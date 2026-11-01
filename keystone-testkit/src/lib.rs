@@ -11,3 +11,7 @@
 
 /// Marker that every test certificate's Common Name must contain (TEST-11).
 pub const TEST_CN_MARKER: &str = "KEYSTONE TEST";
+
+mod drives;
+
+pub use drives::{PLAINTEXT_KEY_MARKERS, TestDrives, find_plaintext_private_keys};
