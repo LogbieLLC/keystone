@@ -1,0 +1,36 @@
+[package]
+name = "keystone-gui"
+description = "Keystone GTK4 + libadwaita desktop interface (thin layer over keystone-core)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "keystone"
+path = "src/main.rs"
+
+[features]
+default = ["simulator"]
+# Production build: network refusal, seccomp, binary self-check (FR-01, SEC-03, SEC-19).
+production = ["keystone-core/production"]
+# Software YubiKey simulator for development and E2E tests (NFR-08).
+# Must never be enabled together with `production`.
+simulator = ["dep:keystone-testkit"]
+
+[dependencies]
+keystone-core.workspace = true
+keystone-testkit = { workspace = true, optional = true }
+gtk.workspace = true
+adw.workspace = true
+time.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

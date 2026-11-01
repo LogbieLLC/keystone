@@ -1,0 +1,20 @@
+[package]
+name = "keystone-testkit"
+description = "Keystone test support: synthetic test keys, YubiKey simulator, temporary drives. Never part of a production build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+keystone-core.workspace = true
+x509-cert.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

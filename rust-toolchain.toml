@@ -1,0 +1,7 @@
+# Exact compiler pin for reproducible builds ("Keystone Dependencies.md", Rust toolchain).
+# Changing this file is ask-first for agents (AGENTS.md, AGENT-02).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["x86_64-unknown-linux-gnu"]
+profile = "minimal"

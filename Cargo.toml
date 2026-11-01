@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["keystone-core", "keystone-gui", "keystone-testkit"]
+
+[workspace.package]
+# GOV-13: YYYY.M.BUILD, "-dev" until milestone M8 is accepted.
+version = "2026.11.1-dev"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Apache-2.0"
+authors = ["Logbie LLC"]
+publish = false
+
+# Exact pins from "Keystone Dependencies.md" (SEC-01, SECP-03).
+# Adding or removing a crate here is ask-first for agents (AGENT-02).
+[workspace.dependencies]
+gtk = { package = "gtk4", version = "=0.11.5" }
+adw = { package = "libadwaita", version = "=0.9.2" }
+openssl = "=0.10.81"
+openssl-sys = "=0.9.117"
+x509-cert = { version = "=0.3.0", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+time = { version = "=0.3.55", features = ["std", "formatting", "parsing", "serde"] }
+zeroize = { version = "=1.9.1", features = ["std"] }
+rustix = { version = "=1.1.6", features = ["fs", "mm", "process"] }
+seccompiler = "=0.5.0"
+thiserror = "=2.0.21"
+proptest = "=1.12.0"
+tempfile = "=3.27.0"
+
+keystone-core = { path = "keystone-core" }
+keystone-testkit = { path = "keystone-testkit" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+# Deterministic, self-contained release binary (SEC-02).
+codegen-units = 1
+lto = "thin"
+debug = false
+strip = "symbols"
