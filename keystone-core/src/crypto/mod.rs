@@ -12,7 +12,12 @@ mod error;
 #[allow(unsafe_code)]
 mod ffi;
 pub mod hash;
+pub mod pem;
+pub mod pkcs8;
 pub mod rand;
+pub mod rsa;
 pub mod secret;
+pub mod verify;
 
 pub use error::CryptoError;
+pub use rsa::{CancelFlag, RsaPrivateKey, generate_rsa};

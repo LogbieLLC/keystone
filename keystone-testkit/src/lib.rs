@@ -1,13 +1,17 @@
 //! Keystone test support (TESTING.md TEST-11, TEST-12; PRD NFR-08).
 //!
-//! - Test keys come only from this crate (TEST-11).
+//! - Test keys come only from this crate (TEST-11): [`keys`].
 //! - Test files are written only to temporary directories (TEST-12).
-//! - Every test certificate's Common Name contains `KEYSTONE TEST` (TEST-11).
+//! - Every test certificate's Common Name contains `KEYSTONE TEST` (TEST-11):
+//!   [`names`].
 //! - The software YubiKey simulator implements the same `TokenSigner` trait as the
 //!   real driver (NFR-08).
 //!
 //! This crate is never part of a production build.
 #![forbid(unsafe_code)]
+
+pub mod keys;
+pub mod names;
 
 /// Marker that every test certificate's Common Name must contain (TEST-11).
 pub const TEST_CN_MARKER: &str = "KEYSTONE TEST";
