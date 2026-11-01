@@ -320,14 +320,21 @@ impl ValidatedName {
 // Validity (FR-10 AC1, AC3)
 // ---------------------------------------------------------------------------
 
-/// A planned validity period (UTC, whole seconds).
+/// A planned validity period (UTC, whole seconds) for one CA level. Only
+/// [`plan_validity`] creates it, so its bounds were checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CertValidity {
+    level: CaLevel,
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
 }
 
 impl CertValidity {
+    /// The level this validity was planned for.
+    pub fn level(&self) -> CaLevel {
+        self.level
+    }
+
     /// Start of validity.
     pub fn not_before(&self) -> OffsetDateTime {
         self.not_before
@@ -431,6 +438,7 @@ pub fn plan_validity(
         });
     }
     Ok(CertValidity {
+        level,
         not_before,
         not_after,
     })
