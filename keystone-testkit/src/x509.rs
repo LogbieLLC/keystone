@@ -214,6 +214,18 @@ pub fn issue_test_leaf(
     dns_names: &[&str],
     ips: &[IpAddr],
 ) -> Vec<u8> {
+    issue_test_leaf_with_email(issuer_cert_der, issuer_key, leaf_key, dns_names, ips, &[])
+}
+
+/// Like [`issue_test_leaf`], with rfc822Name (email) subject alternative names too.
+pub fn issue_test_leaf_with_email(
+    issuer_cert_der: &[u8],
+    issuer_key: &RsaPrivateKey,
+    leaf_key: &RsaPrivateKey,
+    dns_names: &[&str],
+    ips: &[IpAddr],
+    emails: &[&str],
+) -> Vec<u8> {
     let issuer = parse_certificate_der(issuer_cert_der).expect("issuer certificate");
     let spki = leaf_key.public_key_spki_der().expect("leaf key");
     let mut names: Vec<GeneralName> = dns_names
@@ -221,6 +233,11 @@ pub fn issue_test_leaf(
         .map(|name| GeneralName::DnsName(Ia5String::new(name).expect("dns name")))
         .collect();
     names.extend(ips.iter().map(|ip| GeneralName::from(*ip)));
+    names.extend(
+        emails
+            .iter()
+            .map(|email| GeneralName::Rfc822Name(Ia5String::new(email).expect("email"))),
+    );
     let now = OffsetDateTime::now_utc();
     let extensions = vec![
         extension(
