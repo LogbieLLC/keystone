@@ -14,4 +14,6 @@ pub const TEST_CN_MARKER: &str = "KEYSTONE TEST";
 
 mod drives;
 
-pub use drives::{PLAINTEXT_KEY_MARKERS, TestDrives, find_plaintext_private_keys};
+pub use drives::{
+    PLAINTEXT_KEY_TYPES, TestDrives, find_plaintext_private_keys, plaintext_key_markers,
+};

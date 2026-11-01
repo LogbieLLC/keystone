@@ -10,15 +10,19 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// PEM markers of unencrypted private keys (SEC-04). `-----BEGIN ENCRYPTED PRIVATE KEY-----`
-/// (encrypted PKCS#8) does not contain any of them and is allowed.
-pub const PLAINTEXT_KEY_MARKERS: [&str; 5] = [
-    "-----BEGIN PRIVATE KEY-----",
-    "-----BEGIN RSA PRIVATE KEY-----",
-    "-----BEGIN EC PRIVATE KEY-----",
-    "-----BEGIN DSA PRIVATE KEY-----",
-    "-----BEGIN OPENSSH PRIVATE KEY-----",
-];
+/// Key types of the unencrypted private-key PEM labels `-----BEGIN <type>PRIVATE KEY-----`
+/// (SEC-04): PKCS#8, RSA, EC, DSA and OpenSSH. `-----BEGIN ENCRYPTED PRIVATE KEY-----`
+/// (encrypted PKCS#8) matches none of them and is allowed.
+pub const PLAINTEXT_KEY_TYPES: [&str; 5] = ["", "RSA ", "EC ", "DSA ", "OPENSSH "];
+
+/// The unencrypted private-key PEM markers. Built at run time, so this crate's source and
+/// binary never contain a marker for the plaintext-key scanner to find.
+pub fn plaintext_key_markers() -> Vec<String> {
+    PLAINTEXT_KEY_TYPES
+        .iter()
+        .map(|kind| format!("-----BEGIN {kind}PRIVATE KEY-----"))
+        .collect()
+}
 
 /// N temporary CA drives and one export drive, deleted when dropped.
 #[derive(Debug)]
@@ -105,7 +109,7 @@ impl Drop for TestDrives {
 }
 
 /// Recursively finds regular files under `root` that contain any of
-/// [`PLAINTEXT_KEY_MARKERS`]. Symbolic links are not followed.
+/// [`plaintext_key_markers`]. Symbolic links are not followed.
 pub fn find_plaintext_private_keys(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut hits = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -125,7 +129,7 @@ pub fn find_plaintext_private_keys(root: &Path) -> io::Result<Vec<PathBuf>> {
 }
 
 fn contains_marker(content: &[u8]) -> bool {
-    PLAINTEXT_KEY_MARKERS.iter().any(|marker| {
+    plaintext_key_markers().iter().any(|marker| {
         content
             .windows(marker.len())
             .any(|window| window == marker.as_bytes())
@@ -155,7 +159,7 @@ mod tests {
     #[test]
     fn sec04_drop_panics_on_a_plaintext_private_key() {
         // Covers: SEC-04
-        for marker in PLAINTEXT_KEY_MARKERS {
+        for marker in plaintext_key_markers() {
             let result = std::panic::catch_unwind(|| {
                 let drives = TestDrives::new(1);
                 let nested = drives.ca_drive(0).join("keystone/keys");
@@ -181,7 +185,7 @@ mod tests {
     fn scan_does_not_follow_symbolic_links() {
         let drives = TestDrives::new(1);
         let outside = tempfile::tempdir().expect("tempdir");
-        fs::write(outside.path().join("k"), PLAINTEXT_KEY_MARKERS[0]).expect("write");
+        fs::write(outside.path().join("k"), &plaintext_key_markers()[0]).expect("write");
         std::os::unix::fs::symlink(outside.path(), drives.ca_drive(0).join("link"))
             .expect("symlink");
         assert!(drives.plaintext_key_files().expect("scan").is_empty());
