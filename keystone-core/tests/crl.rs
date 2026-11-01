@@ -217,7 +217,8 @@ fn fr13_ac4_refresh_keeps_entries_and_raises_number() {
 
 #[test]
 fn fr13_revocation_is_enforced_by_openssl_at_depth_1_and_2() {
-    // Covers: FR-13 AC1, FR-13 AC5 (local CRL files; the StarnetAuth download part is BLOCKED)
+    // Covers: FR-13 AC1, FR-13 AC5
+    // Local CRL files only; the StarnetAuth download part is BLOCKED (interop/blocked.rs).
     // Scenario A: revoke only the sub-intermediate (depth 1), on its own hierarchy.
     let a = TestHierarchy::build(&HierarchyOptions {
         label: "Scenario A".into(),

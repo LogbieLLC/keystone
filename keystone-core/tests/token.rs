@@ -141,7 +141,8 @@ fn fr06_ac3_random_pin_protected_aes256_management_key_is_reverified() {
 
 #[test]
 fn fr06_ac3_silent_partial_management_key_write_is_caught_on_reopen() {
-    // Covers: FR-06 AC3 (Dependencies doc item 5)
+    // Covers: FR-06 AC3
+    // Dependencies doc, YubiKey item 5: a setter's success is not proof.
     let mut token = sim(10_000_006);
     token
         .controller()

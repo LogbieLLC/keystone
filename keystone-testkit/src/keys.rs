@@ -11,8 +11,9 @@
 //! - `rsa4096(0..RSA4096_COUNT)`: software main/sub-intermediate keys.
 //! - `simulator_pool(0..SIMULATOR_POOL_COUNT)`: used only by `SimulatedYubiKey`
 //!   for on-device key generation, so a token key never equals a software key.
-//! - `rsa2048(0..RSA2048_COUNT)`: test leaves and the simulator's attestation
-//!   hierarchy.
+//! - `rsa2048(0..RSA2048_COUNT)`: test leaves and other small test keys. Index 6
+//!   signs the simulator's "previous slot certificate" preset and index 7 is the
+//!   simulator's attestation root (`simulator::ATTESTATION_ROOT_KEY_INDEX`).
 #![forbid(unsafe_code)]
 
 use std::sync::OnceLock;

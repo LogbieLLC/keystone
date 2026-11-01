@@ -368,7 +368,7 @@ fn days_in_month(year: i32, month: Month) -> u8 {
     time::util::days_in_month(month, year)
 }
 
-fn rfc3339(value: OffsetDateTime) -> String {
+pub(crate) fn rfc3339(value: OffsetDateTime) -> String {
     value
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| value.to_string())

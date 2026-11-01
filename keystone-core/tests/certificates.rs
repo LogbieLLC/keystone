@@ -16,6 +16,7 @@ use keystone_core::profile::{
     CrlLocation, CrlUrl, NameConstraintsChoice, NameConstraintsSpec, ProfileError, ValidatedName,
     plan_validity,
 };
+use keystone_core::token::TokenSigner;
 use keystone_testkit::hierarchy::{HierarchyOptions, MAIN_CRL_URL, MASTER_CRL_URL, TestHierarchy};
 use keystone_testkit::keys;
 use keystone_testkit::names::{assert_test_cn, test_name, test_name_cn_only};
@@ -78,6 +79,22 @@ fn fr02_ac4_subject_order_is_c_o_cn() {
         subject.starts_with("CN=KEYSTONE TEST A Master,O=KEYSTONE TEST,C=US"),
         "{subject}"
     );
+}
+
+#[test]
+fn fr07_ac3_main_certificate_is_stored_in_the_slot() {
+    // Covers: FR-07 AC3
+    let h = hierarchy();
+    let mut token = h.token.reopen();
+    assert_eq!(
+        token.read_signing_certificate().unwrap(),
+        Some(h.main.der.clone())
+    );
+    let status = token
+        .slot_status(keystone_core::token::SIGNING_SLOT)
+        .unwrap();
+    assert_eq!(status.certificate_der, Some(h.main.der.clone()));
+    assert_eq!(status.key.unwrap().public_key_der, h.main.info.spki_der);
 }
 
 #[test]

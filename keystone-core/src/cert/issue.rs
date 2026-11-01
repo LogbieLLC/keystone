@@ -130,10 +130,8 @@ fn check_request(
         return Err(CertError::WrongExponent(key.public_exponent));
     }
     if request.validity.level() != request.level {
-        return Err(CertError::Profile(
-            crate::profile::ProfileError::IssuerMismatch(
-                "the validity was planned for a different level",
-            ),
+        return Err(CertError::Request(
+            "the validity was planned for a different level".into(),
         ));
     }
     match (request.level.issuer_level(), issuer) {
@@ -160,8 +158,8 @@ fn check_request(
             if request.validity.not_after() > issuer.not_after {
                 return Err(CertError::Profile(
                     crate::profile::ProfileError::OutlivesIssuer {
-                        not_after: request.validity.not_after().to_string(),
-                        issuer_not_after: issuer.not_after.to_string(),
+                        not_after: crate::profile::rfc3339(request.validity.not_after()),
+                        issuer_not_after: crate::profile::rfc3339(issuer.not_after),
                         max_years: 0,
                     },
                 ));
