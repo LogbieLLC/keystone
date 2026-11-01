@@ -409,3 +409,75 @@ fn completing_needs_staging_placement_and_audit() {
         Err(StoreError::OperationState { .. })
     ));
 }
+
+#[test]
+fn operation_steps_in_the_wrong_order_are_refused() {
+    // Covers: FR-22 AC1, FR-22 AC2, FR-22 AC7, SEC-20
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateSubIntermediate,
+            "CN=KEYSTONE TEST",
+            &[serial(5)],
+            ts(1),
+        )
+        .expect("begin");
+    let id = op.id();
+    assert!(matches!(
+        op.record_yubikey_step(YubikeySetupStep::PinChanged, 1, ts(1)),
+        Err(StoreError::OperationState { .. })
+    ));
+    assert!(op.commit().is_err(), "commit before sealing");
+    op.stage(key_path(5), encrypted_key_pem(serial(5)).as_bytes())
+        .expect("stage");
+    assert!(
+        op.stage(key_path(5), encrypted_key_pem(serial(5)).as_bytes())
+            .is_err()
+    );
+    let big = OutputPath::new(OutputDir::Certs, "big.crt").expect("path");
+    assert!(
+        op.stage(big, &vec![b'x'; MAX_OUTPUT_FILE_BYTES + 1])
+            .is_err()
+    );
+    assert_eq!(op.outputs().len(), 1);
+    assert_eq!(op.planned_serials(), &[serial(5)]);
+    assert_eq!(op.kind(), OperationKind::CreateSubIntermediate);
+    op.seal_staging(ts(1)).expect("seal");
+    assert!(op.seal_staging(ts(1)).is_err());
+    let late = OutputPath::new(OutputDir::Certs, "late.crt").expect("path");
+    assert!(op.stage(late, b"KEYSTONE TEST").is_err());
+    let signed = SignedObject::Certificate {
+        record: Box::new(cert(serial(5), CaLevel::SubIntermediate, serial(1))),
+        pem: cert_pem(serial(5)),
+    };
+    assert!(
+        op.record_signed(signed, ts(1)).is_err(),
+        "nothing is signed after staging"
+    );
+    // A staged copy missing on one drive stops the move into place.
+    let staged = drives
+        .ca_drive(1)
+        .join("keystone/staging")
+        .join(id.stem())
+        .join("keys")
+        .join(key_path(5).name());
+    fs::remove_file(&staged).expect("remove");
+    assert!(op.commit().is_err());
+    drop(op);
+    // Resuming needs a journal on every drive and an unfinished operation.
+    assert!(set.resume_operation(OperationId(99)).is_err());
+    let done = TestDrives::new(2);
+    let done_set = new_ca(&done);
+    let finished = issue_master(&done_set, 1, ts(1));
+    assert!(matches!(
+        done_set.resume_operation(finished),
+        Err(StoreError::OperationState { .. })
+    ));
+    let export = ExportDrive::open(done.export_drive()).expect("export");
+    let not_an_output = OutputPath::new(OutputDir::Crls, "none.crl").expect("path");
+    assert!(matches!(
+        done_set.export_outputs(finished, &export, &[(not_an_output, "x.crl".to_string())]),
+        Err(StoreError::Unsafe(_))
+    ));
+}

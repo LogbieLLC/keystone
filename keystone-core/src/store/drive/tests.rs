@@ -274,3 +274,47 @@ fn export_drive_refuses_ca_drives_and_never_overwrites() {
         DriveClass::KeystoneExport
     );
 }
+
+#[test]
+fn damaged_drives_are_never_opened_or_used_for_export() {
+    // Covers: SEC-20, SEC-08
+    let drives = TestDrives::new(3);
+    fs::write(drives.ca_drive(0).join(KEYSTONE_DIR), b"not a folder").expect("write");
+    assert!(matches!(
+        classify_drive(drives.ca_drive(0)).expect("classify"),
+        DriveClass::DamagedKeystone(_)
+    ));
+    assert!(matches!(
+        CaDrive::open(drives.ca_drive(0)),
+        Err(StoreError::NotACaDrive { .. })
+    ));
+    assert!(ExportDrive::open(drives.ca_drive(0)).is_err());
+    let set = DriveSet::create(drives.ca_drive(1), &[drives.ca_drive(2)], ts(0)).expect("create");
+    let primary = &set.drives()[0];
+    assert!(primary.label().starts_with("primary drive "));
+    assert_eq!(primary.root(), drives.ca_drive(1));
+    assert!(matches!(
+        primary.dir_at("../x", false),
+        Err(StoreError::Unsafe(_))
+    ));
+    assert!(
+        primary
+            .dir_at("certs/missing", false)
+            .expect("ok")
+            .is_none()
+    );
+    // Damaged identity: the drive is not opened.
+    fs::write(drives.ca_drive(2).join("keystone/drive.json"), b"{}").expect("write");
+    assert!(matches!(
+        CaDrive::open(drives.ca_drive(2)),
+        Err(StoreError::NotACaDrive { .. })
+    ));
+}
+
+proptest::proptest! {
+    #[test]
+    fn sec08_identity_parser_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048)) {
+        // Covers: SEC-08
+        let _ = parse_drive_identity(&bytes);
+    }
+}

@@ -316,6 +316,68 @@ fn appending_needs_identical_logs_on_every_drive() {
     ));
 }
 
+#[test]
+fn audit_log_accessors_and_append_limits() {
+    // Covers: FR-14 AC2, SEC-08
+    let empty = AuditLog::empty();
+    assert!(empty.is_empty());
+    assert_eq!(empty.head().seq, 0);
+    assert_eq!(empty.head().sha256, GENESIS_PREV);
+    assert!(empty.prefix_bytes(3).is_empty());
+    let log = log_of(3);
+    assert_eq!(log.len(), 3);
+    assert_eq!(log.entry_hash(0), None);
+    assert_eq!(log.entry_hash(4), None);
+    assert_eq!(
+        parse_audit_log(log.prefix_bytes(2)).expect("valid").len(),
+        2
+    );
+    assert_eq!(log.prefix_bytes(9), log.as_bytes());
+    assert_eq!(log.common_prefix_len(&log_of(2)), 2);
+    // Over-long text is refused before anything is written.
+    let long = AuditDraft::new(
+        AuditAction::Export,
+        "x".repeat(MAX_AUDIT_TEXT + 1),
+        AuditResult::Success,
+    );
+    assert!(log.with_appended(&[long], ts(1)).is_err());
+    let mut note = AuditDraft::new(AuditAction::Export, "", AuditResult::Success);
+    note.details = Some(AuditDetails {
+        note: Some("y".repeat(MAX_AUDIT_TEXT + 1)),
+        ..AuditDetails::default()
+    });
+    assert!(log.with_appended(&[note], ts(1)).is_err());
+}
+
+#[test]
+fn fr14_ac3_a_damaged_drive_log_is_reported_with_its_path() {
+    // Covers: FR-14 AC3, SEC-09
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    set.append_audit(&[draft(1), draft(2)], ts(1))
+        .expect("append");
+    let path = drives.ca_drive(0).join("keystone/audit.log");
+    let changed = fs::read_to_string(&path)
+        .expect("read")
+        .replacen("sub 1", "sub 9", 1);
+    fs::write(&path, changed).expect("write");
+    let set = open_all(&drives);
+    match set.drives()[0].audit_log() {
+        Err(StoreError::Parse {
+            source: ParseError::Audit { entry: 1, .. },
+            path: reported,
+        }) => assert_eq!(reported, path),
+        other => panic!("expected entry 1 to be named, got {other:?}"),
+    }
+    assert!(set.audit_log().is_err());
+    match set.compare().expect("compare") {
+        DriveComparison::Damaged { problems } => {
+            assert!(problems[0].contains("entry 1"), "{problems:?}");
+        }
+        other => panic!("expected damage, got {other:?}"),
+    }
+}
+
 proptest! {
     #[test]
     fn sec08_audit_parser_never_panics_on_arbitrary_bytes(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {

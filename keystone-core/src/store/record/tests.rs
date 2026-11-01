@@ -284,6 +284,98 @@ fn fr10_ac2_known_serials_cover_records_journals_and_every_drive() {
     assert!(all.contains(&serial(9)) && all.contains(&serial(7)));
 }
 
+#[test]
+fn sec08_record_entries_are_checked_for_consistency() {
+    // Covers: SEC-08, FR-21 AC6, FR-07 AC5
+    let mut named = cert(serial(1), CaLevel::Master, serial(1));
+    named.subject.organization = Some("KEYSTONE TEST Org".to_string());
+    named.subject.country = Some("US".to_string());
+    assert_eq!(
+        named.subject.display(),
+        format!(
+            "CN={}, O=KEYSTONE TEST Org, C=US",
+            named.subject.common_name
+        )
+    );
+    let fails = |change: &dyn Fn(&mut CertificateRecord), level: CaLevel, issuer: u8| {
+        let mut entry = cert(serial(3), level, serial(issuer));
+        change(&mut entry);
+        parse_record(&issued(1, entry).to_bytes()).is_err()
+    };
+    assert!(fails(
+        &|c| c.subject.common_name.clear(),
+        CaLevel::Master,
+        3
+    ));
+    assert!(fails(
+        &|c| c.issuer.common_name = "x".repeat(MAX_NAME_TEXT + 1),
+        CaLevel::Master,
+        3
+    ));
+    assert!(fails(&|c| c.not_after = c.not_before, CaLevel::Master, 3));
+    assert!(fails(
+        &|c| c.permitted_dns = vec!["starnet".into()],
+        CaLevel::Master,
+        3
+    ));
+    assert!(fails(
+        &|c| c.permitted_dns.clear(),
+        CaLevel::SubIntermediate,
+        2
+    ));
+    assert!(fails(
+        &|c| c.name_constraints = false,
+        CaLevel::SubIntermediate,
+        2
+    ));
+    assert!(fails(
+        &|c| c.permitted_dns = vec!["a".to_string(); MAX_PERMITTED_NAMES + 1],
+        CaLevel::SubIntermediate,
+        2
+    ));
+    assert!(fails(
+        &|c| c.attestation_pem = Some("x".into()),
+        CaLevel::Master,
+        3
+    ));
+    assert!(fails(
+        &|c| c.attestation_pem = Some(String::new()),
+        CaLevel::MainIntermediate,
+        1
+    ));
+    // Name constraints switched off explicitly, with no names, is valid (FR-21 AC1).
+    assert!(!fails(
+        &|c| {
+            c.name_constraints = false;
+            c.permitted_dns.clear();
+        },
+        CaLevel::SubIntermediate,
+        2
+    ));
+}
+
+#[test]
+fn record_folder_is_read_strictly_and_compared_across_drives() {
+    // Covers: SEC-08, FR-11 AC1, FR-12 AC3
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    issue_master(&set, 1, ts(10));
+    let folder = drives.ca_drive(1).join("keystone/record");
+    // A second, unexpected record update on one drive makes the drives disagree.
+    let extra = issued(7, cert(serial(7), CaLevel::Master, serial(7)));
+    std::fs::write(folder.join("op-000007.json"), extra.to_bytes()).expect("write");
+    assert!(matches!(
+        set.issuance_record(),
+        Err(StoreError::OutOfSync(_))
+    ));
+    // A file whose name and operation differ is rejected.
+    std::fs::rename(folder.join("op-000007.json"), folder.join("op-000008.json")).expect("mv");
+    assert!(set.drives()[1].record_updates().is_err());
+    std::fs::remove_file(folder.join("op-000008.json")).expect("rm");
+    std::fs::write(folder.join("notes.txt"), b"x").expect("write");
+    assert!(set.drives()[1].record_updates().is_err());
+}
+
 proptest! {
     #[test]
     fn sec08_record_parser_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {

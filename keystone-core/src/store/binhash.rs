@@ -116,4 +116,12 @@ mod tests {
         }
         assert!(parse_binary_hash_record(&vec![b'a'; MAX_METADATA_BYTES + 1]).is_err());
     }
+
+    proptest::proptest! {
+        #[test]
+        fn sec08_binary_hash_parser_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
+            // Covers: SEC-08
+            let _ = parse_binary_hash_record(&bytes);
+        }
+    }
 }

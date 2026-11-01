@@ -179,10 +179,17 @@ impl DriveSet {
             let mut plans = Vec::new();
             for (target, log) in logs.iter().enumerate() {
                 if log.len() < logs[longest].len() {
-                    plans.push(self.plan_repair(longest, target)?);
+                    // A behind drive that cannot be repaired safely is a blocking problem.
+                    match self.plan_repair(longest, target) {
+                        Ok(plan) => plans.push(plan),
+                        Err(StoreError::Unsafe(reason)) => problems.push(reason),
+                        Err(error) => return Err(error),
+                    }
                 }
             }
-            return Ok(if plans.is_empty() {
+            return Ok(if !problems.is_empty() {
+                DriveComparison::Damaged { problems }
+            } else if plans.is_empty() {
                 DriveComparison::InSync
             } else {
                 DriveComparison::Behind { plans }

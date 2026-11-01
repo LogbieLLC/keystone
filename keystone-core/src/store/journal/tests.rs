@@ -203,6 +203,108 @@ fn drive_journal_is_read_and_checked() {
     assert!(open_all(&drives).drives()[0].journal().is_err());
 }
 
+#[test]
+fn journal_staging_rules_are_enforced() {
+    // Covers: FR-22 AC2, FR-22 AC3, SEC-08
+    let entry = |step: u32, event: JournalEvent| JournalEntry {
+        format: JOURNAL_FORMAT,
+        operation: OperationId(1),
+        step,
+        time: ts(0),
+        event,
+    };
+    let output = |name: &str| OutputFile {
+        path: OutputPath::parse(&format!("certs/{name}")).expect("path"),
+        sha256: Sha256Digest([1; 32]),
+        size: 1,
+    };
+    let audit = AuditHead {
+        seq: 1,
+        sha256: Sha256Digest([1; 32]),
+    };
+    let staged = |step, names: &[&str]| {
+        entry(
+            step,
+            JournalEvent::Staged {
+                outputs: names.iter().map(|n| output(n)).collect(),
+            },
+        )
+    };
+    let completed = |step, names: &[&str]| {
+        entry(
+            step,
+            JournalEvent::Completed {
+                outputs: names.iter().map(|n| output(n)).collect(),
+                audit,
+            },
+        )
+    };
+    let signed = |step| {
+        entry(
+            step,
+            JournalEvent::Signed {
+                object: SignedObject::Crl(Box::new(SignedCrl {
+                    issuer_serial: serial(1),
+                    crl_number: 1,
+                    this_update: ts(0),
+                    next_update: ts(86_400),
+                    sha256: Sha256Digest([2; 32]),
+                    pem: "-----BEGIN X509 CRL-----\nKEYSTONE TEST\n-----END X509 CRL-----\n".into(),
+                })),
+            },
+        )
+    };
+    let build = |entries: Vec<JournalEntry>| {
+        OperationJournal::from_entries(
+            OperationId(1),
+            entries.into_iter().map(|e| (e, Vec::new())).collect(),
+        )
+    };
+    let ok = build(vec![
+        pending(1),
+        signed(2),
+        staged(3, &["a"]),
+        completed(4, &["a"]),
+    ])
+    .expect("valid");
+    assert_eq!(ok.staged_outputs().map(<[OutputFile]>::len), Some(1));
+    assert_eq!(ok.signed().count(), 1);
+    assert!(build(vec![pending(1), staged(2, &["a"]), staged(3, &["a"])]).is_err());
+    assert!(build(vec![pending(1), staged(2, &["a"]), signed(3)]).is_err());
+    assert!(build(vec![pending(1), staged(2, &["a"]), completed(3, &["b"])]).is_err());
+    assert!(build(vec![pending(1), completed(2, &["a"])]).is_err());
+    assert!(build(Vec::new()).is_err());
+    // A signed CRL must end after it starts.
+    let mut backwards = signed(2);
+    if let JournalEvent::Signed {
+        object: SignedObject::Crl(crl),
+    } = &mut backwards.event
+    {
+        crl.next_update = crl.this_update;
+    }
+    assert!(parse_journal_entry(&to_json_file(&backwards)).is_err());
+    assert!(parse_journal_entry(&to_json_file(&signed(2))).is_ok());
+    // File names.
+    assert_eq!(parse_entry_name("012-staged.json"), Some((12, "staged")));
+    for bad in [
+        "12-staged.json",
+        "abc-staged.json",
+        "012staged.json",
+        "012-staged.txt",
+    ] {
+        assert_eq!(parse_entry_name(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn unexpected_journal_folders_are_errors() {
+    // Covers: SEC-08
+    let drives = TestDrives::new(2);
+    new_ca(&drives);
+    fs::create_dir(drives.ca_drive(0).join("keystone/journal/notes")).expect("mkdir");
+    assert!(open_all(&drives).drives()[0].journal().is_err());
+}
+
 proptest! {
     #[test]
     fn sec08_journal_parser_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..4096)) {

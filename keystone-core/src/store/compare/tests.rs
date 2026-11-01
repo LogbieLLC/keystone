@@ -282,3 +282,82 @@ fn damaged_outputs_block_signing() {
         other => panic!("expected damage, got {other:?}"),
     }
 }
+
+#[test]
+fn fr12_ac3_a_behind_drive_holding_a_different_file_is_never_overwritten() {
+    // Covers: FR-12 AC3, SEC-20
+    let drives = behind_setup();
+    let set = open_all(&drives);
+    let plan = plans(set.compare().expect("compare"));
+    let RepairStep::Operation { outputs, .. } = &plan[0].steps[0] else {
+        panic!("expected an operation step");
+    };
+    let conflicting = drives
+        .ca_drive(2)
+        .join("keystone")
+        .join(outputs[0].path.to_string());
+    fs::write(&conflicting, b"KEYSTONE TEST different").expect("write");
+    match open_all(&drives).compare().expect("compare") {
+        DriveComparison::Damaged { problems } => {
+            assert!(problems[0].contains("never overwritten"), "{problems:?}");
+        }
+        other => panic!("expected a blocking problem, got {other:?}"),
+    }
+    assert!(matches!(
+        open_all(&drives).repair(&plan, ts(40)),
+        Err(StoreError::Unsafe(_))
+    ));
+    assert_eq!(
+        fs::read(&conflicting).expect("read"),
+        b"KEYSTONE TEST different"
+    );
+}
+
+#[test]
+fn fr12_ac3_a_plan_is_refused_when_the_drives_changed_after_it_was_shown() {
+    // Covers: FR-12 AC3
+    let drives = behind_setup();
+    let shown = plans(open_all(&drives).compare().expect("compare"));
+    open_some(&drives, &[0, 1])
+        .append_audit(
+            &[AuditDraft::new(
+                AuditAction::Export,
+                "late",
+                AuditResult::Success,
+            )],
+            ts(35),
+        )
+        .expect("append");
+    assert!(matches!(
+        open_all(&drives).repair(&shown, ts(40)),
+        Err(StoreError::Unsafe(_))
+    ));
+}
+
+#[test]
+fn fr12_ac3_an_unfinished_operation_on_the_source_is_not_copied() {
+    // Covers: FR-12 AC3, FR-22 AC4
+    let drives = TestDrives::new(3);
+    let set = new_ca(&drives);
+    issue_master(&set, 1, ts(10));
+    let pair = open_some(&drives, &[0, 1]);
+    let mut op = pair
+        .begin_operation(OperationKind::Revoke, "CN=KEYSTONE TEST", &[], ts(20))
+        .expect("begin");
+    op.append_audit(
+        &[AuditDraft::new(
+            AuditAction::Revoke,
+            "CN=KEYSTONE TEST",
+            AuditResult::Success,
+        )],
+        ts(20),
+    )
+    .expect("audit");
+    drop(op); // interrupted before its completed entry
+    match open_all(&drives).compare().expect("compare") {
+        DriveComparison::Damaged { problems } => {
+            assert!(problems[0].contains("recovery"), "{problems:?}");
+        }
+        other => panic!("expected a blocking problem, got {other:?}"),
+    }
+}
