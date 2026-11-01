@@ -10,6 +10,12 @@ pub enum CryptoError {
     /// The secure random source failed.
     #[error("the operating system's secure random source failed")]
     Random,
+    /// Memory for a secret could not be allocated and locked into RAM (SEC-07).
+    #[error("could not lock memory for a secret; raise the memory-lock limit (RLIMIT_MEMLOCK)")]
+    LockedMemory,
+    /// A secret buffer would have to grow beyond its fixed capacity.
+    #[error("secret is longer than its fixed buffer allows")]
+    SecretCapacity,
 }
 
 impl From<openssl::error::ErrorStack> for CryptoError {

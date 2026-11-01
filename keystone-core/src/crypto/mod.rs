@@ -13,5 +13,6 @@ mod error;
 mod ffi;
 pub mod hash;
 pub mod rand;
+pub mod secret;
 
 pub use error::CryptoError;
