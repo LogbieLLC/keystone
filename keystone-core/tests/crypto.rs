@@ -85,6 +85,17 @@ fn fr16_cancel_from_another_thread() {
 }
 
 #[test]
+fn fr16_panicking_progress_callback_never_unwinds_into_openssl() {
+    // Covers: FR-16 AC2
+    let result = generate_rsa(2048, &CancelFlag::new(), &|_| {
+        panic!("KEYSTONE TEST progress failure")
+    });
+    assert!(matches!(result, Err(CryptoError::OpenSsl(_))), "{result:?}");
+    // OpenSSL's state is clean afterwards.
+    generate_rsa(2048, &CancelFlag::new(), &|_| {}).expect("generation after a failed callback");
+}
+
+#[test]
 fn rejects_unsupported_key_sizes() {
     for bits in [0, 1024, 3000, 16384] {
         assert!(matches!(

@@ -458,6 +458,33 @@ fn simulator_fault_injection_removal_and_failures() {
 }
 
 #[test]
+fn sec07_pins_never_appear_in_debug_or_errors() {
+    // Covers: SEC-07
+    let pin = NewPin::from_entries(&s(PIN), &s(PIN)).unwrap();
+    let puk = NewPuk::from_entries(&s(PUK), &s(PUK)).unwrap();
+    let mut token = hardened_sim(10_000_021);
+    token.generate_signing_key(&s(PIN)).unwrap();
+    let wrong = "Zz#99999";
+    let error = token.sign_sha384_digest(&s(wrong), &[0; 48]).unwrap_err();
+    let pin_secret = s(PIN);
+    let signer = keystone_core::token::TokenCaSigner::new(&mut token, &pin_secret);
+    let shown = [
+        format!("{pin:?}"),
+        format!("{puk:?}"),
+        format!("{signer:?}"),
+        format!("{error:?}"),
+        error.to_string(),
+        format!("{:?}", s(PIN)),
+    ];
+    for text in shown {
+        assert!(
+            !text.contains(PIN) && !text.contains(PUK) && !text.contains(wrong),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn token_is_object_safe_and_send() {
     // Covers: NFR-08
     fn assert_send<T: Send>(_: &T) {}
