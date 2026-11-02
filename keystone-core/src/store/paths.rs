@@ -15,6 +15,10 @@ pub const EXPORT_DIR: &str = "keystone-export";
 pub const IDENTITY_FILE: &str = "drive.json";
 /// Audit log inside `keystone/`.
 pub const AUDIT_LOG_FILE: &str = "audit.log";
+/// Replacement marker inside `keystone/` (Replace a lost drive, ADR 0003): written first
+/// on the new drive, it holds the drive identity the copy will get. It is never deleted,
+/// and it marks a drive whose addition must be recorded in the audit log.
+pub const REPLACEMENT_FILE: &str = "replacement.json";
 /// SEC-19 binary hash record inside `keystone/`.
 pub const BINARY_HASH_FILE: &str = "binary.sha256";
 /// Operation journal folder inside `keystone/`.

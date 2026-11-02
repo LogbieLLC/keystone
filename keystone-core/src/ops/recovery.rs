@@ -37,7 +37,7 @@ use crate::store::{
     DriveOperationView, OperationId, OperationJournal, OperationKind, OperationState,
     PendingOperation, RecoveryAction as StoreAction, SignedObject, YubikeySetupStep,
 };
-use crate::token::{CredentialStatus, DeviceInfo, SIGNING_SLOT, TokenSigner};
+use crate::token::{CredentialStatus, DeviceInfo, SIGNING_SLOT, TokenError, TokenSigner};
 
 use super::pipeline::{
     Assembly, OpContext, assemble_and_finish, finish, record_crl, run, signed_crl, staged_key,
@@ -433,16 +433,31 @@ impl Ca {
 
     /// Runs a recovery action that needs no YubiKey (FR-22 AC4): finish from a drive,
     /// abandon, or rebuild from the journal. The action must be one the recovery screen
-    /// currently offers for `operation`. The YubiKey actions run through
-    /// [`Ca::resume_yubikey_setup`].
+    /// offers for `operation` right now, checked again with `token`. The YubiKey
+    /// actions run through [`Ca::resume_yubikey_setup`].
+    ///
+    /// `token` is the YubiKey connection (the one given to [`Ca::recovery_items`]), or
+    /// `None` when no YubiKey is connected. Abandon of an interrupted YubiKey setup is
+    /// accepted only when the caller states that the setup's YubiKey is absent: `None`,
+    /// a connection that reports no YubiKey, or another YubiKey (FR-22 AC5, AC7, review
+    /// finding 10). While the setup's YubiKey is connected, or while a connected YubiKey
+    /// cannot be read, it is refused and the setup is resumed instead.
     pub fn run_recovery(
         &self,
         operation: OperationId,
         action: &RecoveryAction,
         secrets: &RecoverySecrets<'_>,
+        mut token: Option<&mut dyn TokenSigner>,
         time: ConfirmedTime,
     ) -> Result<(), OpsError> {
-        let items = self.recovery_items(None)?;
+        // A YubiKey is there, whether or not it can be read.
+        let yubikey_there = token.as_deref_mut().is_some_and(|token| {
+            !matches!(
+                token.device_info(),
+                Err(TokenError::NotPresent | TokenError::Removed)
+            )
+        });
+        let items = self.recovery_items(token)?;
         let item = items
             .iter()
             .find(|item| item.operation == operation)
@@ -450,6 +465,15 @@ impl Ca {
         if !item.actions.iter().any(|c| c.action == *action) {
             return Err(OpsError::NotReady(format!(
                 "that action is not offered for {operation}"
+            )));
+        }
+        if *action == RecoveryAction::Abandon
+            && item.kind == OperationKind::SetupYubikey
+            && yubikey_there
+            && item.yubikey.is_none()
+        {
+            return Err(OpsError::NotReady(format!(
+                "the connected YubiKey cannot be read, so it may be the YubiKey of {operation}; remove it to abandon the setup, or resume the setup with it"
             )));
         }
         self.check_recovery_time(time)?;
@@ -471,25 +495,10 @@ impl Ca {
         }
     }
 
+    /// SEC-16: a recovery action (or Replace a lost drive) needs a confirmed time later
+    /// than the newest audit entry on any drive, like every CA-changing operation.
     pub(super) fn check_recovery_time(&self, time: ConfirmedTime) -> Result<(), OpsError> {
-        let baseline = self
-            .drive_set()
-            .drives()
-            .iter()
-            .filter_map(|drive| drive.audit_log().ok())
-            .filter_map(|log| crate::clock::baseline(log.entries()))
-            .max();
-        if let Some(baseline) = baseline
-            && time.get() < baseline
-        {
-            return Err(OpsError::Blocked(vec![
-                super::Blocker::ClockConfirmationStale {
-                    confirmed: time.get(),
-                    baseline,
-                },
-            ]));
-        }
-        Ok(())
+        self.check_confirmed_time(time)
     }
 
     /// [`RecoveryAction::FinishWithoutYubikey`]: stages the journaled main-intermediate

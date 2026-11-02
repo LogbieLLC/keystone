@@ -565,6 +565,81 @@ fn regression_the_recovery_finish_entry_keeps_the_action_names_and_every_serial(
     assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
 }
 
+/// A deterministic positive serial from a 16-bit number (more than `serial` offers).
+fn wide_serial(n: u16) -> Serial {
+    let mut bytes = [0u8; 20];
+    bytes[0] = 0x22;
+    bytes[18..].copy_from_slice(&n.to_be_bytes());
+    Serial::from_bytes(bytes).expect("valid serial")
+}
+
+#[test]
+fn regression_a_recovery_finish_keeps_every_serial_of_a_large_revocation() {
+    // Covers: FR-14 AC1, FR-22 AC4, FR-15 AC1
+    // Regression (final storage review): the recovery_finish entry kept only the first
+    // 256 serials, so a revocation that cut off more sub-intermediates lost the rest
+    // from the audit log without a word.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    crate::store::testutil::issue_master(&set, 1, ts(1));
+    let main = wide_serial(1);
+    let children: Vec<Serial> = (2..=300).map(wide_serial).collect();
+    let mut op = set
+        .begin_operation(
+            OperationKind::ReplaceYubikey,
+            "CN=KEYSTONE TEST main",
+            &[],
+            ts(8),
+        )
+        .expect("begin");
+    let id = op.id();
+    let mut changes = vec![RecordChange::Revoked {
+        serial: main,
+        date: ts(8),
+        reason: crate::model::RevocationReason::KeyCompromise,
+    }];
+    changes.extend(
+        children
+            .iter()
+            .map(|child| RecordChange::RevokedByAncestor {
+                serial: *child,
+                ancestor: main,
+                date: ts(8),
+            }),
+    );
+    let update = RecordUpdate::new(id, changes);
+    op.stage(update.output_path(), &update.to_bytes())
+        .expect("stage");
+    op.seal_staging(ts(8)).expect("seal");
+    drop(op);
+    let set = open_all(&drives);
+    set.finish_operation(id, 0, ts(9)).expect("finish");
+    let log = set.audit_log().expect("log");
+    let entries: Vec<_> = log
+        .entries()
+        .iter()
+        .filter(|entry| entry.operation == Some(id))
+        .collect();
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let mut listed = Vec::new();
+    for entry in &entries {
+        assert_eq!(entry.action, AuditAction::RecoveryFinish);
+        let serials = entry
+            .details
+            .as_ref()
+            .and_then(|details| details.serials.clone())
+            .expect("serials");
+        assert!(serials.len() <= crate::store::audit::MAX_AUDIT_SERIALS);
+        listed.extend(serials);
+    }
+    let mut expected = vec![main];
+    expected.extend(&children);
+    assert_eq!(listed, expected, "every serial, in order, none dropped");
+    assert_eq!(entries[0].serial, Some(main));
+    assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+    assert!(set.recovery_report().expect("report").is_clean());
+}
+
 /// Every drive's journals parse, no operation is pending, the drives agree and a new
 /// operation can begin.
 fn assert_recovered(drives: &TestDrives, context: &str) {

@@ -145,6 +145,23 @@ fn read_identity(keystone: &Dir) -> Result<DriveIdentity, StoreError> {
     })
 }
 
+/// Reads a file in the drive identity format (`drive.json`, or the replacement marker),
+/// or `None` when it does not exist.
+pub(crate) fn read_identity_file(
+    keystone: &Dir,
+    name: &str,
+) -> Result<Option<DriveIdentity>, StoreError> {
+    let Some(bytes) = keystone.read_if_exists(name, MAX_METADATA_BYTES)? else {
+        return Ok(None);
+    };
+    parse_drive_identity(&bytes)
+        .map(Some)
+        .map_err(|source| StoreError::Parse {
+            path: keystone.child(name),
+            source,
+        })
+}
+
 /// One opened CA drive.
 #[derive(Debug)]
 pub struct CaDrive {
@@ -304,6 +321,49 @@ fn promoted_primary(drives: &[CaDrive]) -> Option<DriveId> {
         })
 }
 
+/// SEC-11: true when the folders `a` and `b` are on the same device (the same file
+/// system), so they cannot be two separate CA drives: one drive failure would lose both.
+/// The folders need not be mount points; a folder on a USB drive is on that drive.
+///
+/// A production build compares the device numbers (`st_dev`) the operating system
+/// reports, always. Other builds go through the test seam in `store::fault`, because
+/// test drives are folders on one file system: there two folders count as one device
+/// when a test put them on the same simulated device, or when one is inside the other.
+pub(crate) fn same_device(a: &Path, b: &Path) -> Result<bool, StoreError> {
+    let same = Dir::open(a)?.identity()?.0 == Dir::open(b)?.identity()?.0;
+    #[cfg(any(test, not(feature = "production")))]
+    let same = super::fault::same_device(a, b, same);
+    Ok(same)
+}
+
+/// SEC-11: refuses two of `drives` (folder and label) on one device ([`same_device`]).
+pub(crate) fn check_separate_devices(drives: &[(&Path, String)]) -> Result<(), StoreError> {
+    for (index, (first, first_label)) in drives.iter().enumerate() {
+        for (second, second_label) in &drives[index + 1..] {
+            if same_device(first, second)? {
+                return Err(StoreError::DriveSet(format!(
+                    "{second_label} is on the same device as {first_label}; every CA drive must be a separate USB drive, so one failed drive never takes two copies with it (SEC-11)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The folders chosen for a new CA with a label for each, primary first.
+fn chosen_labels<'a>(primary: &'a Path, backups: &[&'a Path]) -> Vec<(&'a Path, String)> {
+    std::iter::once((
+        primary,
+        format!("the primary drive ({})", primary.display()),
+    ))
+    .chain(
+        backups
+            .iter()
+            .map(|root| (*root, format!("the backup drive ({})", root.display()))),
+    )
+    .collect()
+}
+
 /// A file written to every drive of a set but not yet read back (FR-12 AC2).
 #[derive(Debug)]
 pub(crate) struct WrittenCopies {
@@ -323,7 +383,8 @@ impl DriveSet {
     /// Sets up a new CA on empty drives: one primary and at least one backup (FR-12 AC1).
     ///
     /// SEC-20: refuses any drive that already holds a CA (or a damaged `keystone/` folder)
-    /// and any drive that is not empty. Nothing is written until every drive passed.
+    /// and any drive that is not empty. SEC-11: refuses two drives on one device
+    /// ([`same_device`]). Nothing is written until every drive passed.
     pub fn create(
         primary: &Path,
         backups: &[&Path],
@@ -360,6 +421,7 @@ impl DriveSet {
                 )));
             }
         }
+        check_separate_devices(&chosen_labels(primary, backups))?;
         let ca_id = CaId::random()?;
         for (root, role) in &roots {
             let identity = DriveIdentity {
@@ -375,8 +437,9 @@ impl DriveSet {
         DriveSet::open(&all)
     }
 
-    /// Opens the connected drives of one CA (FR-19 AC1). All must hold the same CA, and
-    /// no drive may be given twice. Writing needs the primary and at least one backup
+    /// Opens the connected drives of one CA (FR-19 AC1). All must hold the same CA, no
+    /// drive may be given twice, and no two drives may be on one device (SEC-11,
+    /// [`same_device`]). Writing needs the primary and at least one backup
     /// ([`DriveSet::ensure_writable`]); reading, comparing and recovery analysis do not.
     pub fn open(roots: &[&Path]) -> Result<DriveSet, StoreError> {
         if roots.is_empty() {
@@ -398,6 +461,11 @@ impl DriveSet {
             }
             drives.push(drive);
         }
+        let labelled: Vec<(&Path, String)> = drives
+            .iter()
+            .map(|drive| (drive.root(), drive.label()))
+            .collect();
+        check_separate_devices(&labelled)?;
         let ca = drives[0].identity.ca_id;
         if drives.iter().any(|drive| drive.identity.ca_id != ca) {
             return Err(StoreError::DriveSet(
@@ -535,13 +603,23 @@ pub(crate) fn write_identity(
     keystone: &Dir,
     identity: &DriveIdentity,
 ) -> Result<(), StoreError> {
+    write_identity_file(root, keystone, IDENTITY_FILE, identity)
+}
+
+/// Writes `identity` as `name` (create-only) and verifies it by read-back.
+pub(crate) fn write_identity_file(
+    root: &Path,
+    keystone: &Dir,
+    name: &str,
+    identity: &DriveIdentity,
+) -> Result<(), StoreError> {
     let bytes = to_json_file(identity);
-    keystone.write_atomic(IDENTITY_FILE, &bytes, WriteMode::CreateOnly)?;
-    let back = keystone.read_back(IDENTITY_FILE, MAX_METADATA_BYTES)?;
+    keystone.write_atomic(name, &bytes, WriteMode::CreateOnly)?;
+    let back = keystone.read_back(name, MAX_METADATA_BYTES)?;
     if back != bytes {
         return Err(StoreError::ReadBackMismatch {
             drive: root.display().to_string(),
-            path: keystone.child(IDENTITY_FILE),
+            path: keystone.child(name),
             expected: sha256(&bytes),
             actual: sha256(&back),
         });
@@ -702,6 +780,7 @@ impl DriveSet {
                 "these drives do not hold an unfinished CA setup; nothing was changed".into(),
             )
         })?;
+        check_separate_devices(&chosen_labels(primary, backups))?;
         let ca_id = match setup.ca_id {
             Some(ca_id) => ca_id,
             None => CaId::random()?,

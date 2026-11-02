@@ -30,7 +30,10 @@
 //!
 //! # Rules every signing operation follows
 //! - It needs a [`ConfirmedTime`] (FR-17 AC1), which only `clock::confirm` creates, and
-//!   which must not be earlier than the newest audit entry when the operation starts.
+//!   which must be strictly later than the newest audit entry when the operation starts
+//!   and when it executes (SEC-16). Every CA-changing operation (signing, recovery,
+//!   drive repair, Replace a lost drive) writes an audit entry at its confirmed time, so
+//!   one confirmation never serves two operations: confirm the time again before each.
 //! - The drives must be writable (primary + backup), hold the same verified history, and
 //!   have no interrupted operation (FR-12 AC3, FR-14 AC3, FR-22 AC4); otherwise
 //!   [`OpsError::Blocked`].

@@ -23,6 +23,7 @@ use super::journal::{
     OperationState, OutputFile, SignedObject, YubikeySetupStep,
 };
 use super::paths::{JOURNAL_DIR, OutputDir, OutputPath, RECORD_DIR, STAGING_DIR};
+use super::replace::unrecorded_replacement;
 use super::{ExportDrive, StoreError};
 use crate::crypto::hash::sha256;
 use crate::limits::MAX_OUTPUT_FILE_BYTES;
@@ -77,6 +78,8 @@ impl DriveSet {
         let mut problems = Vec::new();
         for drive in self.drives() {
             problems.extend(drive_problems(drive, &log)?);
+            // Never sign with a drive whose addition is not recorded (review N4).
+            problems.extend(unrecorded_replacement(drive, &log));
         }
         if !problems.is_empty() {
             return Err(StoreError::Damaged(problems));

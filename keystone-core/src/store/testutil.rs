@@ -155,3 +155,47 @@ pub(crate) fn issue_master(set: &DriveSet, n: u8, time: Timestamp) -> OperationI
         time,
     )
 }
+
+/// Copies a folder tree (as a drive image would), without following links.
+pub(crate) fn copy_folder(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("list") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_folder(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
+/// One CA whose drives hold two different histories, through the real store path: the
+/// CA (master, serial 1) is created on drives 0 (primary) and 1 (backup), both are
+/// copied to drives 2 and 3 (as if imaged, same identities), and then each pair is used
+/// on its own: drives 0 and 1 issue serial 7, drives 2 and 3 issue serial 9. Drive 0
+/// with drive 3 is then a primary and a backup of one CA whose histories diverge.
+pub(crate) fn diverged_ca() -> TestDrives {
+    let mut drives = TestDrives::new(2);
+    issue_master(&new_ca(&drives), 1, ts(10));
+    for index in 0..2 {
+        let copy = drives.add_ca_drive();
+        copy_folder(
+            &drives.ca_drive(index).join(super::KEYSTONE_DIR),
+            &copy.join(super::KEYSTONE_DIR),
+        );
+    }
+    issue(
+        &open_some(&drives, &[0, 1]),
+        OperationKind::CreateSubIntermediate,
+        cert(serial(7), CaLevel::SubIntermediate, serial(1)),
+        ts(20),
+    );
+    issue(
+        &open_some(&drives, &[2, 3]),
+        OperationKind::CreateSubIntermediate,
+        cert(serial(9), CaLevel::SubIntermediate, serial(1)),
+        ts(21),
+    );
+    drives
+}

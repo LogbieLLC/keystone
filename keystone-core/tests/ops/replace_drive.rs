@@ -210,10 +210,22 @@ fn sec11_a_replacement_interrupted_at_every_drive_change_finishes_when_run_again
         );
         testing::reset();
         // No partial drive ever looks complete: a drive that has its identity holds the
-        // whole verified copy (at most the replacement's audit entries differ).
+        // whole verified copy (at most the replacement's audit entries differ), and while
+        // no drive records its addition nothing can be signed with it (final storage
+        // review N4).
         if let DriveClass::KeystoneCa(_) = classify_drive(&new).unwrap() {
-            match open(&[&backup, &new]).drive_set().compare().unwrap() {
-                DriveComparison::InSync => {}
+            let both = open(&[&backup, &new]);
+            match both.drive_set().compare().unwrap() {
+                DriveComparison::Damaged { problems } => {
+                    assert!(
+                        problems.len() == 1 && problems[0].contains("Replace a lost drive again"),
+                        "change {crash_at}: {problems:?}"
+                    );
+                    assert!(
+                        !both.startup_report(test.now).unwrap().signing_allowed(),
+                        "change {crash_at}"
+                    );
+                }
                 DriveComparison::Behind { plans } => assert!(
                     plans.iter().all(|plan| plan
                         .steps
@@ -279,6 +291,21 @@ fn sec11_a_replacement_is_refused_while_unsafe() {
         Err(OpsError::Store(StoreError::DriveNotEmpty { .. }))
     ));
     assert!(ca.plan_replace_drive(&roots[1], time).is_err());
+    // SEC-11: a new drive on the same device as a connected drive (final storage review
+    // N3), shown with a plain sentence; a folder on a separate device is accepted.
+    let same = test.drives.add_ca_drive();
+    testing::put_on_device(&roots[1], 61);
+    testing::put_on_device(&same, 61);
+    match ca.plan_replace_drive(&same, time) {
+        Err(OpsError::Store(StoreError::DriveSet(message))) => assert!(
+            message.contains("is on the same device as the backup drive"),
+            "{message}"
+        ),
+        other => panic!("expected a same-device refusal, got {other:?}"),
+    }
+    testing::put_on_device(&same, 62);
+    assert!(ca.plan_replace_drive(&same, time).is_ok());
+    testing::reset();
     // An interrupted operation.
     let (plan, passphrase, _) = plan_flow_c(&mut test, "D4b").unwrap();
     testing::supply_generated_key(keystone_testkit::keys::rsa4096(4));

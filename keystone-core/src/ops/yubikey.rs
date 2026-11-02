@@ -458,8 +458,8 @@ impl Ca {
     }
 
     /// The gate for a recovery action on `operation`: drives writable and identical
-    /// histories, the operation pending and of `kind`, the time not earlier than the
-    /// newest audit entry. Returns the state before the operation.
+    /// histories, the operation pending and of `kind`, the time later than the newest
+    /// audit entry (SEC-16). Returns the state before the operation.
     pub(crate) fn ready_for_recovery(
         &self,
         operation: OperationId,
@@ -487,17 +487,7 @@ impl Ca {
                 "{operation} is not a {kind:?} operation"
             )));
         }
-        let log = self.drive_set().audit_log()?;
-        if let Some(baseline) = crate::clock::baseline(log.entries())
-            && time.get() < baseline
-        {
-            return Err(OpsError::Blocked(vec![
-                super::Blocker::ClockConfirmationStale {
-                    confirmed: time.get(),
-                    baseline,
-                },
-            ]));
-        }
+        self.check_confirmed_time(time)?;
         CaState::load(&self.drive_set().drives()[0])
     }
 }

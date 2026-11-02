@@ -6,7 +6,7 @@ use std::fs;
 use keystone_testkit::TestDrives;
 
 use super::*;
-use crate::store::testutil::{new_ca, open_all, open_some, ts};
+use crate::store::testutil::{copy_folder, new_ca, open_all, open_some, ts};
 
 #[test]
 fn classify_empty_ca_damaged_export_and_other_drives() {
@@ -142,6 +142,82 @@ fn fr19_ac1_opens_an_existing_ca_and_rejects_mixed_drives() {
         DriveSet::open(&[other.export_drive()]),
         Err(StoreError::NotACaDrive { .. })
     ));
+}
+
+/// The message every same-device refusal gives, and that nothing was written.
+fn refused_as_one_device(result: Result<DriveSet, StoreError>) {
+    match result {
+        Err(StoreError::DriveSet(message)) => {
+            assert!(message.contains("on the same device"), "{message}");
+        }
+        other => panic!("expected a same-device refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn regression_two_ca_drives_on_one_device_are_refused() {
+    // Covers: SEC-11, FR-12 AC1, SEC-20
+    // Regression (final storage review N3): a CA could be created on, or opened from,
+    // two folders of one USB drive, so a single drive failure lost every copy.
+    crate::store::fault::clear_devices();
+    let drives = TestDrives::new(3);
+    // Create: two folders on one simulated device are refused before anything is written.
+    crate::store::fault::put_on_device(drives.ca_drive(0), 7);
+    crate::store::fault::put_on_device(drives.ca_drive(1), 7);
+    crate::store::fault::put_on_device(drives.ca_drive(2), 8);
+    refused_as_one_device(DriveSet::create(
+        drives.ca_drive(0),
+        &[drives.ca_drive(2), drives.ca_drive(1)],
+        ts(0),
+    ));
+    for root in drives.ca_drives() {
+        assert_eq!(fs::read_dir(root).expect("list").count(), 0, "untouched");
+    }
+    // Two folders on one USB drive: everything inside a drive is on its device.
+    let (first, second) = (
+        drives.ca_drive(2).join("first"),
+        drives.ca_drive(2).join("second"),
+    );
+    fs::create_dir(&first).expect("mkdir");
+    fs::create_dir(&second).expect("mkdir");
+    refused_as_one_device(DriveSet::create(&first, &[&second], ts(0)));
+    assert_eq!(fs::read_dir(&first).expect("list").count(), 0, "untouched");
+    fs::remove_dir(&first).expect("rmdir");
+    fs::remove_dir(&second).expect("rmdir");
+    // Separate devices: accepted.
+    let set = DriveSet::create(drives.ca_drive(0), &[drives.ca_drive(2)], ts(0)).expect("create");
+    assert_eq!(set.drives().len(), 2);
+    // Open: two CA drives found on one device are refused, whichever order.
+    crate::store::fault::put_on_device(drives.ca_drive(2), 7);
+    refused_as_one_device(DriveSet::open(&[drives.ca_drive(0), drives.ca_drive(2)]));
+    refused_as_one_device(DriveSet::open(&[drives.ca_drive(2), drives.ca_drive(0)]));
+    // A copy of a CA drive's folder nested inside another drive is refused too.
+    crate::store::fault::clear_devices();
+    let nested = drives.ca_drive(0).join("old-backup");
+    fs::create_dir(&nested).expect("mkdir");
+    copy_folder(
+        &drives.ca_drive(2).join(KEYSTONE_DIR),
+        &nested.join(KEYSTONE_DIR),
+    );
+    refused_as_one_device(DriveSet::open(&[drives.ca_drive(0), &nested]));
+    // Drives on separate devices open as before.
+    DriveSet::open(&[drives.ca_drive(0), drives.ca_drive(2)]).expect("open");
+    // Finishing an interrupted setup checks the devices before writing too.
+    let unfinished = TestDrives::new(2);
+    fs::create_dir(unfinished.ca_drive(0).join(KEYSTONE_DIR)).expect("mkdir");
+    crate::store::fault::put_on_device(unfinished.ca_drive(0), 3);
+    crate::store::fault::put_on_device(unfinished.ca_drive(1), 3);
+    refused_as_one_device(DriveSet::finish_setup(
+        unfinished.ca_drive(0),
+        &[unfinished.ca_drive(1)],
+        ts(0),
+    ));
+    assert_eq!(
+        fs::read_dir(unfinished.ca_drive(1)).expect("list").count(),
+        0,
+        "untouched"
+    );
+    crate::store::fault::clear_devices();
 }
 
 #[test]

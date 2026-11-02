@@ -16,9 +16,14 @@
 //!   cached synthetic key from `keystone-testkit` (RSA 8,192 generation takes minutes).
 //! - [`queue_serial_candidate`]: make serial planning try a given value first, to prove
 //!   that a serial seen in any history is never used again (FR-10 AC2).
+//! - [`put_on_device`]: put a test drive folder on a simulated device, to prove that two
+//!   CA drives on one device are refused (SEC-11). Without it, test drive folders count
+//!   as separate devices unless one is inside the other; a production build always
+//!   compares the real device numbers.
 #![forbid(unsafe_code)]
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 
 use crate::crypto::RsaPrivateKey;
 use crate::model::Serial;
@@ -69,12 +74,19 @@ pub fn queue_serial_candidate(serial: Serial) {
     SERIALS.with(|serials| serials.borrow_mut().push(serial));
 }
 
-/// Removes every armed seam on this thread (faults, crash mode, supplied keys and
-/// serial candidates).
+/// SEC-11: from now on, on this thread, `folder` and everything inside it are on
+/// simulated device `device` (the same number for two folders simulates one USB drive).
+pub fn put_on_device(folder: &Path, device: u64) {
+    crate::store::fault::put_on_device(folder, device);
+}
+
+/// Removes every armed seam on this thread (faults, crash mode, supplied keys, serial
+/// candidates and simulated devices).
 pub fn reset() {
     FAULT.with(|fault| fault.set(None));
     CRASH_MODE.with(|mode| mode.set(false));
     crate::store::fault::disarm();
+    crate::store::fault::clear_devices();
     KEYS.with(|keys| keys.borrow_mut().clear());
     SERIALS.with(|serials| serials.borrow_mut().clear());
 }

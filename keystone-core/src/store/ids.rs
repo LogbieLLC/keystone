@@ -139,6 +139,19 @@ mod tests {
     }
 
     #[test]
+    fn regression_a_pending_operation_is_named_once() {
+        // Covers: FR-22 AC4, FR-22 AC8
+        // Regression (final storage review): the message read "operation operation 4 was
+        // interrupted", because the operation's display already says "operation".
+        let message = crate::store::StoreError::PendingOperation(OperationId(4)).to_string();
+        assert!(
+            message.starts_with("operation 4 was interrupted"),
+            "{message}"
+        );
+        assert!(!message.contains("operation operation"), "{message}");
+    }
+
+    #[test]
     fn operation_stems() {
         assert_eq!(OperationId(12).stem(), "op-000012");
         assert_eq!(OperationId::from_stem("op-000012"), Some(OperationId(12)));

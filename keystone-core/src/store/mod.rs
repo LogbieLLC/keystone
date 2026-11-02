@@ -16,6 +16,8 @@
 //!     drive.json                 drive identity (DriveIdentity): CA id, drive id, role
 //!     audit.log                  hash-chained audit log, JSON Lines (audit module)
 //!     binary.sha256              SEC-19 record: "<64 hex>  keystone\n"
+//!     replacement.json           only on a drive set up by Replace a lost drive: written
+//!                                first, the identity the copy gets (replace module)
 //!     journal/
 //!       op-000001/               one folder per operation (FR-22)
 //!         001-pending.json       first entry: kind, subject, planned serials
@@ -41,9 +43,10 @@
 //! - **Atomic writes** (FR-12 AC4): write a temporary file (`.<name>.tmp-<random>`) in the
 //!   same folder, write everything, fsync it, rename it into place, fsync the folder.
 //! - **Never overwrite** (SEC-20): certificates, keys, CRLs, record updates, journal
-//!   entries and drive identities are *create-only*; the final rename uses
-//!   `RENAME_NOREPLACE`, so an existing file is never replaced. Only `audit.log` (which
-//!   only ever grows, checked against the parsed chain) and `binary.sha256` are replaced.
+//!   entries, drive identities and replacement markers are *create-only*; the final
+//!   rename uses `RENAME_NOREPLACE`, so an existing file is never replaced. Only
+//!   `audit.log` (which only ever grows, checked against the parsed chain) and
+//!   `binary.sha256` are replaced.
 //! - **Every drive, verified** (FR-12 AC1, AC2, SEC-11): every change goes to every
 //!   connected CA drive (the primary and at least one backup); each copy is then read
 //!   back from the medium (page cache dropped first) and compared by SHA-256. Any
@@ -105,7 +108,7 @@ pub use journal::{
 pub use operation::OperationHandle;
 pub use paths::{
     AUDIT_LOG_FILE, BINARY_HASH_FILE, EXPORT_DIR, IDENTITY_FILE, JOURNAL_DIR, KEYSTONE_DIR,
-    OutputDir, OutputPath, RECORD_DIR, STAGING_DIR,
+    OutputDir, OutputPath, RECORD_DIR, REPLACEMENT_FILE, STAGING_DIR,
 };
 pub use record::{
     CertStatus, CertificateRecord, IssuanceRecord, RecordChange, RecordSource, RecordUpdate,
@@ -134,8 +137,9 @@ pub enum ParseError {
     #[error("invalid content: {0}")]
     Invalid(String),
     /// The audit log is broken. `entry` is the 1-based number of the first bad entry
-    /// (FR-14 AC3).
-    #[error("audit log entry {entry} is the first bad entry: {problem}")]
+    /// (FR-14 AC3); for [`AuditProblem::EntryOrLinkChanged`] it is the earlier of the two
+    /// entries one of which was changed.
+    #[error("{}", audit_message(*entry, problem))]
     Audit {
         /// 1-based number (line) of the first bad entry.
         entry: u64,
@@ -147,6 +151,17 @@ pub enum ParseError {
 impl ParseError {
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         ParseError::Invalid(message.into())
+    }
+}
+
+/// The text of [`ParseError::Audit`]: it names the first bad entry, or both candidates
+/// when the log cannot tell which of two was changed (review finding 16).
+fn audit_message(entry: u64, problem: &AuditProblem) -> String {
+    match problem {
+        AuditProblem::EntryOrLinkChanged { link_entry } => format!(
+            "audit log entry {entry} or the link in entry {link_entry} is the first bad entry: {problem}"
+        ),
+        _ => format!("audit log entry {entry} is the first bad entry: {problem}"),
     }
 }
 
@@ -241,7 +256,7 @@ pub enum StoreError {
     #[error("the CA drives cannot be verified, so nothing can be signed: {}", .0.join("; "))]
     Damaged(Vec<String>),
     /// An operation is pending; recovery must run first (FR-22 AC4).
-    #[error("operation {0} was interrupted; finish or abandon it on the recovery screen first")]
+    #[error("{0} was interrupted; finish or abandon it on the recovery screen first")]
     PendingOperation(OperationId),
     /// FR-10 AC2: the planned serial has been seen before in some history.
     #[error("serial number {0} was already used or reserved; a serial is never reused")]

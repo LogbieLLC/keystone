@@ -1,16 +1,26 @@
 //! Flow D (revoke and publish a CRL) and Refresh CRL (FR-11, FR-13 AC1 to AC4, FR-14).
 #![forbid(unsafe_code)]
 
+use keystone_core::cert::parse_certificate_der;
 use keystone_core::crl::{CrlFreshness, parse_crl_der};
 use keystone_core::crypto::CancelFlag;
+use keystone_core::crypto::pem;
 use keystone_core::crypto::verify::verify_crl_signature;
-use keystone_core::model::RevocationReason;
+use keystone_core::model::{CaLevel, RevocationReason, Serial, Timestamp};
 use keystone_core::ops::{
     CrlPlanKind, ExportStatus, IssuerUnlock, NoProgress, OpsError, StartupWarning,
 };
-use keystone_core::store::{AuditAction, CertStatus, OperationState};
+use keystone_core::store::audit::MAX_AUDIT_SERIALS;
+use keystone_core::store::journal::MAX_PLANNED_SERIALS;
+use keystone_core::store::{
+    AuditAction, AuditDraft, AuditResult, CertStatus, CertificateRecord, OperationKind,
+    OperationState, RecordChange, RecordUpdate, SignedObject, SubjectName,
+};
 use keystone_testkit::keys;
-use keystone_testkit::x509::{issue_test_leaf, issue_test_leaf_crl};
+use keystone_testkit::x509::{
+    TestCertSpec, TestIssuer, build_test_certificate, cn_name_der, issue_test_leaf,
+    issue_test_leaf_crl, test_ca_extensions,
+};
 use time::Duration;
 
 use crate::support::*;
@@ -229,6 +239,166 @@ fn flow_d_revoking_the_main_intermediate_is_signed_by_the_master_and_cuts_off_it
             .plan_revoke(master.serial(), RevocationReason::Superseded, time)
             .is_err()
     );
+    assert_consistent(&test.ca);
+}
+
+/// `count` sub-intermediates under the active main intermediate, written through the
+/// store API as one completed operation, so a test can have hundreds of them quickly.
+/// Each is a real certificate (signed with a cached test key, Common Name with
+/// KEYSTONE TEST), journaled as signed and recorded in the issuance record.
+fn synthetic_subs(test: &mut TestCa, label: &str, count: usize) -> Vec<Serial> {
+    let state = test.ca.state().unwrap();
+    let main = state.active_main(test.now).unwrap().clone();
+    test.now += Duration::minutes(1);
+    let time = Timestamp::utc(test.now);
+    let spki = keys::rsa2048(2).public_key_spki_der().unwrap();
+    let records: Vec<(CertificateRecord, String)> = (0..count)
+        .map(|index| {
+            let common_name = format!("KEYSTONE TEST {label} Sub {index}");
+            let der = build_test_certificate(&TestCertSpec {
+                subject_der: cn_name_der(&common_name),
+                subject_public_key_der: spki.clone(),
+                issuer: Some(TestIssuer {
+                    name_der: &main.info.subject_der,
+                    key: keys::rsa2048(3),
+                }),
+                self_key: None,
+                not_before: test.now,
+                not_after: test.now + Duration::days(90),
+                extensions: test_ca_extensions(&spki, Some(0)),
+            });
+            let info = parse_certificate_der(&der).unwrap();
+            let record = CertificateRecord {
+                serial: info.serial,
+                level: CaLevel::SubIntermediate,
+                subject: SubjectName {
+                    common_name,
+                    organization: None,
+                    country: None,
+                },
+                issuer_serial: main.serial(),
+                issuer: main.record.subject.clone(),
+                not_before: Timestamp::utc(info.not_before),
+                not_after: Timestamp::utc(info.not_after),
+                fingerprint: info.fingerprint,
+                name_constraints: true,
+                permitted_dns: vec!["starnet".to_owned()],
+                permitted_ip: Vec::new(),
+                attestation_pem: None,
+            };
+            (record, pem::encode("CERTIFICATE", &der))
+        })
+        .collect();
+    let set = test.ca.drive_set();
+    let subject = format!("KEYSTONE TEST {label} synthetic sub-intermediates");
+    // One operation per batch: a pending entry reserves at most MAX_PLANNED_SERIALS.
+    for batch in records.chunks(MAX_PLANNED_SERIALS) {
+        let planned: Vec<Serial> = batch.iter().map(|(record, _)| record.serial).collect();
+        let mut op = set
+            .begin_operation(
+                OperationKind::CreateSubIntermediate,
+                &subject,
+                &planned,
+                time,
+            )
+            .unwrap();
+        for (record, pem) in batch {
+            op.record_signed(
+                SignedObject::Certificate {
+                    record: Box::new(record.clone()),
+                    pem: pem.clone(),
+                },
+                time,
+            )
+            .unwrap();
+        }
+        let update = RecordUpdate::new(
+            op.id(),
+            batch
+                .iter()
+                .map(|(record, _)| RecordChange::Issued {
+                    certificate: Box::new(record.clone()),
+                })
+                .collect(),
+        );
+        op.stage(update.output_path(), &update.to_bytes()).unwrap();
+        op.seal_staging(time).unwrap();
+        op.commit().unwrap();
+        op.append_audit(
+            &[AuditDraft::new(
+                AuditAction::CreateSubIntermediate,
+                subject.clone(),
+                AuditResult::Success,
+            )],
+            time,
+        )
+        .unwrap();
+        op.complete(time).unwrap();
+    }
+    records.iter().map(|(record, _)| record.serial).collect()
+}
+
+#[test]
+fn regression_revoking_a_main_intermediate_with_hundreds_of_subs_audits_every_serial() {
+    // Covers: FR-14 AC1, FR-15 AC1, FR-13 AC1, FR-22 AC3
+    // Regression (final storage review): the revocation's audit note listed every
+    // sub-intermediate it cut off; from about 95 of them the note was longer than
+    // MAX_AUDIT_TEXT, the audit append failed after the CRL was signed and the
+    // revocation always ended on the recovery screen. The recovery entry kept only 256
+    // serials.
+    let (mut test, _token, _) = ca_with_main("D6", 40_000_006);
+    let subs = synthetic_subs(&mut test, "D6", 300);
+    let main = test
+        .ca
+        .state()
+        .unwrap()
+        .active_main(test.now)
+        .unwrap()
+        .serial();
+    let time = test.tick();
+    let master_words = test.master_entered();
+    let outcome = test
+        .ca
+        .plan_revoke(main, RevocationReason::KeyCompromise, time)
+        .unwrap()
+        .execute(
+            &test.ca,
+            IssuerUnlock::Master(&master_words),
+            None,
+            &NoProgress,
+            &CancelFlag::new(),
+        )
+        .expect("the revocation completes");
+    assert_eq!(outcome.revoked_by_ancestor, subs);
+    // Its audit entries list every serial, the revoked one first, none dropped; each
+    // entry stays within the limits and its note is short.
+    let log = test.ca.drive_set().audit_log().unwrap();
+    let entries: Vec<_> = log
+        .entries()
+        .iter()
+        .filter(|entry| entry.operation == Some(outcome.operation))
+        .collect();
+    assert_eq!(entries.len(), 2, "300 + 1 serials need two entries");
+    assert_eq!(entries[0].serial, Some(main));
+    let mut listed = Vec::new();
+    for entry in &entries {
+        assert_eq!(entry.action, AuditAction::Revoke);
+        let details = entry.details.as_ref().unwrap();
+        let serials = details.serials.as_ref().unwrap();
+        assert!(serials.len() <= MAX_AUDIT_SERIALS);
+        listed.extend(serials.iter().copied());
+        assert!(details.note.as_ref().unwrap().len() < 200, "{details:?}");
+    }
+    let mut expected = vec![main];
+    expected.extend(&subs);
+    assert_eq!(listed, expected);
+    let state = test.ca.state().unwrap();
+    for serial in &subs {
+        assert!(matches!(
+            state.record().get(*serial).unwrap().status,
+            CertStatus::RevokedByAncestor { ancestor, .. } if ancestor == main
+        ));
+    }
     assert_consistent(&test.ca);
 }
 

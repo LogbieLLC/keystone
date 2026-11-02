@@ -79,6 +79,8 @@ jobs:
       # golang-go: FR-21 AC5 runs Go's crypto/x509 verifier; perl: SEC-03 kernel probe.
       - run: scripts/ci-setup.sh golang-go
       - run: cargo test --workspace --locked
+      - name: test seams are absent from a production build (FR-22 AC6, SEC-11)
+        run: SOURCE_DATE_EPOCH=1793491200 cargo test --locked -p keystone-core --features production --test ops_seams
 
   gui-e2e:
     if: github.event_name != 'schedule'
