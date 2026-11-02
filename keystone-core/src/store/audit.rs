@@ -550,6 +550,97 @@ impl CaDrive {
             source,
         })
     }
+
+    /// Reads this drive's audit log without failing: a verified log, a missing file, or
+    /// bytes that do not verify (with the reason). Comparison and repair use it so one
+    /// drive's log never stops the whole drive set from being examined (review findings
+    /// 7 and 14).
+    pub(crate) fn read_audit_log(&self) -> LogRead {
+        match self
+            .keystone()
+            .read_if_exists(AUDIT_LOG_FILE, MAX_AUDIT_LOG_BYTES)
+        {
+            Ok(None) => LogRead::Missing,
+            Ok(Some(bytes)) => match parse_audit_log(&bytes) {
+                Ok(log) => LogRead::Valid(log),
+                Err(source) => LogRead::Unverified {
+                    problem: StoreError::Parse {
+                        path: self.keystone().child(AUDIT_LOG_FILE),
+                        source,
+                    }
+                    .to_string(),
+                    bytes,
+                },
+            },
+            Err(error) => LogRead::Unreadable(error.to_string()),
+        }
+    }
+}
+
+/// A drive's audit log read without failing ([`CaDrive::read_audit_log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogRead {
+    /// The log verifies.
+    Valid(AuditLog),
+    /// There is no `audit.log` (on FAT drives a power cut during the atomic replace can
+    /// leave none).
+    Missing,
+    /// The bytes do not verify.
+    Unverified {
+        /// What is wrong, naming the first bad entry.
+        problem: String,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// The file cannot be read at all (not a regular file, too large, I/O error).
+    Unreadable(String),
+}
+
+impl LogRead {
+    /// The verified log, if it verifies.
+    pub(crate) fn valid(&self) -> Option<&AuditLog> {
+        match self {
+            LogRead::Valid(log) => Some(log),
+            _ => None,
+        }
+    }
+
+    /// The bytes on the drive (a missing file counts as empty).
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            LogRead::Valid(log) => Some(log.as_bytes()),
+            LogRead::Missing => Some(&[]),
+            LogRead::Unverified { bytes, .. } => Some(bytes),
+            LogRead::Unreadable(_) => None,
+        }
+    }
+
+    /// For a missing or partly written log only: the complete entries it holds, when its
+    /// bytes are an exact byte prefix of `reference` (a verified log the other drives
+    /// agree on). Such a drive is behind and can be repaired from `reference`: an
+    /// interrupted write, not a changed history. Anything else is `None` (damage).
+    pub(crate) fn interrupted_prefix_of(&self, reference: &AuditLog) -> Option<AuditLog> {
+        let bytes = match self {
+            LogRead::Missing => &[][..],
+            LogRead::Unverified { bytes, .. } => bytes.as_slice(),
+            LogRead::Valid(_) | LogRead::Unreadable(_) => return None,
+        };
+        if !reference.as_bytes().starts_with(bytes) {
+            return None;
+        }
+        let complete = bytes.iter().filter(|b| **b == b'\n').count();
+        parse_audit_log(reference.prefix_bytes(complete)).ok()
+    }
+
+    /// One sentence for the operator when the log does not verify.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match self {
+            LogRead::Valid(_) => None,
+            LogRead::Missing => Some(format!("{AUDIT_LOG_FILE} is missing")),
+            LogRead::Unverified { problem, .. } => Some(problem.clone()),
+            LogRead::Unreadable(reason) => Some(reason.clone()),
+        }
+    }
 }
 
 impl DriveSet {

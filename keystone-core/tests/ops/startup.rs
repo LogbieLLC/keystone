@@ -155,6 +155,45 @@ fn fr12_ac3_a_behind_drive_blocks_signing_until_the_operator_confirms_the_repair
 }
 
 #[test]
+fn regression_a_missing_audit_log_on_one_drive_is_shown_and_repaired_at_start() {
+    // Covers: FR-19 AC1, FR-12 AC3, FR-14 AC3
+    // Review findings 7 and 14: a backup without audit.log (a FAT rename cut off by a
+    // power cut) made the start checks fail for the whole drive set.
+    let mut test = new_ca("S9");
+    let (mut token, _) = token(60_000_009);
+    run_flow_b(&mut test, &mut token, "S9", false).unwrap();
+    std::fs::remove_file(test.drives.ca_drive(1).join("keystone/audit.log")).unwrap();
+    test.reopen();
+    test.now += Duration::minutes(1);
+    let report = test
+        .ca
+        .startup_report(test.now)
+        .expect("the start checks report");
+    assert!(
+        report.audit.iter().any(|status| matches!(
+            status,
+            AuditLogStatus::Broken { first_bad_entry: 0, problem, .. } if problem.contains("audit.log")
+        )),
+        "{:?}",
+        report.audit
+    );
+    let plans = report
+        .blockers
+        .iter()
+        .find_map(|b| match b {
+            Blocker::DrivesBehind { plans } => Some(plans.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("behind: {:?}", report.blockers));
+    let time = confirmed(&test.ca, test.now);
+    test.ca.repair_drives(&plans, time).unwrap();
+    let report = test.ca.startup_report(test.now).unwrap();
+    assert!(report.signing_allowed(), "{:?}", report.blockers);
+    run_flow_c(&mut test, &mut token, "S9", 1, false).expect("signing after repair");
+    assert_consistent(&test.ca);
+}
+
+#[test]
 fn fr12_ac3_diverged_histories_block_signing_and_every_serial_stays_known() {
     // Covers: FR-12 AC3, FR-10 AC2, SEC-22
     let mut test = new_ca("S4");

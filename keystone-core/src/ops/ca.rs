@@ -369,9 +369,15 @@ impl Ca {
                     drive: drive.label(),
                     entries: log.len(),
                 }),
-                Err(StoreError::Parse { source, .. }) => {
-                    let (entry, problem) = match source {
-                        ParseError::Audit { entry, problem } => (entry, problem.to_string()),
+                Err(error) => {
+                    // A missing or unreadable audit.log is reported for that drive (entry
+                    // 0: the file itself), never as a failure of the whole start check.
+                    let (entry, problem) = match error {
+                        StoreError::Parse {
+                            source: ParseError::Audit { entry, problem },
+                            ..
+                        } => (entry, problem.to_string()),
+                        StoreError::Parse { source, .. } => (0, source.to_string()),
                         other => (0, other.to_string()),
                     };
                     blockers.push(Blocker::AuditLogBroken {
@@ -385,7 +391,6 @@ impl Ca {
                         problem,
                     });
                 }
-                Err(error) => return Err(error.into()),
             }
         }
         let comparison = self.drives.compare()?;

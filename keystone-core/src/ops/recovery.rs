@@ -207,19 +207,19 @@ impl Ca {
                 Some(token) => self.token_column(token, &pending).ok(),
                 None => None,
             };
-            items.push(self.refine(pending, column)?);
+            items.push(self.refine(pending, column, report.unreadable.is_empty())?);
         }
         Ok(items)
     }
 
-    fn journals(&self, operation: OperationId) -> Result<Vec<OperationJournal>, OpsError> {
-        let mut out = Vec::new();
-        for drive in self.drive_set().drives() {
-            if let Some(journal) = drive.operation_journal(operation)? {
-                out.push(journal);
-            }
-        }
-        Ok(out)
+    /// The operation's journal on every drive where it can be read (a drive whose
+    /// journal cannot be read is reported by the store, which then offers nothing).
+    fn journals(&self, operation: OperationId) -> Vec<OperationJournal> {
+        self.drive_set()
+            .drives()
+            .iter()
+            .filter_map(|drive| drive.operation_journal(operation).ok().flatten())
+            .collect()
     }
 
     fn token_column(
@@ -248,9 +248,10 @@ impl Ca {
         &self,
         pending: PendingOperation,
         column: Option<TokenColumn>,
+        every_journal_readable: bool,
     ) -> Result<RecoveryItem, OpsError> {
         let operation = pending.operation;
-        let journals = self.journals(operation)?;
+        let journals = self.journals(operation);
         let longest = journals
             .iter()
             .max_by_key(|journal| journal.entries().len())
@@ -320,6 +321,7 @@ impl Ca {
             }
         }
         if actions.is_empty()
+            && every_journal_readable
             && consistent
             && !sealed
             && pending.signed_output_exists

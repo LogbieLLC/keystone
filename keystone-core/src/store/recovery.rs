@@ -26,8 +26,8 @@
 #![forbid(unsafe_code)]
 
 use super::StoreError;
-use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult};
-use super::compare::{copy_journal_entries, copy_output, extend_log};
+use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult, LogRead};
+use super::compare::{copy_journal_entries, copy_output, extend_log, reference_log};
 use super::drive::{CaDrive, DriveSet, to_json_file};
 use super::fsio::WriteMode;
 use super::ids::OperationId;
@@ -167,12 +167,16 @@ pub struct PendingOperation {
 pub struct RecoveryReport {
     /// Interrupted operations, oldest first.
     pub pending: Vec<PendingOperation>,
+    /// Drives whose journal cannot be read, one sentence each (review finding 7). An
+    /// interrupted operation is then still listed from the other drives, but no action
+    /// is offered for it until that drive is repaired or replaced.
+    pub unreadable: Vec<String>,
 }
 
 impl RecoveryReport {
-    /// True when nothing needs recovery.
+    /// True when nothing needs recovery and every drive's journal could be read.
     pub fn is_clean(&self) -> bool {
-        self.pending.is_empty()
+        self.pending.is_empty() && self.unreadable.is_empty()
     }
 }
 
@@ -181,6 +185,15 @@ fn file_state(data: Option<Vec<u8>>, expected: Sha256Digest) -> FileState {
         None => FileState::Missing,
         Some(data) if sha256(&data) == expected => FileState::Verified,
         Some(_) => FileState::Differs,
+    }
+}
+
+/// A copy on a drive compared with its listed SHA-256; a copy that cannot be read (not a
+/// regular file, too large, an I/O error) counts as different, so the view never fails.
+fn read_state(drive: &CaDrive, rel: &str, name: &str, expected: Sha256Digest) -> FileState {
+    match drive.read_at(rel, name, MAX_OUTPUT_FILE_BYTES) {
+        Ok(data) => file_state(data, expected),
+        Err(_) => FileState::Differs,
     }
 }
 
@@ -205,14 +218,8 @@ fn view(
         outputs.push(OutputState {
             path: output.path.clone(),
             sha256: output.sha256,
-            staged: file_state(
-                drive.read_at(&staging_rel(operation, dir), name, MAX_OUTPUT_FILE_BYTES)?,
-                output.sha256,
-            ),
-            placed: file_state(
-                drive.read_at(dir.name(), name, MAX_OUTPUT_FILE_BYTES)?,
-                output.sha256,
-            ),
+            staged: read_state(drive, &staging_rel(operation, dir), name, output.sha256),
+            placed: read_state(drive, dir.name(), name, output.sha256),
         });
     }
     let mut unlisted = Vec::new();
@@ -228,8 +235,10 @@ fn view(
             {
                 continue;
             }
-            let data = folder.read(&name, MAX_OUTPUT_FILE_BYTES)?;
-            unlisted.push((format!("{}/{name}", dir.name()), sha256(&data)));
+            // Only regular files that can be read are listed with their hash.
+            if let Ok(data) = folder.read(&name, MAX_OUTPUT_FILE_BYTES) {
+                unlisted.push((format!("{}/{name}", dir.name()), sha256(&data)));
+            }
         }
     }
     let mut signed_certificates = Vec::new();
@@ -240,12 +249,12 @@ fn view(
             SignedObject::Crl(crl) => signed_crls.push(crl.crl_number),
         }
     }
-    let audit_entries = drive
-        .audit_log()?
-        .entries()
-        .iter()
-        .filter(|entry| entry.operation == Some(operation))
-        .count();
+    let audit_entries = drive.read_audit_log().valid().map_or(0, |log| {
+        log.entries()
+            .iter()
+            .filter(|entry| entry.operation == Some(operation))
+            .count()
+    });
     Ok(DriveOperationView {
         drive_index,
         drive: drive.label(),
@@ -279,14 +288,28 @@ fn journal_prefix(shorter: &OperationJournal, longer: &OperationJournal) -> bool
 impl DriveSet {
     /// FR-22 AC4: every operation that is pending on at least one drive, with what each
     /// drive holds and the safe actions.
+    ///
+    /// A drive whose journal cannot be read does not stop the report (review finding 7):
+    /// it is listed in [`RecoveryReport::unreadable`] and every interrupted operation is
+    /// then shown from the other drives, without any action.
     pub fn recovery_report(&self) -> Result<RecoveryReport, StoreError> {
-        let journals: Vec<_> = self
-            .drives()
-            .iter()
-            .map(CaDrive::journal)
-            .collect::<Result<_, _>>()?;
+        let mut report = RecoveryReport::default();
+        let mut journals = Vec::new();
+        for drive in self.drives() {
+            match drive.journal() {
+                Ok(journal) => journals.push(Some(journal)),
+                Err(error) => {
+                    report.unreadable.push(format!(
+                        "the journal on {} cannot be read: {error}",
+                        drive.label()
+                    ));
+                    journals.push(None);
+                }
+            }
+        }
         let mut operations: Vec<OperationId> = journals
             .iter()
+            .flatten()
             .flat_map(|journal| {
                 journal
                     .iter()
@@ -296,13 +319,15 @@ impl DriveSet {
             .collect();
         operations.sort();
         operations.dedup();
-        let mut report = RecoveryReport::default();
+        let unreadable: Vec<bool> = journals.iter().map(Option::is_none).collect();
         for operation in operations {
             let per_drive: Vec<Option<&OperationJournal>> = journals
                 .iter()
-                .map(|journal| journal.get(&operation))
+                .map(|journal| journal.as_ref().and_then(|j| j.get(&operation)))
                 .collect();
-            report.pending.push(self.analyse(operation, &per_drive)?);
+            report
+                .pending
+                .push(self.analyse(operation, &per_drive, &unreadable)?);
         }
         Ok(report)
     }
@@ -311,6 +336,7 @@ impl DriveSet {
         &self,
         operation: OperationId,
         per_drive: &[Option<&OperationJournal>],
+        unreadable: &[bool],
     ) -> Result<PendingOperation, StoreError> {
         let mut drives = Vec::new();
         for (index, (drive, journal)) in self.drives().iter().zip(per_drive).enumerate() {
@@ -351,7 +377,18 @@ impl DriveSet {
         };
         let mut actions = Vec::new();
         let mut blocked_reason = None;
-        if !consistent {
+        let unreadable_drives: Vec<&str> = drives
+            .iter()
+            .zip(unreadable)
+            .filter(|(_, unreadable)| **unreadable)
+            .map(|(view, _)| view.drive.as_str())
+            .collect();
+        if !unreadable_drives.is_empty() {
+            blocked_reason = Some(format!(
+                "the journal on {} cannot be read, so what that drive holds for this operation is unknown; no automatic action is safe until it is repaired or replaced",
+                unreadable_drives.join(" and ")
+            ));
+        } else if !consistent {
             blocked_reason = Some(
                 "the drives hold different journals for this operation; no automatic action is safe"
                     .to_string(),
@@ -606,38 +643,88 @@ impl DriveSet {
     /// Makes every drive hold this operation's audit entries when some drive already has
     /// them (an interruption between drives). Returns true when the entries exist.
     fn sync_operation_audit(&self, operation: OperationId) -> Result<bool, StoreError> {
-        let logs: Vec<_> = self
-            .drives()
+        let reads: Vec<LogRead> = self.drives().iter().map(CaDrive::read_audit_log).collect();
+        let source = reference_log(&reads).ok_or_else(|| {
+            StoreError::OutOfSync("the audit logs differ; compare the drives first".to_string())
+        })?;
+        let source_drive = reads
             .iter()
-            .map(CaDrive::audit_log)
-            .collect::<Result<_, _>>()?;
-        let longest = (0..logs.len()).max_by_key(|i| logs[*i].len()).unwrap_or(0);
-        if logs.iter().any(|log| !log.is_prefix_of(&logs[longest])) {
-            return Err(StoreError::OutOfSync(
-                "the audit logs differ; compare the drives first".to_string(),
-            ));
-        }
-        let source = &logs[longest];
+            .position(|read| read.valid() == Some(source))
+            .map(|index| &self.drives()[index])
+            .ok_or_else(|| StoreError::Unsafe("no drive holds a verified audit log".into()))?;
         let has_entries = source
             .entries()
             .iter()
             .any(|e| e.operation == Some(operation));
-        for (drive, log) in self.drives().iter().zip(&logs) {
-            if log.len() < source.len() {
-                if source.entries()[log.len()..]
-                    .iter()
-                    .any(|entry| entry.operation != Some(operation))
-                {
-                    return Err(StoreError::OutOfSync(format!(
-                        "{} is missing more than this operation's audit entries; compare the drives first",
-                        drive.label()
-                    )));
-                }
-                extend_log(drive, source, source.len() as u64)?;
+        for (drive, read) in self.drives().iter().zip(&reads) {
+            // A missing or cut-off audit.log (a power cut during the atomic replace on a
+            // FAT drive) counts by the complete entries it holds (review finding 14).
+            let current = match read {
+                LogRead::Valid(log) => log.clone(),
+                other => other.interrupted_prefix_of(source).ok_or_else(|| {
+                    StoreError::OutOfSync(format!(
+                        "{}: {}; compare the drives first",
+                        drive.label(),
+                        other.problem().unwrap_or_default()
+                    ))
+                })?,
+            };
+            if current.len() == source.len() && read.valid().is_some() {
+                continue;
             }
+            // Only this operation's entries, entries of no operation, and entries of
+            // operations this drive already holds whole (journal and outputs, as on the
+            // source) may be added here; anything else is a repair (FR-12 AC3).
+            let mut checked: Vec<OperationId> = Vec::new();
+            for entry in &source.entries()[current.len()..] {
+                match entry.operation {
+                    None => {}
+                    Some(op) if op == operation || checked.contains(&op) => {}
+                    Some(op) => {
+                        if !holds_whole(source_drive, drive, op)? {
+                            return Err(StoreError::OutOfSync(format!(
+                                "{} is missing more than this operation's audit entries; compare the drives first",
+                                drive.label()
+                            )));
+                        }
+                        checked.push(op);
+                    }
+                }
+            }
+            extend_log(drive, source, source.len() as u64)?;
         }
         Ok(has_entries)
     }
+}
+
+/// True when `drive` holds `operation` exactly as `source` does: the same finished
+/// journal, byte for byte, and every output its completed entry lists, verified.
+fn holds_whole(
+    source: &CaDrive,
+    drive: &CaDrive,
+    operation: OperationId,
+) -> Result<bool, StoreError> {
+    let Some(theirs) = source.operation_journal(operation)? else {
+        return Ok(false);
+    };
+    let Some(ours) = drive.operation_journal(operation)? else {
+        return Ok(false);
+    };
+    if theirs.terminal().is_none() || ours.raw_entries() != theirs.raw_entries() {
+        return Ok(false);
+    }
+    for output in ours.completed_outputs().unwrap_or_default() {
+        if read_state(
+            drive,
+            output.path.dir().name(),
+            output.path.name(),
+            output.sha256,
+        ) != FileState::Verified
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The `recovery_finish` audit entry of an operation finished from `src` (FR-14 AC1,

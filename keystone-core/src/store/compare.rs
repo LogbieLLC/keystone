@@ -18,7 +18,9 @@
 #![forbid(unsafe_code)]
 
 use super::StoreError;
-use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditEntry, AuditLog, AuditResult};
+use super::audit::{
+    AuditAction, AuditDetails, AuditDraft, AuditEntry, AuditLog, AuditResult, LogRead,
+};
 use super::drive::{CaDrive, DriveSet};
 use super::fsio::WriteMode;
 use super::ids::OperationId;
@@ -152,34 +154,81 @@ pub(crate) fn drive_problems(drive: &CaDrive, log: &AuditLog) -> Result<Vec<Stri
     Ok(problems)
 }
 
+/// [`drive_problems`], with a drive whose journal cannot be read reported as one more
+/// problem of that drive instead of an error for the whole set (review finding 7).
+fn drive_problems_reported(drive: &CaDrive, log: &AuditLog) -> Vec<String> {
+    drive_problems(drive, log).unwrap_or_else(|error| vec![format!("{}: {error}", drive.label())])
+}
+
+/// The verified log the other drives agree on: the longest verified log, when every
+/// verified log is an exact prefix of it.
+pub(crate) fn reference_log(reads: &[LogRead]) -> Option<&AuditLog> {
+    let valid: Vec<&AuditLog> = reads.iter().filter_map(LogRead::valid).collect();
+    let longest = valid.iter().copied().max_by_key(|log| log.len())?;
+    valid
+        .iter()
+        .all(|log| log.is_prefix_of(longest))
+        .then_some(longest)
+}
+
 impl DriveSet {
     /// Compares the drives (FR-12 AC3, FR-19 AC1, SEC-09). Run at every start.
+    ///
+    /// Never fails because of one drive: an unreadable journal or audit log is reported
+    /// as a problem of that drive (review finding 7). A missing `audit.log`, or one whose
+    /// bytes are an exact prefix of the log the other drives agree on (a write cut off by
+    /// a power cut; on FAT the atomic replace is not crash-safe), makes that drive
+    /// *behind*: it is repaired from the others (review finding 14). A complete, verified
+    /// log that the drive's own journals contradict stays damage.
     pub fn compare(&self) -> Result<DriveComparison, StoreError> {
+        let reads: Vec<LogRead> = self.drives().iter().map(CaDrive::read_audit_log).collect();
+        let reference = reference_log(&reads);
         let mut logs = Vec::new();
+        let mut interrupted = Vec::new();
         let mut problems = Vec::new();
-        for drive in self.drives() {
-            match drive.audit_log() {
-                Ok(log) => {
-                    problems.extend(drive_problems(drive, &log)?);
-                    logs.push(log);
+        for (drive, read) in self.drives().iter().zip(&reads) {
+            if let LogRead::Valid(log) = read {
+                problems.extend(drive_problems_reported(drive, log));
+                logs.push(log.clone());
+                interrupted.push(false);
+                continue;
+            }
+            match reference.and_then(|reference| read.interrupted_prefix_of(reference)) {
+                Some(prefix) => {
+                    // Its journals are checked against the log it will hold once repaired.
+                    if let Some(reference) = reference {
+                        problems.extend(drive_problems_reported(drive, reference));
+                    }
+                    logs.push(prefix);
+                    interrupted.push(true);
                 }
-                Err(StoreError::Parse { source, .. }) => {
-                    problems.push(format!("{}: {source}", drive.label()));
+                None => {
+                    problems.push(format!(
+                        "{}: {}",
+                        drive.label(),
+                        read.problem().unwrap_or_default()
+                    ));
                     logs.push(AuditLog::empty());
+                    interrupted.push(false);
                 }
-                Err(error) => return Err(error),
             }
         }
         if !problems.is_empty() {
             return Ok(DriveComparison::Damaged { problems });
         }
         let longest = (0..logs.len())
-            .max_by_key(|index| (logs[*index].len(), std::cmp::Reverse(*index)))
+            .max_by_key(|index| {
+                (
+                    logs[*index].len(),
+                    !interrupted[*index],
+                    std::cmp::Reverse(*index),
+                )
+            })
             .unwrap_or(0);
         if logs.iter().all(|log| log.is_prefix_of(&logs[longest])) {
             let mut plans = Vec::new();
             for (target, log) in logs.iter().enumerate() {
-                if log.len() < logs[longest].len() {
+                if log.len() < logs[longest].len() || interrupted[target] {
                     // A behind drive that cannot be repaired safely is a blocking problem.
                     match self.plan_repair(longest, target) {
                         Ok(plan) => plans.push(plan),
@@ -229,7 +278,19 @@ impl DriveSet {
         target: usize,
     ) -> Result<RepairPlan, StoreError> {
         let (src, dst) = (&self.drives()[source], &self.drives()[target]);
-        let (src_log, dst_log) = (src.audit_log()?, dst.audit_log()?);
+        let src_log = src.audit_log()?;
+        let dst_read = dst.read_audit_log();
+        let dst_log = match &dst_read {
+            LogRead::Valid(log) => log.clone(),
+            other => other.interrupted_prefix_of(&src_log).ok_or_else(|| {
+                StoreError::Unsafe(format!(
+                    "{}: {}; it is not part of {}'s log and cannot be repaired automatically",
+                    dst.label(),
+                    other.problem().unwrap_or_default(),
+                    src.label()
+                ))
+            })?,
+        };
         if !dst_log.is_prefix_of(&src_log) {
             return Err(StoreError::Unsafe(format!(
                 "{} is not an exact prefix of {}; it cannot be repaired automatically",
@@ -396,12 +457,16 @@ impl DriveSet {
                 copied += 1;
             }
         }
+        // A drive whose audit.log was missing or cut off holds the complete log again
+        // (even when nothing else was missing).
+        extend_log(dst, &src_log, src_log.len() as u64)?;
         Ok(copied)
     }
 }
 
 /// The target's journal for `operation` must be a byte-identical prefix of the source's,
-/// without its final entry.
+/// without its final entry, or the source's whole journal byte for byte (a drive that
+/// lost only its audit log already holds it; copying it again changes nothing).
 fn check_target_journal(
     dst: &CaDrive,
     operation: OperationId,
@@ -410,6 +475,9 @@ fn check_target_journal(
     if let Some(existing) = dst.operation_journal(operation)? {
         let ours = existing.raw_entries();
         let theirs = source.raw_entries();
+        if ours == theirs {
+            return Ok(());
+        }
         if existing.terminal().is_some()
             || ours.len() > theirs.len()
             || ours.iter().zip(theirs).any(|(a, b)| a != b)
@@ -490,16 +558,24 @@ pub(crate) fn copy_output(
     dst.write_one_verified(dir, name, &data, WriteMode::CreateOnly)
 }
 
-/// Extends `dst`'s audit log to the first `seq` entries of `source` (whose prefix it must
-/// already be). Atomic replace; verified by read-back.
+/// Extends `dst`'s audit log to the first `seq` entries of `source` (whose exact byte
+/// prefix it must already be; a missing or cut-off file counts by its bytes). Atomic
+/// replace; verified by read-back.
 pub(crate) fn extend_log(dst: &CaDrive, source: &AuditLog, seq: u64) -> Result<(), StoreError> {
-    let current = dst.audit_log()?;
-    let count = usize::try_from(seq).unwrap_or(usize::MAX);
-    if current.len() >= count {
+    let read = dst.read_audit_log();
+    let count = usize::try_from(seq).unwrap_or(usize::MAX).min(source.len());
+    if read.valid().is_some_and(|current| current.len() >= count) {
         return Ok(());
     }
+    let current = read.bytes().ok_or_else(|| {
+        StoreError::Unsafe(format!(
+            "the audit log on {} cannot be read: {}",
+            dst.label(),
+            read.problem().unwrap_or_default()
+        ))
+    })?;
     let bytes = source.prefix_bytes(count);
-    if !bytes.starts_with(current.as_bytes()) {
+    if !bytes.starts_with(current) {
         return Err(StoreError::Unsafe(format!(
             "{} no longer holds a prefix of the source log",
             dst.label()
