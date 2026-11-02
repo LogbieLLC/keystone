@@ -33,7 +33,7 @@ use super::compare::{
 };
 use super::drive::{
     CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, IDENTITY_FORMAT, classify_drive,
-    layout_folders, write_identity,
+    layout_folders, same_device, write_identity,
 };
 use super::fsio::{Dir, EntryKind, WriteMode};
 use super::ids::DriveId;
@@ -87,7 +87,8 @@ impl DriveSet {
     /// Plans copying this CA to a new drive at `target` (see the module documentation).
     /// Refuses while the connected drives are not in sync, while an operation is
     /// interrupted, and for a target that is not empty (except an interrupted copy of
-    /// this CA) or is one of the connected drives.
+    /// this CA), is one of the connected drives, or is on the same device as one of them
+    /// (SEC-11). The target need not be a mount point: a folder on the new drive is fine.
     pub fn plan_add_drive(&self, target: &Path) -> Result<AddDrivePlan, StoreError> {
         match self.compare()? {
             DriveComparison::InSync => {}
@@ -117,6 +118,14 @@ impl DriveSet {
             {
                 return Err(StoreError::DriveSet(format!(
                     "{} is {}; choose a new, empty drive",
+                    target.display(),
+                    drive.label()
+                )));
+            }
+            // SEC-11: the new drive must be a separate device (a folder on it is fine).
+            if same_device(target, drive.root())? {
+                return Err(StoreError::DriveSet(format!(
+                    "this folder ({}) is on the same device as the {}; choose a folder on a new, separate USB drive",
                     target.display(),
                     drive.label()
                 )));

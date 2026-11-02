@@ -169,6 +169,59 @@ fn sec20_replacement_targets_are_refused_unless_empty() {
     assert!(!damaged.join("keystone/drive.json").exists());
 }
 
+/// A same-device refusal naming the connected drive.
+fn refused_as_same_device(result: Result<AddDrivePlan, StoreError>, drive: &CaDrive) {
+    match result {
+        Err(StoreError::DriveSet(message)) => assert!(
+            message.contains("on the same device as") && message.contains(&drive.label()),
+            "{message}"
+        ),
+        other => panic!("expected a same-device refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn regression_a_replacement_target_on_a_connected_drives_device_is_refused() {
+    // Covers: SEC-11, FR-12 AC1
+    // Regression (final storage review N3): a folder inside a connected drive (even its
+    // own staging folder) was accepted as the "new" drive, so the CA was "replaced" onto
+    // the device it already used.
+    fault::clear_devices();
+    let mut drives = ca(2);
+    let pair = open_some(&drives, &[0, 1]);
+    let primary = open_some(&drives, &[0]);
+    // A sub-folder of the backup, the primary's own folder tree and the staging folder.
+    let in_backup = drives.ca_drive(1).join("second-copy");
+    fs::create_dir(&in_backup).expect("mkdir");
+    refused_as_same_device(pair.plan_add_drive(&in_backup), &pair.drives()[1]);
+    let in_primary = drives.ca_drive(0).join("copy");
+    fs::create_dir(&in_primary).expect("mkdir");
+    refused_as_same_device(primary.plan_add_drive(&in_primary), &primary.drives()[0]);
+    let staging = drives.ca_drive(1).join("keystone/staging");
+    refused_as_same_device(pair.plan_add_drive(&staging), &pair.drives()[1]);
+    // A separate folder that the operating system reports on the primary's device.
+    let new = drives.add_ca_drive();
+    fault::put_on_device(drives.ca_drive(0), 41);
+    fault::put_on_device(drives.ca_drive(1), 42);
+    fault::put_on_device(&new, 41);
+    refused_as_same_device(primary.plan_add_drive(&new), &primary.drives()[0]);
+    refused_as_same_device(pair.plan_add_drive(&new), &pair.drives()[0]);
+    // Nothing was written to any refused target.
+    for target in [&in_backup, &in_primary, &staging, &new] {
+        assert_eq!(fs::read_dir(target).expect("list").count(), 0, "{target:?}");
+    }
+    // On its own device, a folder on the new drive is accepted: it need not be the
+    // drive's mount point.
+    fault::put_on_device(&new, 43);
+    let folder = new.join("keystone-ca");
+    fs::create_dir(&folder).expect("mkdir");
+    let plan = primary.plan_add_drive(&folder).expect("plan");
+    assert_eq!(plan.state, NewDriveState::Empty);
+    let set = primary.add_drive(&plan, ts(30)).expect("add");
+    set.ensure_writable().expect("writable");
+    fault::clear_devices();
+}
+
 #[test]
 fn sec11_no_drive_is_added_while_drives_differ_or_an_operation_is_pending() {
     // Covers: SEC-11, SEC-22, FR-22 AC4

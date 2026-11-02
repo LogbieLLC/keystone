@@ -279,6 +279,21 @@ fn sec11_a_replacement_is_refused_while_unsafe() {
         Err(OpsError::Store(StoreError::DriveNotEmpty { .. }))
     ));
     assert!(ca.plan_replace_drive(&roots[1], time).is_err());
+    // SEC-11: a new drive on the same device as a connected drive (final storage review
+    // N3), shown with a plain sentence; a folder on a separate device is accepted.
+    let same = test.drives.add_ca_drive();
+    testing::put_on_device(&roots[1], 61);
+    testing::put_on_device(&same, 61);
+    match ca.plan_replace_drive(&same, time) {
+        Err(OpsError::Store(StoreError::DriveSet(message))) => assert!(
+            message.contains("is on the same device as the backup drive"),
+            "{message}"
+        ),
+        other => panic!("expected a same-device refusal, got {other:?}"),
+    }
+    testing::put_on_device(&same, 62);
+    assert!(ca.plan_replace_drive(&same, time).is_ok());
+    testing::reset();
     // An interrupted operation.
     let (plan, passphrase, _) = plan_flow_c(&mut test, "D4b").unwrap();
     testing::supply_generated_key(keystone_testkit::keys::rsa4096(4));
