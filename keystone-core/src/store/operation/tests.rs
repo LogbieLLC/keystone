@@ -140,6 +140,52 @@ fn fr16_cancel_before_a_persistent_change_keeps_the_serial_reserved() {
 }
 
 #[test]
+fn regression_cancel_on_a_resumed_operation_removes_every_staged_file() {
+    // Covers: FR-16 AC2, FR-22 AC7
+    // Regression (review finding 9): a resumed handle knows no staged outputs until
+    // staging is sealed, so cancel deleted nothing and the staged key stayed behind.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateMaster,
+            "CN=KEYSTONE TEST",
+            &[serial(1)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.stage(key_path(1), encrypted_key_pem(serial(1)).as_bytes())
+        .expect("stage");
+    // A second file reached only the primary before an interruption.
+    crate::store::fault::fail_after(1);
+    assert!(
+        op.stage(
+            OutputPath::new(OutputDir::Certs, "partial.crt").expect("path"),
+            cert_pem(serial(1)).as_bytes(),
+        )
+        .is_err()
+    );
+    crate::store::fault::disarm();
+    drop(op);
+    let set = open_all(&drives);
+    let op = set.resume_operation(id).expect("resume");
+    assert!(op.outputs().is_empty(), "a resumed handle lists no outputs");
+    op.cancel(ts(6)).expect("cancel");
+    for root in drives.ca_drives() {
+        assert_eq!(journal_of(root, id).state(), OperationState::Cancelled);
+        let staging = root.join("keystone/staging").join(id.stem());
+        assert!(
+            !staging.exists(),
+            "{} still holds {:?}",
+            staging.display(),
+            all_files(&staging)
+        );
+    }
+    assert!(set.ensure_in_sync().is_ok());
+}
+
+#[test]
 fn fr16_no_cancel_after_a_signature() {
     // Covers: FR-16 AC1, FR-22 AC3
     let drives = TestDrives::new(2);

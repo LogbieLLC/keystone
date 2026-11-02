@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use super::audit::{AuditDraft, AuditResult};
 use super::compare::drive_problems;
 use super::drive::{DriveSet, to_json_file};
-use super::fsio::WriteMode;
+use super::fsio::{EntryKind, WriteMode};
 use super::ids::{MAX_OPERATION_ID, OperationId};
 use super::journal::{
     AuditHead, JOURNAL_FORMAT, JournalEntry, JournalEvent, MAX_OUTPUTS, MAX_STEP, OperationKind,
@@ -660,14 +660,20 @@ impl OperationHandle<'_> {
                 "the operation made a persistent change and can no longer be cancelled",
             ));
         }
+        // Every file in this operation's staging folder goes, not only the outputs this
+        // handle staged: a resumed handle knows none until staging is sealed, and an
+        // interrupted earlier attempt may have left a copy (or a temporary file) on some
+        // drives only (FR-16 AC2: no output left behind; review finding 9).
         let staging = format!("{STAGING_DIR}/{}", self.id.stem());
         for drive in self.set.drives() {
-            for output in &self.outputs {
-                if let Some(dir) =
-                    drive.dir_at(&format!("{staging}/{}", output.path.dir().name()), false)?
-                    && dir.kind(output.path.name())?.is_some()
-                {
-                    dir.remove_file(output.path.name())?;
+            for dir_name in OutputDir::ALL.map(OutputDir::name) {
+                let Some(dir) = drive.dir_at(&format!("{staging}/{dir_name}"), false)? else {
+                    continue;
+                };
+                for (name, kind) in dir.entries()? {
+                    if kind == EntryKind::File {
+                        dir.remove_file(&name)?;
+                    }
                 }
             }
             remove_empty_staging(drive, &staging)?;
