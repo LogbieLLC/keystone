@@ -7,6 +7,11 @@
 //!
 //! Usage: cargo run -p keystone-testkit --example scan_plaintext_keys -- <path> [<path> ...]
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line CI tool: its only output is the scan result for the job log"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

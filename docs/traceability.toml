@@ -17,7 +17,7 @@
 "NFR-10" = "Usability walkthrough of Flows A to E, passphrase confirmation and the recovery screen by the maintainer before every full release (TESTING.md TEST-08)."
 
 [ci-job]
-"FR-10 AC4" = "CI job `rfc5280-lint` runs pkilint on every certificate and CRL produced by the sample generator (scripts/lint-samples.sh)."
+"FR-10 AC4" = "CI job `rfc5280-lint` (scripts/lint-samples.sh) lints every certificate produced by the sample generator with zlint v3.7.3 (RFC 5280, 5480 and 5891 rules only) and every CRL with pkilint 0.13.3; any error or warning fails the job. The tool choice is recorded in docs/adr/0002-rfc5280-lint-tools.md."
 "NFR-01" = "Every CI job runs in a clean ubuntu:26.04 container pinned by digest, using the distribution's GTK4, libadwaita and OpenSSL 3 packages."
 "NFR-06" = "CI job `traceability` (this script) fails when an acceptance criterion has no test and no documented reason."
 "NFR-07" = "CI job `coverage`: cargo llvm-cov --package keystone-core --fail-under-lines 90. Flow, boundary and failure-case E2E tests run in the `test` and `gui-e2e` jobs."
