@@ -122,6 +122,18 @@ mod tests {
     }
 
     #[test]
+    fn sec03_an_inherited_io_uring_instance_refuses_to_start() {
+        // Covers: SEC-03 (HardeningError::InheritedIoUring is shown like every refusal)
+        let refusal = keystone_core::hardening::HardeningError::InheritedIoUring {
+            descriptors: vec![7],
+        };
+        let result = startup(&[], |_| Err(refusal.to_string()), || Ok(()));
+        let message = result.expect_err("refused");
+        assert!(message.contains("io_uring"), "{message}");
+        assert!(message.contains("file descriptors 7"), "{message}");
+    }
+
+    #[test]
     fn startup_reads_the_command_line_last() {
         let options = startup(
             &["--primary".to_string(), "/tmp/a".to_string()],

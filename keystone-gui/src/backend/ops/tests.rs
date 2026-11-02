@@ -437,6 +437,83 @@ fn fr22_an_interrupted_operation_is_finished_from_the_recovery_screen() {
 }
 
 #[test]
+fn fr22_ac7_an_interrupted_yubikey_setup_is_resumed_from_the_recovery_screen() {
+    // Covers: FR-22 AC7, FR-22 AC4, FR-06 AC2
+    use keystone_core::store::YubikeySetupStep;
+    let d = drives();
+    let backend = OpsBackend::default();
+    let (_, words) = create_master(&d);
+    let shared = token();
+    let device = shared.lock().device_info().expect("device");
+    // Interrupted after the PUK change was journaled (ops test seam).
+    testing::arm_fault(testing::FaultPoint::AfterTokenStepRecorded(
+        YubikeySetupStep::PukChanged,
+    ));
+    let (ctx_b, _) = ctx(&d.selection, Some(&shared), true);
+    let error = backend
+        .setup_yubikey(
+            ctx_b,
+            SetupYubikeyPlan {
+                device,
+                credentials: YubikeyCredentials::SetNew {
+                    pin: NewPin::from_entries(&secret(PIN), &secret(PIN)).expect("pin"),
+                    puk: NewPuk::from_entries(&secret(PUK), &secret(PUK)).expect("puk"),
+                },
+                master_crl: Some(url("http://pki.keystone-test.invalid/master.crl")),
+                name: name("Resumed Main"),
+                validity_years: 10,
+                master_passphrase: entered(&words),
+            },
+        )
+        .expect_err("interrupted");
+    assert!(matches!(error, BackendError::Failed(_)));
+    testing::reset();
+    // The recovery screen, read with this YubiKey connected, offers only the resume.
+    let items = backend
+        .recovery_items(&d.selection, Some(&shared))
+        .expect("items");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(item.yubikey.is_some(), "the YubiKey column is filled");
+    assert_eq!(item.actions.len(), 1, "{:?}", item.actions);
+    let action = item.actions[0].action.clone();
+    assert!(matches!(action, RecoveryAction::ResumeYubikeySetup { .. }));
+    let needs = crate::vm::recovery::resume_needs(item, &action);
+    assert!(
+        needs.current_pin && !needs.new_puk && needs.unsigned,
+        "{needs:?}"
+    );
+    let (ctx_r, _) = ctx(&d.selection, Some(&shared), true);
+    let resumed = backend
+        .recover(
+            ctx_r,
+            RecoveryPlan {
+                operation: item.operation,
+                action,
+                resume: Some(ResumeCredentials {
+                    current_pin: Some(secret(PIN)),
+                    master_passphrase: Some(entered(&words)),
+                    main_intermediate: Some(crate::backend::ResumeMainIntermediate {
+                        name: name("Resumed Main"),
+                        validity_years: 10,
+                        master_crl: Some(url("http://pki.keystone-test.invalid/master.crl")),
+                    }),
+                    ..ResumeCredentials::default()
+                }),
+            },
+        )
+        .expect("resumed");
+    assert_eq!(resumed.certificates[0].level, CaLevel::MainIntermediate);
+    assert!(resumed.drive_writes.iter().all(|w| w.verified));
+    assert!(
+        backend
+            .recovery_items(&d.selection, Some(&shared))
+            .expect("items")
+            .is_empty()
+    );
+}
+
+#[test]
 fn fr16_ac2_cancel_during_key_generation_leaves_no_output() {
     // Covers: FR-16 AC1, FR-16 AC2, NFR-03
     let d = drives();
@@ -690,6 +767,12 @@ fn errors_are_plain_sentences_without_secrets() {
         ),
         BackendError::Cancelled
     );
+    // StoreError::Damaged names every problem (nothing can be signed).
+    let damaged = cause_text(&OpsError::Store(keystone_core::store::StoreError::Damaged(
+        vec!["certs/x.crt is missing on backup drive 1a2b3c4d".into()],
+    )));
+    assert!(damaged.contains("cannot be verified"), "{damaged}");
+    assert!(damaged.contains("certs/x.crt is missing"), "{damaged}");
     let interrupted = failure(
         "Creating the master",
         OpsError::Interrupted {
