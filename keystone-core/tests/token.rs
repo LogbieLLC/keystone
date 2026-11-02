@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use keystone_core::cert::parse_certificate_der;
 use keystone_core::crypto::hash::sha384;
 use keystone_core::crypto::rsa::{inspect_rsa_spki, verify_sha384_pkcs1};
 use keystone_core::crypto::secret::SecretString;
@@ -154,6 +155,36 @@ fn fr06_ac3_silent_partial_management_key_write_is_caught_on_reopen() {
         check_hardening_report(&report),
         Err(TokenError::HardeningNotConfirmed(_))
     ));
+}
+
+#[test]
+fn fr06_ac3_a_stale_stored_management_key_is_caught_on_reopen() {
+    // Covers: FR-06 AC3, NFR-08
+    // Dependencies doc, YubiKey item 5: the PIN-protected copy must be the key the
+    // device now authenticates with. Here the new AES-256 key is active and the
+    // "PIN-protected" flag is set, but the stored copy is still the old key.
+    let mut token = sim(10_000_024);
+    token
+        .controller()
+        .fail_next(SimOp::SetManagementKey, 1, FaultKind::StaleStoredCopy);
+    harden(&mut token, PIN, PUK).expect("the setter reports success");
+    // The status flags alone look hardened ...
+    let status = token.credential_status().unwrap();
+    ensure_hardened(&status).expect("flags look right");
+    assert!(status.management_key_pin_protected);
+    // ... but authenticating with the stored copy through a fresh handle fails.
+    let report = token.reopen_and_verify_hardening(&s(PIN)).unwrap();
+    assert!(!report.management_key_authenticated);
+    assert!(matches!(
+        check_hardening_report(&report),
+        Err(TokenError::HardeningNotConfirmed(_))
+    ));
+    // Every operation that needs the management key fails the same way.
+    assert!(matches!(
+        token.generate_signing_key(&s(PIN)),
+        Err(TokenError::HardeningNotConfirmed(_))
+    ));
+    assert!(token.slot_status(SIGNING_SLOT).unwrap().is_empty());
 }
 
 #[test]
@@ -334,7 +365,10 @@ fn fr07_ac5_other_devices_f9_or_untrusted_root_fails() {
         slot_certificate_der: attestation.slot_certificate_der.clone(),
         f9_certificate_der: other.f9_certificate_der,
     };
-    assert!(verify(&mut token, &spki, &mixed).is_err());
+    assert!(matches!(
+        verify(&mut token, &spki, &mixed),
+        Err(TokenError::Attestation(_))
+    ));
     // Trusting a different self-signed root, or the F9 certificate itself.
     let device = token.device_info().unwrap();
     let other_key = keystone_testkit::keys::rsa2048(3);
@@ -365,6 +399,60 @@ fn fr07_ac5_other_devices_f9_or_untrusted_root_fails() {
         );
         assert!(matches!(result, Err(TokenError::Attestation(_))));
     }
+}
+
+#[test]
+fn fr07_ac5_f9_certificates_share_one_subject_and_bind_by_signature() {
+    // Covers: FR-07 AC5, SEC-23, NFR-08
+    // Real Yubico F9 certificates are believed to share one subject, so the
+    // simulator gives every device the same one. A slot attestation from another
+    // YubiKey, presented with this device's F9 certificate, has a matching issuer
+    // name but must still fail, because its signature is not this F9's.
+    let (mut token, spki, attestation) = attested(10_000_025);
+    let (_, other_spki, other) = attested(10_000_026);
+    let this_f9 = parse_certificate_der(&attestation.f9_certificate_der).unwrap();
+    let other_f9 = parse_certificate_der(&other.f9_certificate_der).unwrap();
+    assert_eq!(this_f9.subject_der, other_f9.subject_der, "one F9 subject");
+    assert_ne!(this_f9.spki_der, other_f9.spki_der, "one F9 key per device");
+    let other_slot = parse_certificate_der(&other.slot_certificate_der).unwrap();
+    assert_eq!(other_slot.issuer_der, this_f9.subject_der);
+    // Another device's slot certificate with this device's F9 (and the attested key
+    // of either device): refused.
+    let swapped = SlotAttestation {
+        slot_certificate_der: other.slot_certificate_der.clone(),
+        f9_certificate_der: attestation.f9_certificate_der.clone(),
+    };
+    for key in [&spki, &other_spki] {
+        let error = verify(&mut token, key, &swapped).unwrap_err();
+        assert!(
+            matches!(&error, TokenError::Attestation(reason)
+                if reason.contains("does not verify") || reason.contains("not signed by this device's F9")),
+            "{error}"
+        );
+    }
+    // Even when the other device's F9 is also offered as a trusted intermediate, so
+    // that a chain exists, the slot certificate is not signed by this F9.
+    let trust = AttestationTrust::new(
+        vec![attestation_root_der()],
+        vec![other.f9_certificate_der.clone()],
+    )
+    .unwrap();
+    let device = token.device_info().unwrap();
+    let result = verify_piv_attestation(
+        &trust,
+        &swapped,
+        &AttestationExpectation {
+            device: &device,
+            public_key_der: &other_spki,
+        },
+        OffsetDateTime::now_utc(),
+    );
+    assert!(
+        matches!(result, Err(TokenError::Attestation(_))),
+        "{result:?}"
+    );
+    // This device's own attestation verifies.
+    verify(&mut token, &spki, &attestation).expect("own attestation");
 }
 
 #[test]

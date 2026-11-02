@@ -7,18 +7,21 @@
 //!   three PIN and three PUK attempts;
 //! - `set_random_management_key` sets a random AES-256 key stored PIN-protected
 //!   (item 4), and `reopen_and_verify_hardening` reads the state back through a
-//!   fresh handle and authenticates with the stored key (item 5);
+//!   fresh handle and authenticates with the stored copy, which passes only when the
+//!   copy is the key the device actually uses (item 5); every management-key
+//!   operation authenticates the same way;
 //! - `slot_status` reports key metadata and certificate storage separately (item 6);
 //! - `wipe_slot` deletes one slot's key and certificate (item 7);
 //! - every signature needs the PIN and a touch (PIN and touch policy "always");
 //! - generating a key overwrites the slot like the real device does: refusing an
 //!   occupied slot is core logic (`ensure_slot_empty`), not the token's job;
 //! - its own attestation hierarchy: "KEYSTONE TEST Attestation Root" (one per test
-//!   process) -> per-device F9 certificate -> slot attestation certificate with
-//!   Yubico's firmware (3.3), serial (3.7) and policy (3.8) extensions.
+//!   process) -> per-device F9 certificate (own key, but the same subject on every
+//!   device, as on real YubiKeys) -> slot attestation certificate with Yubico's
+//!   firmware (3.3), serial (3.7) and policy (3.8) extensions.
 //!
 //! Fault injection ([`SimController`]): remove and reinsert the device, fail the next
-//! N operations of a kind (before or after their effect), a silent partial
+//! N operations of a kind (before or after their effect), a silent partial or stale
 //! management-key write, touch timeouts, slow operations, an occupied slot at start,
 //! and wrong attested serial or policy. Several handles can share one device
 //! ([`SimulatedYubiKey::reopen`]) for re-verification and interrupted-setup tests.
@@ -99,6 +102,11 @@ pub enum FaultKind {
     /// Only for `SetManagementKey`: the new AES-256 key is set but the
     /// PIN-protected copy is not stored, and the call still reports success.
     SilentPartialWrite,
+    /// Only for `SetManagementKey`: the new AES-256 key is set and the
+    /// "PIN-protected" flag too, but the stored PIN-protected copy keeps the previous
+    /// key (a stale write), and the call still reports success. Authenticating with
+    /// the stored copy then fails.
+    StaleStoredCopy,
 }
 
 /// Whether the simulated operator touches the key.
@@ -182,9 +190,20 @@ struct SlotKey {
 struct ManagementKey {
     algorithm: ManagementKeyAlgorithm,
     is_default: bool,
+    /// The flag in the device's admin data saying a PIN-protected copy is stored.
     pin_protected: bool,
-    /// The stored key value; only its presence matters in the simulator.
-    _value: [u8; 32],
+    /// The key the device authenticates against.
+    active: [u8; 32],
+    /// The PIN-protected copy that Keystone reads back (with the PIN) and
+    /// authenticates with, as the real driver does.
+    stored: Option<[u8; 32]>,
+}
+
+impl ManagementKey {
+    /// True when the stored PIN-protected copy is the key the device uses.
+    fn stored_copy_authenticates(&self) -> bool {
+        self.stored == Some(self.active)
+    }
 }
 
 struct Fault {
@@ -277,6 +296,9 @@ pub fn attestation_root_issuer() -> TestIssuer<'static> {
 /// Common Name of a simulated slot attestation certificate.
 pub const SLOT_ATTESTATION_CN: &str = "KEYSTONE TEST YubiKey PIV Attestation 9c";
 
+/// Common Name of every simulated device's F9 attestation certificate.
+pub const F9_SUBJECT_CN: &str = "KEYSTONE TEST Yubico PIV Attestation";
+
 /// Yubico's extensions of a slot attestation certificate: firmware (3.3), device
 /// serial (3.7) and PIN and touch policy (3.8).
 pub fn slot_attestation_extensions(
@@ -319,6 +341,14 @@ fn communication(op: SimOp, when: &str) -> TokenError {
     TokenError::Communication(format!("simulated fault in {op:?} ({when})"))
 }
 
+/// What the real driver reports when the PIN-protected management key it read back
+/// does not authenticate.
+fn stale_management_key() -> TokenError {
+    TokenError::HardeningNotConfirmed(
+        "the PIN-protected management key stored on the YubiKey does not authenticate".into(),
+    )
+}
+
 impl DeviceState {
     fn verify_pin(&mut self, pin: &SecretString) -> Result<(), TokenError> {
         if self.pin_retries == 0 {
@@ -359,13 +389,17 @@ impl DeviceState {
     }
 
     /// Authenticates with the management key: the default key is known; a
-    /// PIN-protected key is retrieved with the PIN.
+    /// PIN-protected key is retrieved with the PIN and must be the active key.
     fn authenticate_management(&mut self, pin: &SecretString) -> Result<(), TokenError> {
         if self.management.is_default {
             return Ok(());
         }
         if self.management.pin_protected {
-            return self.verify_pin(pin);
+            self.verify_pin(pin)?;
+            if !self.management.stored_copy_authenticates() {
+                return Err(stale_management_key());
+            }
+            return Ok(());
         }
         Err(TokenError::ManagementKeyUnavailable)
     }
@@ -389,7 +423,7 @@ impl DeviceState {
                 && match fault.kind {
                     FaultKind::FailBefore | FaultKind::RemoveBefore => !after,
                     FaultKind::FailAfter | FaultKind::RemoveAfter => after,
-                    FaultKind::SilentPartialWrite => false,
+                    FaultKind::SilentPartialWrite | FaultKind::StaleStoredCopy => false,
                 }
         })?;
         let fault = &mut self.faults[index];
@@ -399,15 +433,19 @@ impl DeviceState {
         Some(kind)
     }
 
-    fn take_silent_partial_write(&mut self) -> bool {
-        let Some(index) = self.faults.iter().position(|fault| {
-            fault.op == SimOp::SetManagementKey && fault.kind == FaultKind::SilentPartialWrite
-        }) else {
-            return false;
-        };
+    /// The next silent management-key write fault, if one is armed.
+    fn take_management_write_fault(&mut self) -> Option<FaultKind> {
+        let index = self.faults.iter().position(|fault| {
+            fault.op == SimOp::SetManagementKey
+                && matches!(
+                    fault.kind,
+                    FaultKind::SilentPartialWrite | FaultKind::StaleStoredCopy
+                )
+        })?;
         self.faults[index].remaining -= 1;
+        let kind = self.faults[index].kind;
         self.faults.retain(|fault| fault.remaining > 0);
-        true
+        Some(kind)
     }
 
     fn slot_attestation(&self) -> Result<SlotAttestation, TokenError> {
@@ -465,17 +503,19 @@ fn lock(device: &Mutex<DeviceState>) -> MutexGuard<'_, DeviceState> {
 
 impl SimulatedYubiKey {
     /// A factory-fresh device (defaults as on a new YubiKey), with its own F9
-    /// attestation certificate under the test attestation root.
+    /// attestation key and certificate under the test attestation root.
+    ///
+    /// Every device's F9 certificate has the same subject ([`F9_SUBJECT_CN`]), as
+    /// real Yubico F9 certificates are believed to have (not yet checked against a
+    /// real device), so attestation must bind a slot certificate to a device's F9 by
+    /// signature, never by name.
     pub fn new(config: SimulatorConfig) -> Self {
         let root = attestation_root();
         let f9_key = keys::generate_uncached(2048);
         let f9_spki = f9_key.public_key_spki_der().expect("F9 key");
         let now = OffsetDateTime::now_utc();
         let f9_certificate = build_test_certificate(&TestCertSpec {
-            subject_der: cn_name_der(&format!(
-                "KEYSTONE TEST YubiKey PIV Attestation F9 {}",
-                config.serial
-            )),
+            subject_der: cn_name_der(F9_SUBJECT_CN),
             subject_public_key_der: f9_spki.clone(),
             issuer: Some(TestIssuer {
                 name_der: &root.name_der,
@@ -500,7 +540,9 @@ impl SimulatedYubiKey {
                 algorithm: ManagementKeyAlgorithm::Aes192,
                 is_default: true,
                 pin_protected: false,
-                _value: value,
+                // Stands in for the well-known factory key.
+                active: value,
+                stored: None,
             },
             slot_key: None,
             slot_certificate: None,
@@ -652,12 +694,20 @@ impl TokenSigner for SimulatedYubiKey {
             state.verify_pin(pin)?;
             let mut value = [0u8; 32];
             fill(&mut value)?;
-            let partial = state.take_silent_partial_write();
+            let previous = state.management.active;
+            let (pin_protected, stored) = match state.take_management_write_fault() {
+                // The PIN-protected copy was never written.
+                Some(FaultKind::SilentPartialWrite) => (false, None),
+                // The flag was written, but the stored copy is still the old key.
+                Some(_) => (true, Some(previous)),
+                None => (true, Some(value)),
+            };
             state.management = ManagementKey {
                 algorithm: ManagementKeyAlgorithm::Aes256,
                 is_default: false,
-                pin_protected: !partial,
-                _value: value,
+                pin_protected,
+                active: value,
+                stored,
             };
             Ok(())
         })
@@ -670,9 +720,11 @@ impl TokenSigner for SimulatedYubiKey {
         let mut fresh = self.reopen();
         fresh.run(SimOp::VerifyHardening, |state| {
             let status = state.status();
+            // Like the real driver: read the PIN-protected copy with the PIN, then
+            // authenticate with it. Only the key the device actually uses passes.
             let management_key_authenticated = if status.management_key_pin_protected {
                 state.verify_pin(pin)?;
-                true
+                state.management.stored_copy_authenticates()
             } else {
                 false
             };
