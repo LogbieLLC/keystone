@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: scripts/ci-setup.sh python3-dogtail python3-gi at-spi2-core dbus-x11 dbus-daemon xvfb xauth libglib2.0-bin
+      - run: scripts/ci-setup.sh python3-dogtail python3-gi at-spi2-core dbus-x11 dbus-daemon xvfb xauth libglib2.0-bin strace
       - name: Dogtail E2E with the YubiKey simulator (TESTING.md, NFR-04, NFR-08)
         run: keystone-gui/tests/e2e/run.sh
 
