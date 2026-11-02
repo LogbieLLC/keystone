@@ -19,6 +19,7 @@ use crate::crypto::secret::SecretString;
 use crate::model::{CaLevel, RevocationReason, Serial};
 use crate::passphrase::EnteredPassphrase;
 use crate::profile::{default_crl_next_update, rfc3339};
+use crate::store::record::MAX_CHANGES;
 use crate::store::{CertStatus, OperationId, OperationKind};
 use crate::token::{TokenCaSigner, TokenSigner};
 
@@ -176,6 +177,20 @@ fn revocable(state: &CaState, serial: Serial) -> Result<&StoredCert, OpsError> {
     Ok(target)
 }
 
+/// A revocation's issuance-record update lists the revoked certificate and every
+/// sub-intermediate it cuts off (FR-15 AC1), at most [`MAX_CHANGES`] changes. Refused
+/// before anything is signed when they do not fit, so a revocation never fails after its
+/// CRL was signed and no serial is ever left out (the audit entries take any number).
+fn check_record_capacity(cut_off: usize) -> Result<(), OpsError> {
+    if cut_off >= MAX_CHANGES {
+        return Err(OpsError::NotReady(format!(
+            "this revocation would mark {cut_off} sub-intermediates revoked by ancestor; one operation can record at most {}, so nothing was signed",
+            MAX_CHANGES - 1
+        )));
+    }
+    Ok(())
+}
+
 impl Ca {
     /// Flow D review: revoke `serial` for `reason`. A sub-intermediate is revoked by the
     /// main intermediate (YubiKey), a main intermediate by the master (passphrase).
@@ -263,6 +278,7 @@ impl Ca {
                 old_main: target, ..
             } => cut_off_children(state, target),
         };
+        check_record_capacity(cut_off.len())?;
         let next = default_crl_next_update(issuer.level(), time.get().get())?;
         let mut review = Review::new(match kind {
             CrlPlanKind::Revoke { .. } => "Revoke a certificate and publish a new CRL",
@@ -372,6 +388,7 @@ impl CrlPlan {
                 reason,
             } => {
                 revocable(&state, target)?;
+                check_record_capacity(cut_off_children(&state, target).len())?;
                 Some(RevokedEntry {
                     serial: target,
                     revocation_date: now,
@@ -440,5 +457,20 @@ impl CrlPlan {
             revoked_by_ancestor: self.cut_off,
             export,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fr14_ac1_a_revocation_that_cannot_be_recorded_whole_is_refused_before_signing() {
+        // Covers: FR-14 AC1, FR-22 AC3, FR-15 AC1
+        assert!(check_record_capacity(0).is_ok());
+        assert!(check_record_capacity(MAX_CHANGES - 1).is_ok());
+        let error = check_record_capacity(MAX_CHANGES).unwrap_err();
+        assert!(matches!(error, OpsError::NotReady(_)));
+        assert!(error.to_string().contains("nothing was signed"), "{error}");
     }
 }

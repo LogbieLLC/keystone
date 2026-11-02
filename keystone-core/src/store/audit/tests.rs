@@ -123,6 +123,76 @@ fn fr14_ac3_a_changed_entry_is_named_as_the_first_bad_entry() {
 }
 
 #[test]
+fn fr14_ac1_serials_beyond_one_entry_continue_in_further_entries() {
+    // Covers: FR-14 AC1, SEC-08
+    let wide = |n: usize| {
+        let mut bytes = [0u8; 20];
+        bytes[0] = 0x33;
+        bytes[18..].copy_from_slice(&u16::try_from(n).expect("small").to_be_bytes());
+        Serial::from_bytes(bytes).expect("serial")
+    };
+    let mut first = draft(1);
+    first.operation = Some(OperationId(4));
+    first.details = Some(AuditDetails {
+        note: Some("revoked".to_string()),
+        ..AuditDetails::default()
+    });
+    // No serials: the entry is unchanged.
+    assert_eq!(with_serials(first.clone(), &[]), vec![first.clone()]);
+    // Exactly one entry's worth: one entry, the note unchanged.
+    let full: Vec<Serial> = (0..MAX_AUDIT_SERIALS).map(wide).collect();
+    let one = with_serials(first.clone(), &full);
+    assert_eq!(one.len(), 1);
+    let details = one[0].details.as_ref().expect("details");
+    assert_eq!(details.serials.as_ref(), Some(&full));
+    assert_eq!(details.note.as_deref(), Some("revoked"));
+    // One more: a continuation entry of the same operation, action, subject and result.
+    let more: Vec<Serial> = (0..=MAX_AUDIT_SERIALS).map(wide).collect();
+    let two = with_serials(first.clone(), &more);
+    assert_eq!(two.len(), 2);
+    assert_eq!(two[0].serial, first.serial);
+    assert_eq!(two[1].serial, None);
+    for draft in &two {
+        assert_eq!(draft.operation, first.operation);
+        assert_eq!(draft.action, first.action);
+        assert_eq!(draft.subject, first.subject);
+        assert_eq!(draft.result, first.result);
+    }
+    let notes: Vec<&str> = two
+        .iter()
+        .map(|d| {
+            d.details
+                .as_ref()
+                .and_then(|d| d.note.as_deref())
+                .expect("note")
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        [
+            "revoked; serials part 1 of 2 (257 serials in all)",
+            "serials part 2 of 2 (257 serials in all)"
+        ]
+    );
+    let listed: Vec<Serial> = two
+        .iter()
+        .flat_map(|d| {
+            d.details
+                .as_ref()
+                .and_then(|d| d.serials.clone())
+                .expect("serials")
+        })
+        .collect();
+    assert_eq!(listed, more, "no serial dropped");
+    // Both entries are valid audit entries.
+    let (bytes, added) = AuditLog::empty()
+        .with_appended(&two, ts(9))
+        .expect("append");
+    assert_eq!(added.len(), 2);
+    parse_audit_log(&bytes).expect("valid");
+}
+
+#[test]
 fn regression_an_edited_link_names_the_entry_that_holds_it() {
     // Covers: FR-14 AC3, SEC-09
     // Regression (review finding 16): editing the `prev` of entry n named the unchanged

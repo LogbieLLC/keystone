@@ -30,7 +30,7 @@
 #![forbid(unsafe_code)]
 
 use super::StoreError;
-use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult, LogRead};
+use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult, LogRead, with_serials};
 use super::compare::{copy_journal_entries, copy_output, extend_log, reference_log};
 use super::drive::{CaDrive, DriveSet, to_json_file};
 use super::fsio::WriteMode;
@@ -536,8 +536,8 @@ impl DriveSet {
             return Ok(());
         }
         if !audited {
-            let draft = recovery_finish_draft(src, &journal, &outputs)?;
-            self.append_audit(&[draft], time)?;
+            let drafts = recovery_finish_drafts(src, &journal, &outputs)?;
+            self.append_audit(&drafts, time)?;
         }
         let entry = JournalEntry {
             format: JOURNAL_FORMAT,
@@ -741,12 +741,13 @@ fn holds_whole(
 /// The `recovery_finish` audit entry of an operation finished from `src` (FR-14 AC1,
 /// FR-21 AC6, review finding 8): the original action, the subject, the first serial and
 /// fingerprint, the issuer, the permitted names, the revocation reason, the CRL number and
-/// every serial the operation signed or changed in the issuance record.
-fn recovery_finish_draft(
+/// every serial the operation signed or changed in the issuance record. More serials than
+/// one entry holds continue in further entries; none is dropped.
+fn recovery_finish_drafts(
     src: &CaDrive,
     journal: &OperationJournal,
     outputs: &[OutputFile],
-) -> Result<AuditDraft, StoreError> {
+) -> Result<Vec<AuditDraft>, StoreError> {
     let operation = journal.operation();
     let mut draft = AuditDraft::new(
         AuditAction::RecoveryFinish,
@@ -818,12 +819,8 @@ fn recovery_finish_draft(
         .first()
         .copied()
         .or_else(|| journal.planned_serials().first().copied());
-    if !serials.is_empty() {
-        serials.truncate(super::audit::MAX_AUDIT_SERIALS);
-        details.serials = Some(serials);
-    }
     draft.details = Some(details);
-    Ok(draft)
+    Ok(with_serials(draft, &serials))
 }
 
 /// Puts one output in place on `drive`: already there and verified, moved from this

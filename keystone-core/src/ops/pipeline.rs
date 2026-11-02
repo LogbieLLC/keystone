@@ -17,6 +17,7 @@ use crate::crypto::verify::crl_pem_to_der;
 use crate::limits::MAX_OUTPUT_FILE_BYTES;
 use crate::model::{CaLevel, Serial, Timestamp};
 use crate::profile::{CrlLocation, NameConstraintsChoice};
+use crate::store::audit::with_serials;
 use crate::store::{
     AuditAction, AuditDetails, AuditDraft, AuditResult, CertStatus, CertificateRecord,
     OperationHandle, OperationId, OperationJournal, OperationKind, OutputDir, OutputPath,
@@ -498,16 +499,14 @@ pub(crate) fn assemble(
             );
             files.push((crl_path(&issuer.record, crl.crl_number), crl_file(crl)?));
             files.push(record_file(operation, changes));
+            // The note stays short whatever the number of children: the serials go in
+            // `details.serials`, over several entries when needed (FR-14 AC1; a long
+            // list in the note made the audit append fail after the CRL was signed).
             let mut note = format!("revoked by {}", issuer.record.subject.display());
             if !cut_off.is_empty() {
                 note.push_str(&format!(
-                    "; {} sub-intermediate(s) marked revoked by ancestor: {}",
-                    cut_off.len(),
-                    cut_off
-                        .iter()
-                        .map(Serial::to_hex)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "; {} sub-intermediate(s) marked revoked by ancestor, listed with it in serials",
+                    cut_off.len()
                 ));
             }
             let action = if kind == OperationKind::Revoke {
@@ -515,7 +514,7 @@ pub(crate) fn assemble(
             } else {
                 AuditAction::ReplaceYubikey
             };
-            vec![draft(
+            let first = draft(
                 action,
                 target.record.subject.display(),
                 Some(entry.serial),
@@ -527,7 +526,15 @@ pub(crate) fn assemble(
                     note: Some(note),
                     ..AuditDetails::default()
                 },
-            )]
+            );
+            if cut_off.is_empty() {
+                vec![first]
+            } else {
+                let serials: Vec<Serial> = std::iter::once(entry.serial)
+                    .chain(cut_off.iter().copied())
+                    .collect();
+                with_serials(first, &serials)
+            }
         }
     };
     Ok(Assembly { files, audit })

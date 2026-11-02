@@ -268,6 +268,46 @@ impl AuditDraft {
     }
 }
 
+/// FR-14 AC1: `first` with `serials` in its `details.serials`, followed by as many
+/// continuation entries as needed so that no entry lists more than
+/// [`MAX_AUDIT_SERIALS`] serials. No serial is ever dropped. A continuation entry
+/// repeats the operation, action, subject and result; its note says which part of the
+/// serials it holds. The caller keeps every note short: a list of serials belongs in
+/// `serials`, never in a note (whose length is limited by [`MAX_AUDIT_TEXT`]).
+pub(crate) fn with_serials(first: AuditDraft, serials: &[Serial]) -> Vec<AuditDraft> {
+    let parts = serials.len().div_ceil(MAX_AUDIT_SERIALS);
+    if parts == 0 {
+        return vec![first];
+    }
+    serials
+        .chunks(MAX_AUDIT_SERIALS)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let mut draft = if index == 0 {
+                first.clone()
+            } else {
+                let mut next = AuditDraft::new(first.action, first.subject.clone(), first.result);
+                next.operation = first.operation;
+                next
+            };
+            let details = draft.details.get_or_insert_with(AuditDetails::default);
+            details.serials = Some(chunk.to_vec());
+            if parts > 1 {
+                let part = format!(
+                    "serials part {} of {parts} ({} serials in all)",
+                    index + 1,
+                    serials.len()
+                );
+                details.note = Some(match details.note.take() {
+                    Some(note) if index == 0 => format!("{note}; {part}"),
+                    _ => part,
+                });
+            }
+            draft
+        })
+        .collect()
+}
+
 /// Why an audit-log entry is bad (FR-14 AC3).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuditProblem {
