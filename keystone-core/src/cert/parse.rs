@@ -49,9 +49,11 @@ pub enum ConstraintName {
     Dns(String),
     /// iPAddress: address followed by mask.
     Ip(Vec<u8>),
-    /// rfc822Name (empty = all email).
+    /// rfc822Name. Keystone permits only the reserved `.keystone.invalid` domain
+    /// (ADR 0001).
     Email(String),
-    /// uniformResourceIdentifier (empty = all URIs).
+    /// uniformResourceIdentifier. Keystone permits only the reserved
+    /// `.keystone.invalid` domain (ADR 0001).
     Uri(String),
     /// Any other name form.
     Other,

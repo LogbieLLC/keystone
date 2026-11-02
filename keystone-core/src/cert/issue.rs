@@ -28,7 +28,7 @@ use crate::crypto::verify::{certificate_der_to_pem, verify_certificate_signature
 use crate::model::{CaLevel, Serial};
 use crate::profile::{
     CertValidity, CrlLocation, NameConstraintsChoice, NameConstraintsSpec, PUBLIC_EXPONENT,
-    ValidatedName, level_profile,
+    RESERVED_CONSTRAINT_DOMAIN, ValidatedName, level_profile,
 };
 
 /// Most attempts to find an unused random serial before giving up.
@@ -218,7 +218,11 @@ fn ip_name(bytes: Vec<u8>) -> Result<GeneralName, CertError> {
     ))
 }
 
-/// The nameConstraints value for a sub-intermediate (FR-21 AC2, AC3).
+/// The nameConstraints value for a sub-intermediate (FR-21 AC2, AC3, ADR 0001).
+///
+/// Email and URI names are blocked by permitting only the reserved
+/// [`RESERVED_CONSTRAINT_DOMAIN`] for both forms; no zero-length entry is written,
+/// because OpenSSL does not treat one as "all names" (see [`NameConstraintsSpec`]).
 fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints, CertError> {
     let mut permitted = Vec::new();
     for name in spec.permitted_dns() {
@@ -227,6 +231,12 @@ fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints,
     for range in spec.permitted_ip() {
         permitted.push(subtree(ip_name(range.constraint_bytes())?));
     }
+    permitted.push(subtree(GeneralName::Rfc822Name(ia5(
+        RESERVED_CONSTRAINT_DOMAIN,
+    )?)));
+    permitted.push(subtree(GeneralName::UniformResourceIdentifier(ia5(
+        RESERVED_CONSTRAINT_DOMAIN,
+    )?)));
     let mut excluded = Vec::new();
     if spec.excludes_all_ipv4() {
         excluded.push(subtree(ip_name(vec![0; 8])?));
@@ -234,11 +244,11 @@ fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints,
     if spec.excludes_all_ipv6() {
         excluded.push(subtree(ip_name(vec![0; 32])?));
     }
-    excluded.push(subtree(GeneralName::Rfc822Name(ia5("")?)));
-    excluded.push(subtree(GeneralName::UniformResourceIdentifier(ia5("")?)));
     Ok(NameConstraints {
         permitted_subtrees: Some(permitted),
-        excluded_subtrees: Some(excluded),
+        // GeneralSubtrees has SIZE (1..MAX): with ranges entered for both IPv4 and
+        // IPv6 nothing is excluded, and the field is left out.
+        excluded_subtrees: (!excluded.is_empty()).then_some(excluded),
     })
 }
 

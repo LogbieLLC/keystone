@@ -145,14 +145,21 @@ fn fr08_ac2_sub_intermediate_profile() {
     assert_eq!(info.ca_level(), Some(CaLevel::SubIntermediate));
     let nc = info.name_constraints.as_ref().unwrap();
     assert!(nc.critical, "FR-21 AC2: critical");
-    assert_eq!(nc.permitted, [ConstraintName::Dns("starnet".into())]);
+    // ADR 0001: email and URI names are blocked by permitting only the reserved
+    // `.keystone.invalid` domain (RFC 2606/6761), never by a zero-length exclusion.
+    assert_eq!(
+        nc.permitted,
+        [
+            ConstraintName::Dns("starnet".into()),
+            ConstraintName::Email(".keystone.invalid".into()),
+            ConstraintName::Uri(".keystone.invalid".into()),
+        ]
+    );
     assert_eq!(
         nc.excluded,
         [
             ConstraintName::Ip(vec![0; 8]),
-            ConstraintName::Ip(vec![0; 32]),
-            ConstraintName::Email(String::new()),
-            ConstraintName::Uri(String::new()),
+            ConstraintName::Ip(vec![0; 32])
         ]
     );
     assert_eq!(
@@ -185,16 +192,51 @@ fn fr21_ac3_permitted_ip_ranges_replace_the_family_exclusion() {
             ConstraintName::Dns("starnet".into()),
             ConstraintName::Dns("pki.example.test".into()),
             ConstraintName::Ip(vec![10, 0, 0, 0, 255, 0, 0, 0]),
+            ConstraintName::Email(".keystone.invalid".into()),
+            ConstraintName::Uri(".keystone.invalid".into()),
         ]
     );
+    assert_eq!(nc.excluded, [ConstraintName::Ip(vec![0; 32])]);
+}
+
+#[test]
+fn fr21_ac3_ranges_for_both_families_leave_no_empty_excluded_subtrees() {
+    // Covers: FR-21 AC2, FR-21 AC3
+    // GeneralSubtrees is SIZE (1..MAX): with nothing to exclude the field is omitted,
+    // and email and URI names stay blocked through permittedSubtrees (ADR 0001).
+    let h = TestHierarchy::build(&HierarchyOptions {
+        label: "IP46".into(),
+        permitted_ip: vec!["10.0.0.0/8".into(), "2001:db8::/32".into()],
+        sub_key_index: 5,
+        ..HierarchyOptions::default()
+    });
+    let nc = h.sub.info.name_constraints.as_ref().unwrap();
+    assert!(nc.critical);
+    assert!(nc.excluded.is_empty(), "{nc:?}");
+    assert!(
+        nc.permitted
+            .contains(&ConstraintName::Email(".keystone.invalid".into()))
+    );
+    assert!(
+        nc.permitted
+            .contains(&ConstraintName::Uri(".keystone.invalid".into()))
+    );
+    // The excludedSubtrees field is absent, not an empty SEQUENCE.
+    use x509_cert::der::Decode;
+    use x509_cert::der::oid::AssociatedOid;
+    let cert = x509_cert::Certificate::from_der(&h.sub.der).unwrap();
+    let (_, value) = cert
+        .tbs_certificate()
+        .get_extension::<x509_cert::ext::pkix::NameConstraints>()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        nc.excluded,
-        [
-            ConstraintName::Ip(vec![0; 32]),
-            ConstraintName::Email(String::new()),
-            ConstraintName::Uri(String::new()),
-        ]
+        x509_cert::ext::pkix::NameConstraints::OID.to_string(),
+        OID_NAME_CONSTRAINTS
     );
+    assert!(value.excluded_subtrees.is_none());
+    let options = VerifyOptions::at(OffsetDateTime::now_utc());
+    verify_chain(&h.sub.der, &[&h.main.der], &[&h.master.der], &[], &options).unwrap();
 }
 
 #[test]
