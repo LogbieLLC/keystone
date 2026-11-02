@@ -93,8 +93,8 @@ pub use audit::{
 pub use binhash::parse_binary_hash_record;
 pub use compare::{DriveComparison, DriveHistory, RepairPlan, RepairStep};
 pub use drive::{
-    CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, ExportDrive, classify_drive,
-    parse_drive_identity,
+    CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, ExportDrive, SetupProgress,
+    UnfinishedSetup, classify_drive, parse_drive_identity, unfinished_setup,
 };
 pub use ids::{CaId, DriveId, OperationId};
 pub use journal::{

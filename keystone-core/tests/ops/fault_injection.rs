@@ -185,11 +185,75 @@ fn fr22_ac6_ac7_flow_b_recovers_from_an_interruption_at_every_step() {
 }
 
 #[test]
+fn fr22_ac6_flow_a_interrupted_while_setting_up_the_drives_finishes_the_setup() {
+    // Covers: FR-22 AC6, SEC-20, FR-12 AC1
+    // Review finding 11: setting up the empty drives writes two files per drive (audit
+    // log, then the drive identity last). An interruption there left drives that were
+    // refused for ever. Flow A now recognises them and finishes setting them up; nothing
+    // already written is overwritten.
+    const DRIVE_SETUP_CHANGES: u32 = 4;
+    let now = base_time();
+    let (passphrase, _) = master_passphrase();
+    for crash_at in 0..DRIVE_SETUP_CHANGES {
+        let drives = TestDrives::new(2);
+        testing::crash_on_drive_change(crash_at);
+        let error = run_flow_a(&drives, "F7", now, &passphrase, None).unwrap_err();
+        assert!(
+            matches!(error.root_cause(), OpsError::Store(_)),
+            "change {crash_at}: {error}"
+        );
+        testing::reset();
+        let roots: Vec<&Path> = drives.ca_drives().iter().map(PathBuf::as_path).collect();
+        assert!(
+            Ca::open(&roots).is_err(),
+            "a partial drive never opens as a CA"
+        );
+        let identity = drives.ca_drive(0).join("keystone/drive.json");
+        let before = std::fs::read(&identity).ok();
+        // Flow A again on the same drives: the review offers to finish the setup.
+        let backups: Vec<&Path> = roots[1..].to_vec();
+        let request = keystone_core::ops::CreateMasterRequest::new(
+            roots[0],
+            &backups,
+            keystone_testkit::names::test_name("F7 Master"),
+        );
+        let later = now + time::Duration::minutes(1);
+        let plan = keystone_core::ops::plan_create_master(request, confirmed_new(later))
+            .unwrap_or_else(|e| panic!("change {crash_at}: {e}"));
+        assert!(matches!(
+            plan.drive_setup(),
+            keystone_core::ops::DriveSetup::FinishInterruptedSetup { .. }
+        ));
+        assert!(
+            plan.review()
+                .value("Drives")
+                .is_some_and(|v| v.starts_with("Finish setting up these drives")),
+            "{:?}",
+            plan.review()
+        );
+        testing::supply_generated_key(keystone_testkit::keys::master(0));
+        let outcome = plan
+            .execute(&passphrase, None, &NoProgress, &CancelFlag::new())
+            .unwrap_or_else(|e| panic!("change {crash_at}: {e}"));
+        assert_no_lost_record(&outcome.ca);
+        assert!(outcome.ca.state().unwrap().master().is_some());
+        if let Some(before) = before {
+            assert_eq!(
+                std::fs::read(&identity).unwrap(),
+                before,
+                "never overwritten"
+            );
+        }
+    }
+}
+
+#[test]
 fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup() {
     // Covers: FR-22 AC6, FR-13 AC6, SEC-20
     // Setting up the empty drives writes two files per drive (audit log, then the drive
-    // identity last). An interruption there leaves a drive that is classified as
-    // damaged and is never reused automatically (SEC-20); the sweep starts after it.
+    // identity last); interruptions there are covered by
+    // fr22_ac6_flow_a_interrupted_while_setting_up_the_drives_finishes_the_setup. This
+    // sweep covers every change after the drive setup.
     const DRIVE_SETUP_CHANGES: u32 = 4;
     let now = base_time();
     let (passphrase, words) = master_passphrase();

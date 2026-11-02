@@ -22,7 +22,8 @@ use crate::profile::{
     CertValidity, MASTER, ValidatedName, default_crl_next_update, plan_validity, rfc3339,
 };
 use crate::store::{
-    DriveClass, DriveSet, OperationId, OperationKind, StoreError, SubjectName, classify_drive,
+    CaId, DriveClass, DriveSet, OperationId, OperationKind, StoreError, SubjectName,
+    classify_drive, unfinished_setup,
 };
 
 use super::ca::ExportStatus;
@@ -59,6 +60,23 @@ impl CreateMasterRequest {
     }
 }
 
+/// How Flow A gets its drives (SEC-20: a CA is never created over another one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveSetup {
+    /// Every drive is empty: a new CA is set up on them.
+    NewDrives,
+    /// The drives hold a Keystone CA with no certificate (only cancelled or abandoned
+    /// attempts): it is used again; reserved serials stay reserved.
+    ReuseEmptyCa,
+    /// Review finding 11: an earlier setup of these drives was interrupted (they hold
+    /// only the empty layout, and possibly the identity, of the same CA). "Finish setting
+    /// up these drives": what is missing is added; nothing is overwritten or deleted.
+    FinishInterruptedSetup {
+        /// The CA the interrupted setup started, when an identity was already written.
+        ca_id: Option<CaId>,
+    },
+}
+
 /// A checked Flow A plan. Nothing was written.
 #[derive(Debug)]
 pub struct CreateMasterPlan {
@@ -67,7 +85,7 @@ pub struct CreateMasterPlan {
     validity: CertValidity,
     serial: PlannedSerial,
     time: ConfirmedTime,
-    reuse: bool,
+    setup: DriveSetup,
     review: Review,
 }
 
@@ -98,10 +116,10 @@ fn roots(request: &CreateMasterRequest) -> Vec<&Path> {
         .collect()
 }
 
-/// Checks whether the drives can take a new CA (SEC-20): all empty, or all one drive set
-/// that holds no certificate (only cancelled or abandoned attempts). Returns true for the
-/// second case.
-fn check_drives(request: &CreateMasterRequest) -> Result<bool, OpsError> {
+/// Checks whether the drives can take a new CA (SEC-20): all empty, an interrupted
+/// setup of these drives (review finding 11), or all one drive set that holds no
+/// certificate (only cancelled or abandoned attempts).
+fn check_drives(request: &CreateMasterRequest) -> Result<DriveSetup, OpsError> {
     if request.backups.is_empty() {
         return Err(StoreError::NotEnoughDrives {
             primaries: 1,
@@ -110,6 +128,9 @@ fn check_drives(request: &CreateMasterRequest) -> Result<bool, OpsError> {
         .into());
     }
     let roots = roots(request);
+    if let Some(setup) = unfinished_setup(roots[0], &roots[1..])? {
+        return Ok(DriveSetup::FinishInterruptedSetup { ca_id: setup.ca_id });
+    }
     let mut empty = 0;
     for root in &roots {
         match classify_drive(root)? {
@@ -130,7 +151,7 @@ fn check_drives(request: &CreateMasterRequest) -> Result<bool, OpsError> {
         }
     }
     if empty == roots.len() {
-        return Ok(false);
+        return Ok(DriveSetup::NewDrives);
     }
     let holds_ca = || StoreError::DriveHoldsCa {
         root: request.primary.clone(),
@@ -143,7 +164,7 @@ fn check_drives(request: &CreateMasterRequest) -> Result<bool, OpsError> {
     if !state.is_empty() || !set.recovery_report()?.is_clean() {
         return Err(holds_ca().into());
     }
-    Ok(true)
+    Ok(DriveSetup::ReuseEmptyCa)
 }
 
 /// Flow A, steps 1 to 4: checks the drives (SEC-20), the name (FR-02 AC4) and the
@@ -152,7 +173,7 @@ pub fn plan_create_master(
     request: CreateMasterRequest,
     time: ConfirmedTime,
 ) -> Result<CreateMasterPlan, OpsError> {
-    let reuse = check_drives(&request)?;
+    let setup = check_drives(&request)?;
     let name = ValidatedName::new(&request.subject)?;
     let validity = plan_validity(
         CaLevel::Master,
@@ -160,7 +181,7 @@ pub fn plan_create_master(
         time.get().get(),
         None,
     )?;
-    let serial = if reuse {
+    let serial = if setup == DriveSetup::ReuseEmptyCa {
         let set = DriveSet::open(&roots(&request))?;
         plan_unique_serial(&Ca::from_set(set))?
     } else {
@@ -185,6 +206,19 @@ pub fn plan_create_master(
         "First CRL",
         format!("empty, number 1, next update {}", rfc3339(crl_next)),
     );
+    review.line(
+        "Drives",
+        match setup {
+            DriveSetup::NewDrives => "set up the empty drives for a new CA".to_owned(),
+            DriveSetup::ReuseEmptyCa => {
+                "use these drives again: they hold this tool's CA with no certificate yet; reserved serial numbers stay reserved".to_owned()
+            }
+            DriveSetup::FinishInterruptedSetup { ca_id } => format!(
+                "Finish setting up these drives: an earlier setup{} was interrupted; what is missing is added, nothing on them is overwritten or deleted",
+                ca_id.map(|id| format!(" of CA {}", id.short())).unwrap_or_default()
+            ),
+        },
+    );
     review.line("Primary drive", request.primary.display().to_string());
     review.line(
         "Backup drives",
@@ -201,7 +235,7 @@ pub fn plan_create_master(
         validity,
         serial,
         time,
-        reuse,
+        setup,
         review,
     })
 }
@@ -222,6 +256,11 @@ impl CreateMasterPlan {
     /// The serial the master will get.
     pub fn serial(&self) -> Serial {
         self.serial.serial()
+    }
+
+    /// How the drives are set up (new, reused, or finishing an interrupted setup).
+    pub fn drive_setup(&self) -> DriveSetup {
+        self.setup
     }
 
     /// Flow A, steps 5 and 6. `passphrase` is the master passphrase the operator just
@@ -247,12 +286,18 @@ impl CreateMasterPlan {
             cancel_available: true,
         });
         let roots = roots(&self.request);
-        let set = if self.reuse {
-            check_drives(&self.request)?;
-            DriveSet::open(&roots)?
-        } else {
-            let backups: Vec<&Path> = roots[1..].to_vec();
-            DriveSet::create(roots[0], &backups, self.time.get())?
+        // The drives are checked again: they must still be what the review showed.
+        if check_drives(&self.request)? != self.setup {
+            return Err(OpsError::NotReady(
+                "the drives changed since the review; check them and plan again".into(),
+            ));
+        }
+        let set = match self.setup {
+            DriveSetup::ReuseEmptyCa => DriveSet::open(&roots)?,
+            DriveSetup::NewDrives => DriveSet::create(roots[0], &roots[1..], self.time.get())?,
+            DriveSetup::FinishInterruptedSetup { .. } => {
+                DriveSet::finish_setup(roots[0], &roots[1..], self.time.get())?
+            }
         };
         let ca = Ca::from_set(set);
         let state = ca.ready_for_signing(self.time)?;

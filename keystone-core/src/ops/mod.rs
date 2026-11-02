@@ -112,7 +112,9 @@ pub use ca::{
     HierarchySummary, StartupReport, StartupWarning, assess_clock_for_new_ca,
 };
 pub use crl_ops::{CrlOutcome, CrlPlan, CrlPlanKind, IssuerUnlock};
-pub use master::{CreateMasterOutcome, CreateMasterPlan, CreateMasterRequest, plan_create_master};
+pub use master::{
+    CreateMasterOutcome, CreateMasterPlan, CreateMasterRequest, DriveSetup, plan_create_master,
+};
 pub use progress::{NoProgress, Progress, ProgressSink, Step};
 pub use recovery::{RecoveryAction, RecoveryChoice, RecoveryItem, RecoverySecrets, TokenColumn};
 pub use state::{CaState, StoredCert, StoredCrl};
