@@ -434,7 +434,7 @@ impl Ca {
         }
     }
 
-    fn check_recovery_time(&self, time: ConfirmedTime) -> Result<(), OpsError> {
+    pub(super) fn check_recovery_time(&self, time: ConfirmedTime) -> Result<(), OpsError> {
         let baseline = self
             .drive_set()
             .drives()

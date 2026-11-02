@@ -26,6 +26,7 @@
 //! | D revoke + CRL | [`Ca::plan_revoke`] | [`CrlPlan::execute`] |
 //! | Refresh CRL (FR-13 AC4) | [`Ca::plan_refresh_crl`] | [`CrlPlan::execute`] |
 //! | E replace lost YubiKey | [`Ca::plan_replace_yubikey`] | [`CrlPlan::execute`], then Flow B, then Flow C per [`CaState::reissue_candidates`] |
+//! | Replace a lost drive (SEC-11) | [`Ca::plan_replace_drive`] | [`ReplaceDrivePlan::execute`] (signs nothing; the one writing action a CA with a single healthy drive can run) |
 //!
 //! # Rules every signing operation follows
 //! - It needs a [`ConfirmedTime`] (FR-17 AC1), which only `clock::confirm` creates, and
@@ -88,6 +89,7 @@ mod master;
 mod pipeline;
 mod progress;
 mod recovery;
+mod replace;
 mod seam;
 mod state;
 mod sub;
@@ -117,6 +119,7 @@ pub use master::{
 };
 pub use progress::{NoProgress, Progress, ProgressSink, Step};
 pub use recovery::{RecoveryAction, RecoveryChoice, RecoveryItem, RecoverySecrets, TokenColumn};
+pub use replace::{ReplaceDriveOutcome, ReplaceDrivePlan};
 pub use state::{CaState, StoredCert, StoredCrl};
 pub use sub::{SubIntermediateOutcome, SubIntermediatePlan, SubIntermediateRequest};
 pub use yubikey::{
@@ -309,6 +312,8 @@ mod tests {
         assert_send::<CrlPlan>();
         assert_send::<IssuerUnlock<'static>>();
         assert_send::<CrlOutcome>();
+        assert_send::<ReplaceDrivePlan>();
+        assert_send::<ReplaceDriveOutcome>();
         assert_send::<RecoveryItem>();
         assert_send::<RecoverySecrets<'static>>();
         assert_send::<StartupReport>();

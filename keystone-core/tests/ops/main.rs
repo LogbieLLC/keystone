@@ -17,5 +17,6 @@ mod flow_c;
 mod flow_d;
 mod flow_e;
 mod recovery;
+mod replace_drive;
 mod startup;
 mod support;
