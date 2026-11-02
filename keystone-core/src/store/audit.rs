@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::drive::{CaDrive, DriveSet, check_len, check_timestamp};
 use super::fsio::WriteMode;
-use super::ids::OperationId;
+use super::ids::{DriveId, OperationId};
 use super::journal::{AuditHead, OperationKind};
 use super::paths::AUDIT_LOG_FILE;
 use super::{ParseError, StoreError};
@@ -148,6 +148,14 @@ pub struct AuditDetails {
     /// (for example a revoked main intermediate and the sub-intermediates it cut off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serials: Option<Vec<Serial>>,
+    /// Replace a lost drive: the new drive that received a verified copy of the CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_added: Option<DriveId>,
+    /// Replace a lost drive: the backup drive that became the primary because the
+    /// primary was lost. From this entry on it is the primary (its `drive.json`, which is
+    /// never rewritten, still says backup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_promoted: Option<DriveId>,
     /// Free text (for example which drive was repaired from which).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,

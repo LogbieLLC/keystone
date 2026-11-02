@@ -596,7 +596,7 @@ impl Ca {
         self.drives
             .drives()
             .iter()
-            .map(|drive| (drive.label(), drive.identity().role))
+            .map(|drive| (drive.label(), drive.role()))
             .collect()
     }
 }

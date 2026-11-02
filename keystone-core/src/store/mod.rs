@@ -81,6 +81,7 @@ pub mod operation;
 mod paths;
 pub mod record;
 pub mod recovery;
+pub mod replace;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -113,6 +114,7 @@ pub use record::{
 pub use recovery::{
     DriveOperationView, FileState, OutputState, PendingOperation, RecoveryAction, RecoveryReport,
 };
+pub use replace::{AddDrivePlan, NewDriveState};
 
 use crate::crypto::CryptoError;
 use crate::model::{Serial, Sha256Digest};

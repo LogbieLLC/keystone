@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::audit::{AuditAction, AuditLog};
 use super::fsio::{Dir, EntryKind, WriteMode};
 use super::ids::{CaId, DriveId};
 use super::paths::{
@@ -150,6 +151,10 @@ pub struct CaDrive {
     root: PathBuf,
     keystone: Dir,
     identity: DriveIdentity,
+    /// The role the drive has now: the identity's role, unless the audit log records a
+    /// later promotion of a backup to primary (Replace a lost drive). `drive.json` is
+    /// create-only and never rewritten, so a promotion lives in the audit log.
+    role: DriveRole,
 }
 
 impl CaDrive {
@@ -159,6 +164,7 @@ impl CaDrive {
             DriveClass::KeystoneCa(identity) => Ok(CaDrive {
                 root: root.to_path_buf(),
                 keystone: Dir::open(root)?.open_dir(KEYSTONE_DIR)?,
+                role: identity.role,
                 identity,
             }),
             DriveClass::DamagedKeystone(reason) => Err(StoreError::NotACaDrive {
@@ -172,9 +178,27 @@ impl CaDrive {
         }
     }
 
-    /// The drive's identity.
+    /// The drive's identity, as stored in its `drive.json`.
     pub fn identity(&self) -> &DriveIdentity {
         &self.identity
+    }
+
+    /// The drive's role now: the identity's role, or primary/backup as the latest
+    /// audited promotion in the connected drives' most complete audit log says
+    /// ([`DriveSet::open`]). Use this, not `identity().role`, for what the drive is.
+    pub fn role(&self) -> DriveRole {
+        self.role
+    }
+
+    /// A drive being set up by "Replace a lost drive": its folder exists, its identity
+    /// is only in memory until it is written last.
+    pub(crate) fn provisional(root: &Path, keystone: Dir, identity: DriveIdentity) -> CaDrive {
+        CaDrive {
+            root: root.to_path_buf(),
+            keystone,
+            role: identity.role,
+            identity,
+        }
     }
 
     /// The drive's mount point.
@@ -184,7 +208,7 @@ impl CaDrive {
 
     /// A short label for the operator: `primary drive 1a2b3c4d (/media/usb1)`.
     pub fn label(&self) -> String {
-        let role = match self.identity.role {
+        let role = match self.role {
             DriveRole::Primary => "primary",
             DriveRole::Backup => "backup",
         };
@@ -261,6 +285,23 @@ impl CaDrive {
             None => Ok(None),
         }
     }
+}
+
+/// The drive the latest audited promotion made the primary, read from the most complete
+/// verified audit log among `drives` (Replace a lost drive).
+fn promoted_primary(drives: &[CaDrive]) -> Option<DriveId> {
+    drives
+        .iter()
+        .filter_map(|drive| drive.read_audit_log().valid().cloned())
+        .max_by_key(AuditLog::len)?
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.action == AuditAction::DriveRepair)
+                .then(|| entry.details.as_ref()?.primary_promoted)
+                .flatten()
+        })
 }
 
 /// A file written to every drive of a set but not yet read back (FR-12 AC2).
@@ -363,9 +404,20 @@ impl DriveSet {
                 "the drives belong to different CAs".to_string(),
             ));
         }
+        // A backup promoted to primary (Replace a lost drive) is the only primary; every
+        // other drive, including a former primary found again, is a backup.
+        if let Some(primary) = promoted_primary(&drives) {
+            for drive in &mut drives {
+                drive.role = if drive.identity.drive_id == primary {
+                    DriveRole::Primary
+                } else {
+                    DriveRole::Backup
+                };
+            }
+        }
         if drives
             .iter()
-            .filter(|drive| drive.identity.role == DriveRole::Primary)
+            .filter(|drive| drive.role == DriveRole::Primary)
             .count()
             > 1
         {
@@ -373,7 +425,7 @@ impl DriveSet {
                 "more than one drive is marked as the primary".to_string(),
             ));
         }
-        drives.sort_by_key(|drive| (drive.identity.role, drive.identity.drive_id));
+        drives.sort_by_key(|drive| (drive.role, drive.identity.drive_id));
         Ok(DriveSet { drives })
     }
 
@@ -392,7 +444,7 @@ impl DriveSet {
         let primaries = self
             .drives
             .iter()
-            .filter(|drive| drive.identity.role == DriveRole::Primary)
+            .filter(|drive| drive.role == DriveRole::Primary)
             .count();
         let backups = self.drives.len() - primaries;
         if primaries == 1 && backups >= 1 {
@@ -461,7 +513,7 @@ impl DriveSet {
 }
 
 /// The folders `init_drive` creates inside `keystone/`.
-fn layout_folders() -> impl Iterator<Item = &'static str> {
+pub(crate) fn layout_folders() -> impl Iterator<Item = &'static str> {
     [JOURNAL_DIR, STAGING_DIR]
         .into_iter()
         .chain(OutputDir::ALL.iter().map(|dir| dir.name()))
@@ -478,7 +530,11 @@ fn init_drive(root: &Path, identity: &DriveIdentity) -> Result<(), StoreError> {
     write_identity(root, &keystone, identity)
 }
 
-fn write_identity(root: &Path, keystone: &Dir, identity: &DriveIdentity) -> Result<(), StoreError> {
+pub(crate) fn write_identity(
+    root: &Path,
+    keystone: &Dir,
+    identity: &DriveIdentity,
+) -> Result<(), StoreError> {
     let bytes = to_json_file(identity);
     keystone.write_atomic(IDENTITY_FILE, &bytes, WriteMode::CreateOnly)?;
     let back = keystone.read_back(IDENTITY_FILE, MAX_METADATA_BYTES)?;

@@ -652,7 +652,11 @@ fn regression_a_missing_audit_log_on_one_drive_is_repaired_from_the_others() {
         let set = open_all(&drives);
         let shown = plans(set.compare().expect("compare"));
         assert_eq!(shown.len(), 1);
-        assert_eq!(shown[0].target, missing);
+        // Backups are ordered by their random drive ids: compare by mount point.
+        assert_eq!(
+            set.drives()[shown[0].target].root(),
+            drives.ca_drive(missing)
+        );
         set.repair(&shown, ts(90)).expect("repair");
         let set = open_all(&drives);
         assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
@@ -681,7 +685,7 @@ fn regression_a_partly_written_audit_log_is_repaired_and_a_changed_one_is_not() 
     fs::write(audit_log_path(&drives, 1), &full[..second_line_end - 7]).expect("cut");
     let set = open_all(&drives);
     let shown = plans(set.compare().expect("compare"));
-    assert_eq!(shown[0].target, 1);
+    assert_eq!(set.drives()[shown[0].target].root(), drives.ca_drive(1));
     set.repair(&shown, ts(90)).expect("repair");
     assert_eq!(
         open_all(&drives).compare().expect("compare"),
