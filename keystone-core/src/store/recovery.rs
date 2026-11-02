@@ -5,12 +5,19 @@
 //! on at least one drive, with exactly what each drive holds for it: journal entries,
 //! signed objects, YubiKey steps, and every output file in staging and in place with its
 //! hash status. It offers at most two actions, each with one plain sentence:
+//! - [`RecoveryAction::FinishFrom`]: a drive already holds the operation's final entry
+//!   (an interrupted finish, cancel or abandon): bring its audit entries to every drive,
+//!   then copy that final entry, so every drive records the same end. Nothing else is
+//!   offered then, and Abandon is refused: a second final entry would make the journal
+//!   unreadable;
 //! - [`RecoveryAction::FinishFrom`]: a drive holds the verified output (every file listed
 //!   by its `staged` or `completed` entry, with the right SHA-256): copy what is missing
 //!   to the other drives, write the audit entry and the `completed` entry last;
 //! - [`RecoveryAction::Abandon`]: offered only when nothing irreversible was journaled on
-//!   any drive (no signature, no YubiKey step, nothing staged): mark it abandoned; its
-//!   serial stays reserved;
+//!   any drive (no signature, no YubiKey step, nothing staged) and no drive holds a final
+//!   entry: mark it abandoned; its serial stays reserved. An audit entry that an earlier,
+//!   interrupted cancel or abandon wrote to some drives only is first copied to every
+//!   drive (an earlier abandon entry is reused, not written twice);
 //! - for YubiKey setup with recorded steps and nothing staged,
 //!   [`RecoveryAction::ResumeYubikeySetup`] tells the operations layer to read the
 //!   YubiKey's real state and continue from the first incomplete step (FR-22 AC5, AC7).
@@ -328,6 +335,19 @@ impl DriveSet {
             .iter()
             .flatten()
             .all(|journal| journal_prefix(journal, longest));
+        let terminal_source = per_drive
+            .iter()
+            .position(|journal| journal.is_some_and(|j| j.terminal().is_some()));
+        let signed_or_staged = per_drive
+            .iter()
+            .flatten()
+            .any(|journal| journal.signed().next().is_some() || journal.staged_outputs().is_some());
+        let next_step = {
+            let done = longest.yubikey_steps();
+            YubikeySetupStep::ALL
+                .into_iter()
+                .find(|step| !done.iter().any(|(d, _)| d == step))
+        };
         let mut actions = Vec::new();
         let mut blocked_reason = None;
         if !consistent {
@@ -335,20 +355,31 @@ impl DriveSet {
                 "the drives hold different journals for this operation; no automatic action is safe"
                     .to_string(),
             );
+        } else if let Some(source) = terminal_source {
+            // A drive already holds the final entry (an interrupted finish, cancel or
+            // abandon): the only safe action is to make every drive agree with it.
+            if longest.state() == OperationState::Completed && !drives[source].holds_verified_output
+            {
+                blocked_reason = Some(format!(
+                    "{} marks this operation completed, but files its completed entry lists are missing or changed there",
+                    drives[source].drive
+                ));
+            } else {
+                actions.push(RecoveryAction::FinishFrom {
+                    drive_index: source,
+                    drive: drives[source].drive.clone(),
+                });
+            }
         } else if let Some(source) = best_source(&drives, per_drive) {
             actions.push(RecoveryAction::FinishFrom {
                 drive_index: source,
                 drive: drives[source].drive.clone(),
             });
-        } else if !signed_output_exists {
+        } else if !signed_output_exists && !signed_or_staged {
             actions.push(RecoveryAction::Abandon);
         } else if longest.kind() == OperationKind::SetupYubikey
             && longest.staged_outputs().is_none()
         {
-            let done = longest.yubikey_steps();
-            let next_step = YubikeySetupStep::ALL
-                .into_iter()
-                .find(|step| !done.iter().any(|(d, _)| d == step));
             actions.push(RecoveryAction::ResumeYubikeySetup { next_step });
         } else {
             blocked_reason = Some(
@@ -438,6 +469,23 @@ impl DriveSet {
             }
         }
         let audited = self.sync_operation_audit(operation)?;
+        if let Some(head) = journal.audit_head() {
+            // The final entry exists on `src`: every drive must now hold the audit entry
+            // it records before the final entry is copied (FR-12 AC3 order).
+            for drive in self.drives() {
+                if drive.audit_log()?.entry_hash(head.seq) != Some(head.sha256) {
+                    return Err(StoreError::Unsafe(format!(
+                        "{} does not hold audit entry {} that the final entry of {operation} records; compare the drives first",
+                        drive.label(),
+                        head.seq
+                    )));
+                }
+            }
+            for drive in self.drives() {
+                copy_journal_entries(src, drive, &journal, true)?;
+            }
+            return Ok(());
+        }
         if !audited {
             let mut draft = AuditDraft::new(
                 AuditAction::RecoveryFinish,
@@ -458,12 +506,6 @@ impl DriveSet {
             });
             self.append_audit(&[draft], time)?;
         }
-        if journal.terminal().is_some() {
-            for drive in self.drives() {
-                copy_journal_entries(src, drive, &journal, true)?;
-            }
-            return Ok(());
-        }
         let entry = JournalEntry {
             format: JOURNAL_FORMAT,
             operation,
@@ -471,7 +513,11 @@ impl DriveSet {
             time: whole(time)?,
             event: JournalEvent::Completed {
                 outputs,
-                audit: self.audit_log()?.head(),
+                // The operation's own last audit entry, not the log head (finding 6).
+                audit: self
+                    .audit_log()?
+                    .operation_head(operation)
+                    .ok_or_else(|| StoreError::Unsafe(format!("{operation} has no audit entry")))?,
             },
         };
         self.write_verified(
@@ -502,26 +548,66 @@ impl DriveSet {
                 "{operation} cannot be abandoned: something irreversible was recorded"
             )));
         }
+        // Re-checked on the raw journals: never a second final entry (review finding 1),
+        // never after a signature or staging (FR-22 AC4).
+        for drive in self.drives() {
+            if let Some(journal) = drive.operation_journal(operation)? {
+                if journal.terminal().is_some() {
+                    return Err(StoreError::Unsafe(format!(
+                        "{operation} already has a final entry on {}; finish it from that drive",
+                        drive.label()
+                    )));
+                }
+                if journal.signed().next().is_some() || journal.staged_outputs().is_some() {
+                    return Err(StoreError::Unsafe(format!(
+                        "{operation} cannot be abandoned: something was signed or staged"
+                    )));
+                }
+            }
+        }
         self.sync_operation_journal(operation)?;
-        let journal = self.drives()[0]
-            .operation_journal(operation)?
+        // An earlier attempt may have written the audit entry to some drives only
+        // (review finding 2): bring it to every drive first.
+        self.sync_operation_audit(operation)?;
+        let journal = self
+            .drives()
+            .iter()
+            .map(|drive| drive.operation_journal(operation))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .max_by_key(|journal| journal.entries().len())
             .ok_or_else(|| StoreError::Unsafe(format!("{operation} disappeared")))?;
-        let mut draft = AuditDraft::new(
-            AuditAction::RecoveryAbandon,
-            journal.subject(),
-            AuditResult::Abandoned,
-        );
-        draft.operation = Some(operation);
-        draft.serial = journal.planned_serials().first().copied();
-        self.append_audit(&[draft], time)?;
+        let log = self.audit_log()?;
+        let previous = log
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.operation == Some(operation))
+            .filter(|entry| {
+                entry.action == AuditAction::RecoveryAbandon
+                    && entry.result == AuditResult::Abandoned
+            });
+        if previous.is_none() {
+            let mut draft = AuditDraft::new(
+                AuditAction::RecoveryAbandon,
+                journal.subject(),
+                AuditResult::Abandoned,
+            );
+            draft.operation = Some(operation);
+            draft.serial = journal.planned_serials().first().copied();
+            self.append_audit(&[draft], time)?;
+        }
+        let audit = self
+            .audit_log()?
+            .operation_head(operation)
+            .ok_or_else(|| StoreError::Unsafe(format!("{operation} has no audit entry")))?;
         let entry = JournalEntry {
             format: JOURNAL_FORMAT,
             operation,
             step: journal.entries().len() as u32 + 1,
             time: whole(time)?,
-            event: JournalEvent::Abandoned {
-                audit: self.audit_log()?.head(),
-            },
+            event: JournalEvent::Abandoned { audit },
         };
         self.write_verified(
             &format!("{JOURNAL_DIR}/{}", operation.stem()),

@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 
 use super::audit::{AuditDraft, AuditResult};
+use super::compare::drive_problems;
 use super::drive::{DriveSet, to_json_file};
 use super::fsio::WriteMode;
 use super::ids::{MAX_OPERATION_ID, OperationId};
@@ -65,10 +66,21 @@ fn whole_seconds(time: Timestamp) -> Result<Timestamp, StoreError> {
 type RawJournals = Vec<(OperationId, Vec<Vec<u8>>)>;
 
 impl DriveSet {
-    /// Checks that every drive holds the same audit log and the same journals, and that
-    /// no operation is pending. Returns the shared audit-log head.
+    /// Checks that every drive holds the same audit log and the same journals, that no
+    /// operation is pending, and that nothing is damaged: every completed output is
+    /// present with its SHA-256 and every journal's audit head is in the log (the checks
+    /// of [`DriveSet::compare`], so a new operation is refused whenever `compare` would
+    /// report damage). Returns the shared audit-log head.
     pub(crate) fn ensure_in_sync(&self) -> Result<AuditHead, StoreError> {
-        let head = self.audit_log()?.head();
+        let log = self.audit_log()?;
+        let head = log.head();
+        let mut problems = Vec::new();
+        for drive in self.drives() {
+            problems.extend(drive_problems(drive, &log)?);
+        }
+        if !problems.is_empty() {
+            return Err(StoreError::Damaged(problems));
+        }
         let mut first: Option<(String, RawJournals)> = None;
         for drive in self.drives() {
             let journal = drive.journal()?;
@@ -627,7 +639,7 @@ impl OperationHandle<'_> {
         if !self.audited {
             return Err(self.state_error("write the audit entry before completing"));
         }
-        let audit = self.set.audit_log()?.head();
+        let audit = self.own_audit_head()?;
         let outputs = self.outputs.clone();
         self.write_entry(
             JournalEvent::Completed {
@@ -667,8 +679,19 @@ impl OperationHandle<'_> {
         );
         draft.serial = self.planned.first().copied();
         self.append_audit(&[draft], time)?;
-        let audit = self.set.audit_log()?.head();
+        let audit = self.own_audit_head()?;
         self.write_entry(JournalEvent::Cancelled { audit }, time)
+    }
+
+    /// This operation's own last audit entry (number and SHA-256), which its final
+    /// journal entry records. Entries of no operation appended later (a clock
+    /// correction, a binary-hash record, a drive repair, an export) never change it, so
+    /// a behind drive stays repairable (review finding 6).
+    fn own_audit_head(&self) -> Result<AuditHead, StoreError> {
+        self.set
+            .audit_log()?
+            .operation_head(self.id)
+            .ok_or_else(|| self.state_error("the operation has no audit entry"))
     }
 }
 

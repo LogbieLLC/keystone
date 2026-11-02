@@ -44,6 +44,13 @@ pub fn crash_on_drive_change(allowed: u32) {
     crate::store::fault::fail_after(allowed);
 }
 
+/// Makes the drive change after the next `allowed` ones fail (once) like a pulled drive,
+/// **without** crash mode: the failing operation handles the error as it would in
+/// production (for example a cancel that cannot finish leaves the operation pending).
+pub fn fail_drive_change(allowed: u32) {
+    crate::store::fault::fail_after(allowed);
+}
+
 /// Number of drive changes (atomic writes, moves, deletes) on this thread since the
 /// last call; resets the count.
 pub fn drive_change_count() -> u32 {

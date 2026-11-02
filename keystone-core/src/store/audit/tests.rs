@@ -144,7 +144,9 @@ fn regression_an_edited_link_names_the_entry_that_holds_it() {
             first_bad(&join(&text)),
             (
                 (n - 1) as u64,
-                AuditProblem::HashMismatch { next_entry: n as u64 }
+                AuditProblem::HashMismatch {
+                    next_entry: n as u64
+                }
             ),
             "content of entry {}",
             n - 1

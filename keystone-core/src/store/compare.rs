@@ -6,8 +6,9 @@
 //!   [`DriveComparison::Behind`] with a [`RepairPlan`] per behind drive. After the operator
 //!   confirms, [`DriveSet::repair`] copies each missing operation *whole*: its journal
 //!   entries, every output file its completed entry lists (each verified against that
-//!   SHA-256), its audit entries, and **last** its final journal entry, so copying a log
-//!   entry can never make an incomplete drive look repaired;
+//!   SHA-256), its audit entries up to the one its final entry records (with any entries
+//!   of no operation written while it was pending), and **last** its final journal entry,
+//!   so copying a log entry can never make an incomplete drive look repaired;
 //! - logs differ after a common point: [`DriveComparison::Diverged`], with every history
 //!   side by side. Signing is blocked. Keystone never chooses a history, by length or
 //!   otherwise;
@@ -115,7 +116,7 @@ impl DriveComparison {
 
 /// Integrity problems of one drive: journal heads missing from the log (FR-14) and
 /// completed outputs that are missing or changed (FR-22 AC2).
-fn drive_problems(drive: &CaDrive, log: &AuditLog) -> Result<Vec<String>, StoreError> {
+pub(crate) fn drive_problems(drive: &CaDrive, log: &AuditLog) -> Result<Vec<String>, StoreError> {
     let mut problems = Vec::new();
     for (operation, journal) in drive.journal()? {
         if let Some(head) = journal.audit_head()
@@ -240,15 +241,15 @@ impl DriveSet {
         let mut steps: Vec<RepairStep> = Vec::new();
         let mut index = 0;
         while index < missing.len() {
-            let operation = missing[index].operation;
-            let run = missing[index..]
-                .iter()
-                .take_while(|entry| entry.operation == operation)
-                .count();
-            let entries = missing[index..index + run].to_vec();
-            index += run;
-            let Some(operation) = operation else {
-                steps.push(RepairStep::AuditOnly { entries });
+            let Some(operation) = missing[index].operation else {
+                let run = missing[index..]
+                    .iter()
+                    .take_while(|entry| entry.operation.is_none())
+                    .count();
+                steps.push(RepairStep::AuditOnly {
+                    entries: missing[index..index + run].to_vec(),
+                });
+                index += run;
                 continue;
             };
             let seen_before = steps.iter().any(|step| {
@@ -262,13 +263,34 @@ impl DriveSet {
             let journal = src.operation_journal(operation)?.ok_or_else(|| {
                 StoreError::Unsafe(format!("{} has no journal for {operation}", src.label()))
             })?;
-            let last = entries.last().map_or(0, |entry| entry.seq);
-            if journal.audit_head().map(|head| head.seq) != Some(last) {
-                return Err(StoreError::Unsafe(format!(
+            let not_finished = || {
+                StoreError::Unsafe(format!(
                     "{operation} is not finished on {}; open the recovery screen first",
                     src.label()
+                ))
+            };
+            // The operation's final entry records its own last audit entry. Entries of no
+            // operation written while it was pending (a clock correction, an export ...)
+            // may sit between its entries; they are copied with it (review finding 6).
+            let head = journal.audit_head().ok_or_else(not_finished)?;
+            if src_log.entry_hash(head.seq) != Some(head.sha256) {
+                return Err(not_finished());
+            }
+            let end = missing[index..]
+                .iter()
+                .position(|entry| entry.seq == head.seq)
+                .map(|offset| index + offset)
+                .ok_or_else(not_finished)?;
+            let entries = missing[index..=end].to_vec();
+            if entries
+                .iter()
+                .any(|entry| entry.operation.is_some_and(|op| op != operation))
+            {
+                return Err(StoreError::Unsafe(format!(
+                    "the audit entries of {operation} are interleaved with another operation's; it cannot be repaired automatically"
                 )));
             }
+            index = end + 1;
             check_target_journal(dst, operation, &journal)?;
             let outputs = journal.completed_outputs().unwrap_or_default().to_vec();
             for output in &outputs {

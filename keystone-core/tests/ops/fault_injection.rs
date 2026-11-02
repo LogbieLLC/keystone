@@ -15,7 +15,8 @@ use keystone_core::crypto::CancelFlag;
 use keystone_core::model::RevocationReason;
 use keystone_core::ops::testing::{self, FaultPoint};
 use keystone_core::ops::{
-    Ca, ExportStatus, IssuerUnlock, NoProgress, OpsError, RecoveryAction, RecoverySecrets,
+    Ca, ExportStatus, IssuerUnlock, NoProgress, OpsError, Progress, RecoveryAction,
+    RecoverySecrets, Step,
 };
 use keystone_core::store::OperationState;
 use keystone_testkit::{SimulatedYubiKey, TestDrives};
@@ -236,6 +237,75 @@ fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup
                 run_flow_a(&drives, "F5", later, &passphrase, None).expect("Flow A again");
             assert_no_lost_record(&outcome.ca);
         }
+    }
+}
+
+/// Flow C cancelled right after its encrypted key was staged; the cancel itself fails
+/// at drive change `fail_at` (counted from the start of the cancel), like a pulled
+/// drive. Returns the operation's error.
+fn cancel_flow_c_failing_at(
+    test: &mut TestCa,
+    token: &mut SimulatedYubiKey,
+    fail_at: Option<u32>,
+) -> OpsError {
+    let (plan, passphrase, _) = plan_flow_c(test, "FC").unwrap();
+    testing::supply_generated_key(keystone_testkit::keys::rsa4096(5));
+    let cancel = CancelFlag::new();
+    let flag = cancel.clone();
+    let progress = move |report: Progress| {
+        if let Progress::Step { step, .. } = report {
+            match step {
+                Step::StagingKey => flag.cancel(),
+                Step::Cancelling => {
+                    testing::drive_change_count();
+                    if let Some(allowed) = fail_at {
+                        testing::fail_drive_change(allowed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    plan.execute(
+        &test.ca,
+        token,
+        &s(PIN),
+        &passphrase,
+        None,
+        &progress,
+        &cancel,
+    )
+    .unwrap_err()
+}
+
+#[test]
+fn fr22_ac6_a_cancel_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-16 AC2, FR-22 AC4, SEC-22
+    // Review findings 1 and 2: an interrupted cancel must never corrupt the journals or
+    // block the CA; recovery after a restart reaches a consistent state.
+    let (base, token, _) = ca_with_main("FC", 80_000_007);
+    let mut probe = clone_ca(&base);
+    let mut probe_token = token.reopen();
+    let error = cancel_flow_c_failing_at(&mut probe, &mut probe_token, None);
+    assert!(matches!(error, OpsError::Cancelled { .. }), "{error}");
+    let total = testing::drive_change_count();
+    assert!(total >= 6, "a cancel makes {total} drive changes");
+    assert_no_lost_record(&probe.ca);
+    for fail_at in 0..total {
+        let mut test = clone_ca(&base);
+        let mut token = token.reopen();
+        let error = cancel_flow_c_failing_at(&mut test, &mut token, Some(fail_at));
+        assert!(
+            matches!(error, OpsError::Interrupted { .. }),
+            "change {fail_at}: {error}"
+        );
+        test.reopen();
+        let taken = recover_all(&mut test, None, "FC");
+        assert_eq!(taken.len(), 1, "change {fail_at}: {taken:?}");
+        assert_no_lost_record(&test.ca);
+        // The CA signs again afterwards.
+        run_flow_c(&mut test, &mut token, "FC after", 4, false)
+            .unwrap_or_else(|e| panic!("change {fail_at}: {e}"));
     }
 }
 

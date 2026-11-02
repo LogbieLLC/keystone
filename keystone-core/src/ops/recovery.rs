@@ -29,8 +29,8 @@ use crate::crypto::pkcs8::decrypt_key_pem;
 use crate::model::{CaLevel, Serial};
 use crate::passphrase::EnteredPassphrase;
 use crate::store::{
-    DriveOperationView, OperationId, OperationJournal, OperationKind, PendingOperation,
-    RecoveryAction as StoreAction, SignedObject, YubikeySetupStep,
+    DriveOperationView, OperationId, OperationJournal, OperationKind, OperationState,
+    PendingOperation, RecoveryAction as StoreAction, SignedObject, YubikeySetupStep,
 };
 use crate::token::{CredentialStatus, DeviceInfo, SIGNING_SLOT, TokenSigner};
 
@@ -267,13 +267,35 @@ impl Ca {
         let mut blocked_reason = pending.blocked_reason.clone();
         for action in &pending.actions {
             match action {
-                StoreAction::FinishFrom { drive_index, drive } => actions.push(choice(
-                    RecoveryAction::FinishFrom {
+                StoreAction::FinishFrom { drive_index, drive } => {
+                    let ended = pending
+                        .drives
+                        .get(*drive_index)
+                        .and_then(|view| view.state)
+                        .filter(|state| {
+                            matches!(state, OperationState::Cancelled | OperationState::Abandoned)
+                        });
+                    let action = RecoveryAction::FinishFrom {
                         drive_index: *drive_index,
                         drive: drive.clone(),
-                    },
-                    operation,
-                )),
+                    };
+                    actions.push(match ended {
+                        // An interrupted cancel or abandon: only its final entry (and
+                        // audit entry) is copied; nothing is marked completed.
+                        Some(state) => RecoveryChoice {
+                            description: format!(
+                                "Copy the {} entry of {operation} from {drive} to every other drive so they all record it the same way; nothing is signed, deleted or overwritten.",
+                                if state == OperationState::Cancelled {
+                                    "cancelled"
+                                } else {
+                                    "abandoned"
+                                }
+                            ),
+                            action,
+                        },
+                        None => choice(action, operation),
+                    });
+                }
                 StoreAction::Abandon if existing_key => {
                     actions.push(choice(
                         RecoveryAction::CompleteSetupWithExistingKey,

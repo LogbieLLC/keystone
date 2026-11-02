@@ -441,6 +441,20 @@ impl AuditLog {
         }
     }
 
+    /// The newest entry that belongs to `operation` (its number and SHA-256): what an
+    /// operation's final journal entry records, so later entries that belong to no
+    /// operation never change it.
+    pub fn operation_head(&self, operation: OperationId) -> Option<AuditHead> {
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.operation == Some(operation))?;
+        Some(AuditHead {
+            seq: self.entries[index].seq,
+            sha256: self.hashes[index],
+        })
+    }
+
     /// True when this log's entries are the first entries of `other` (same entries and
     /// hashes, possibly fewer) (FR-12 AC3).
     pub fn is_prefix_of(&self, other: &AuditLog) -> bool {
