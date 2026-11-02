@@ -656,8 +656,19 @@ impl Backend for OpsBackend {
                 let secrets = RecoverySecrets {
                     master_passphrase: resume.master_passphrase.as_ref(),
                 };
-                ca.run_recovery(operation, &action, &secrets, time)
-                    .map_err(|e| failure(ACTION, e))?;
+                // The core re-checks the action against the YubiKey actually connected
+                // (Abandon of a YubiKey setup is refused while that setup's YubiKey is
+                // connected); `None` means no YubiKey is connected.
+                let mut token = ctx.token.as_ref().map(SharedToken::lock);
+                ca.run_recovery(
+                    operation,
+                    &action,
+                    &secrets,
+                    token.as_mut().map(|t| &mut ***t as &mut dyn TokenSigner),
+                    time,
+                )
+                .map_err(|e| failure(ACTION, e))?;
+                drop(token);
                 drop(resume);
                 if action == RecoveryAction::Abandon {
                     return Ok(FlowOutcome {

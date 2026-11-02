@@ -135,12 +135,14 @@ pub fn gather(selection: &DriveSelection, new_ca: bool) -> StartupData {
 
 fn audit_failure(error: &StoreError) -> AuditFailure {
     match error {
+        // The core's sentence names the first bad entry, or both candidates when the
+        // log alone cannot tell which of two entries was changed (FR-14 AC3).
         StoreError::Parse {
-            source: ParseError::Audit { entry, problem },
+            source: source @ ParseError::Audit { entry, .. },
             ..
         } => AuditFailure {
             first_bad_entry: Some(*entry),
-            message: format!("entry {entry} is the first bad entry: {problem}"),
+            message: source.to_string(),
         },
         other => AuditFailure {
             first_bad_entry: None,
@@ -588,6 +590,36 @@ pub fn evaluate(data: &StartupData, production: bool, now: OffsetDateTime) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fr14_ac3_a_broken_last_link_names_both_candidate_entries() {
+        // Covers: FR-14 AC3
+        // When only the link in the last entry breaks, the log alone cannot tell
+        // whether entry n-1 or that link was changed; the operator is told both, never
+        // that one of them is certainly the first bad entry.
+        use keystone_core::store::AuditProblem;
+        let error = StoreError::Parse {
+            path: "audit.log".into(),
+            source: ParseError::Audit {
+                entry: 3,
+                problem: AuditProblem::EntryOrLinkChanged { link_entry: 4 },
+            },
+        };
+        let failure = audit_failure(&error);
+        assert_eq!(failure.first_bad_entry, Some(3));
+        assert!(
+            failure
+                .message
+                .contains("entry 3 or the link in entry 4 is the first bad entry"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("entry 3 is the first bad entry"),
+            "{}",
+            failure.message
+        );
+    }
     use keystone_core::model::Timestamp;
     use keystone_core::store::audit::GENESIS_PREV;
     use keystone_core::store::{AuditDraft, DriveSet, OperationKind};
