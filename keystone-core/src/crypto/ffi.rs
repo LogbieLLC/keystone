@@ -24,8 +24,20 @@
 //!   every path, including early returns.
 //! - Nothing here panics across the FFI boundary: the keygen callback catches
 //!   unwinding and turns it into "abort".
-//! - A private key is generated or decrypted directly into an `EVP_PKEY` owned by
-//!   `PrivateKey`; there is no plaintext DER round trip.
+//! - A private key is generated, or decoded from its decrypted `PrivateKeyInfo`,
+//!   directly into an `EVP_PKEY` owned by `PrivateKey`, with its private numbers in
+//!   OpenSSL's secure heap. Decryption does not use `EVP_PKCS82PKEY`, because
+//!   OpenSSL 3's decoder behind it leaves an unwiped plaintext copy of the key in
+//!   freed heap memory (see `rsa_key_from_pkcs8_info`). The plaintext buffers of
+//!   `PKCS8_decrypt` and `PKCS8_PRIV_KEY_INFO` are wiped by OpenSSL; this module
+//!   never holds plaintext key bytes in a buffer of its own.
+//! - Residual risk, encryption: for a generated (provider) key, `EVP_PKEY2PKCS8`
+//!   encodes through OpenSSL 3's encoder, which frees two plaintext DER buffers of
+//!   the key without wiping them (`ASN1_item_i2d_bio` and the memory BIO of
+//!   `OSSL_ENCODER_to_data`, in 3.0.13 and 3.5.4). The next allocations of the same
+//!   size inside the same encryption (`PKCS8_set0_pbe`, which wipes its buffers)
+//!   reuse those blocks; `tests/key_residue.rs` checks after every master and
+//!   sub-intermediate encryption that no copy is left outside the secure heap.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::{CStr, c_char, c_int, c_long, c_ulong, c_void};
@@ -87,6 +99,13 @@ unsafe extern "C" {
         pass: *const c_char,
         passlen: c_int,
     ) -> *mut sys::PKCS8_PRIV_KEY_INFO;
+    fn PKCS8_pkey_get0(
+        ppkalg: *mut *const sys::ASN1_OBJECT,
+        pk: *mut *const u8,
+        ppklen: *mut c_int,
+        pa: *mut *const sys::X509_ALGOR,
+        p8: *const sys::PKCS8_PRIV_KEY_INFO,
+    ) -> c_int;
     fn X509_STORE_add_crl(store: *mut sys::X509_STORE, crl: *mut sys::X509_CRL) -> c_int;
     fn X509_STORE_CTX_set_time(ctx: *mut sys::X509_STORE_CTX, flags: c_ulong, t: c_long);
     fn CRYPTO_secure_malloc_init(size: usize, minsize: usize) -> c_int;
@@ -214,6 +233,7 @@ macro_rules! guard {
 guard!(PkeyCtxGuard, sys::EVP_PKEY_CTX, sys::EVP_PKEY_CTX_free);
 guard!(PkeyGuard, sys::EVP_PKEY, sys::EVP_PKEY_free);
 guard!(BignumGuard, sys::BIGNUM, sys::BN_free);
+guard!(RsaGuard, sys::RSA, sys::RSA_free);
 guard!(
     P8InfoGuard,
     sys::PKCS8_PRIV_KEY_INFO,
@@ -300,7 +320,8 @@ unsafe extern "C" fn keygen_callback(ctx: *mut sys::EVP_PKEY_CTX) -> c_int {
 /// A private key owned by this module.
 ///
 /// The `EVP_PKEY` is created by key generation or decryption and freed on drop
-/// (`EVP_PKEY_free` clears the private numbers). It is never handed out as an
+/// (`EVP_PKEY_free` clears the private numbers, including any copy OpenSSL made
+/// for signing). It is never handed out as an
 /// OpenSSL object, so only this module can reach the private key; the methods
 /// below are the only things anyone can do with it.
 pub(crate) struct PrivateKey(PkeyGuard);
@@ -315,10 +336,6 @@ unsafe impl Send for PrivateKey {}
 unsafe impl Sync for PrivateKey {}
 
 impl PrivateKey {
-    fn from_raw(raw: *mut sys::EVP_PKEY, context: &str) -> Result<Self, CryptoError> {
-        Ok(PrivateKey(PkeyGuard::checked(raw, context)?))
-    }
-
     /// True for an RSA key (not RSA-PSS or any other type).
     pub(crate) fn is_rsa(&self) -> bool {
         // SAFETY: `self.0.0` is a live key owned by the guard.
@@ -538,10 +555,12 @@ pub(crate) enum Pbes2Kdf {
 /// Encrypts `key` into an `EncryptedPrivateKeyInfo` (DER) using PBES2 with the given
 /// KDF and AES-256-CBC, with the caller's salt and IV.
 ///
-/// The key goes from the `EVP_PKEY` straight into OpenSSL's `PKCS8_PRIV_KEY_INFO`
-/// (cleared when freed) and is encrypted there; no plaintext copy reaches Rust. The
-/// passphrase is passed with its explicit length. The output contains only
-/// ciphertext and public parameters.
+/// `EVP_PKEY2PKCS8` puts the key into OpenSSL's `PKCS8_PRIV_KEY_INFO` (wiped when
+/// freed), and `PKCS8_set0_pbe` encrypts it there (its plaintext buffer is wiped
+/// too); no plaintext copy reaches Rust. For a generated key, `EVP_PKEY2PKCS8` goes
+/// through OpenSSL's encoder, which frees two plaintext buffers without wiping them;
+/// see the residual risk in the module documentation. The passphrase is passed with
+/// its explicit length. The output contains only ciphertext and public parameters.
 pub(crate) fn encrypt_pkcs8_der(
     key: &PrivateKey,
     passphrase: &[u8],
@@ -619,11 +638,14 @@ pub(crate) fn encrypt_pkcs8_der(
 /// The caller checks the encryption parameters first (`pkcs8.rs`, SEC-08). The
 /// passphrase is passed to `PKCS8_decrypt` as a pointer into the caller's (locked)
 /// buffer with an explicit length, so no copy of it is made on the Rust side and a
-/// NUL byte is an ordinary byte. The decrypted `PKCS8_PRIV_KEY_INFO` is cleared by
-/// OpenSSL when freed, and `EVP_PKCS82PKEY` decodes it straight into the key.
+/// NUL byte is an ordinary byte. `PKCS8_decrypt` wipes its plaintext buffer before
+/// freeing it, and the decrypted `PKCS8_PRIV_KEY_INFO` is wiped by OpenSSL when it
+/// is freed. [`rsa_key_from_pkcs8_info`] then decodes the key from that structure
+/// into the secure heap without any other copy.
 ///
 /// A malformed structure is [`CryptoError::Der`]; a failed decryption (wrong
-/// passphrase or damaged ciphertext) is [`CryptoError::WrongPassphrase`].
+/// passphrase or damaged ciphertext) is [`CryptoError::WrongPassphrase`]; a key that
+/// is not RSA is [`CryptoError::UnsupportedKey`].
 pub(crate) fn decrypt_pkcs8_der(der: &[u8], passphrase: &[u8]) -> Result<PrivateKey, CryptoError> {
     // The decrypted private numbers go into the locked heap.
     init_secure_heap()?;
@@ -655,14 +677,77 @@ pub(crate) fn decrypt_pkcs8_der(der: &[u8], passphrase: &[u8]) -> Result<Private
         return Err(CryptoError::WrongPassphrase);
     }
     let p8 = P8InfoGuard(p8);
-    // SAFETY: `p8.0` is live; OpenSSL allocates a new key, owned by `PrivateKey` below.
-    let raw = unsafe { sys::EVP_PKCS82PKEY(p8.0) };
-    if raw.is_null() {
-        // SAFETY: as above.
+    rsa_key_from_pkcs8_info(&p8)
+}
+
+/// Turns a decrypted `PrivateKeyInfo` into a [`PrivateKey`] without leaving any copy
+/// of the private numbers outside OpenSSL's secure heap (SEC-07).
+///
+/// `EVP_PKCS82PKEY` is not used: in OpenSSL 3 (checked in the 3.0.13 and 3.5.4
+/// sources) it re-encodes the structure and runs the `OSSL_DECODER`, whose DER reader
+/// (`der2key_decode`) copies the whole plaintext key into a heap buffer and frees it
+/// without wiping it. Instead:
+/// 1. `PKCS8_pkey_get0` borrows the `RSAPrivateKey` DER inside `p8`; nothing is
+///    copied, and `p8` wipes it when freed.
+/// 2. `d2i_RSAPrivateKey` decodes straight from that buffer. Its ASN.1 template marks
+///    d, p, q, dP, dQ and qInv as `CBIGNUM`, so each is created with `BN_secure_new`
+///    in the locked secure heap and filled by `BN_bin2bn` directly from the DER
+///    (a primitive INTEGER is never collected into a temporary buffer).
+/// 3. `EVP_PKEY_assign` hands that `RSA` to a new `EVP_PKEY` without copying it.
+///
+/// `d2i_RSAPrivateKey`, `RSA_free` and `EVP_PKEY_assign` are deprecated since
+/// OpenSSL 3.0 but are part of every 3.x library built with the deprecated API, which
+/// is the default and how Ubuntu builds 3.0 and 3.5; rust-openssl relies on them as
+/// well. Without them the program does not link, so the change cannot go unnoticed.
+///
+/// The result is a "legacy" `EVP_PKEY`. Signing with it makes OpenSSL export the key
+/// once to its default provider (`OSSL_PARAM` in the secure heap, wiped when freed);
+/// the provider's copy and its Montgomery values are ordinary heap memory while the
+/// key lives and are wiped by `BN_clear_free` when it is dropped. Keys from
+/// [`generate_rsa_key`] keep such Montgomery values in ordinary memory after their
+/// first signature as well.
+fn rsa_key_from_pkcs8_info(p8: &P8InfoGuard) -> Result<PrivateKey, CryptoError> {
+    let mut algorithm: *const sys::ASN1_OBJECT = ptr::null();
+    let mut data: *const u8 = ptr::null();
+    let mut len: c_int = 0;
+    // SAFETY: `p8.0` is live. The outputs are borrowed pointers into `p8`, used only
+    // while `p8` is alive; the `X509_ALGOR` output is not requested (null is allowed).
+    let found =
+        unsafe { PKCS8_pkey_get0(&mut algorithm, &mut data, &mut len, ptr::null_mut(), p8.0) };
+    let Ok(data_len) = usize::try_from(len) else {
+        return Err(CryptoError::WrongPassphrase);
+    };
+    if found != 1 || algorithm.is_null() || data.is_null() || data_len == 0 {
+        // SAFETY: clears this thread's error queue.
         unsafe { sys::ERR_clear_error() };
         return Err(CryptoError::WrongPassphrase);
     }
-    PrivateKey::from_raw(raw, "EVP_PKCS82PKEY")
+    // SAFETY: `algorithm` points to the live algorithm OID inside `p8`.
+    if unsafe { sys::OBJ_obj2nid(algorithm) } != sys::NID_rsaEncryption {
+        return Err(CryptoError::UnsupportedKey("not an RSA key".into()));
+    }
+    let mut cursor = data;
+    // SAFETY: `cursor` points to `len` readable bytes inside `p8`, which outlives this
+    // call; OpenSSL allocates a new `RSA`, owned by the guard below.
+    let rsa = unsafe { sys::d2i_RSAPrivateKey(ptr::null_mut(), &mut cursor, c_long::from(len)) };
+    if rsa.is_null() {
+        // SAFETY: clears this thread's error queue.
+        unsafe { sys::ERR_clear_error() };
+        return Err(CryptoError::WrongPassphrase);
+    }
+    let mut rsa = RsaGuard(rsa);
+    if cursor != data.wrapping_add(data_len) {
+        return Err(CryptoError::WrongPassphrase);
+    }
+    // SAFETY: plain constructor; a null result is handled by `checked`.
+    let key = PkeyGuard::checked(unsafe { sys::EVP_PKEY_new() }, "EVP_PKEY_new")?;
+    // SAFETY: both objects are live. On success the key takes ownership of `rsa.0`
+    // without copying it (handled below); on failure it stays with the guard.
+    if unsafe { sys::EVP_PKEY_assign(key.0, sys::EVP_PKEY_RSA, rsa.0.cast::<c_void>()) } != 1 {
+        return Err(openssl_error("EVP_PKEY_assign"));
+    }
+    rsa.0 = ptr::null_mut();
+    Ok(PrivateKey(key))
 }
 
 // ---------------------------------------------------------------------------
