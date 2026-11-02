@@ -129,8 +129,16 @@ static SECURE_HEAP_LOCKED: OnceLock<bool> = OnceLock::new();
 /// [`CryptoError::SecureHeapUnavailable`].
 pub(crate) fn init_secure_heap() -> Result<(), CryptoError> {
     let locked = *SECURE_HEAP_LOCKED.get_or_init(|| {
+        // SAFETY: plain query of a flag.
+        if unsafe { CRYPTO_secure_malloc_initialized() } == 1 {
+            // Already set up in this process by another copy of this module. That
+            // happens only in keystone-core's own unit tests, which also link the
+            // library build through keystone-testkit; nothing else in Keystone creates
+            // the heap, and this function keeps a heap only when it is locked (below).
+            return true;
+        }
         // SAFETY: plain call with constant power-of-two arguments (checked above); the
-        // `OnceLock` makes this the only initialisation in the process.
+        // `OnceLock` makes this the only initialisation by this copy of the module.
         let rc =
             unsafe { CRYPTO_secure_malloc_init(SECURE_HEAP_BYTES, SECURE_HEAP_MIN_ALLOCATION) };
         if rc == 2 {

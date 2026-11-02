@@ -404,3 +404,6 @@ impl CertificateInfo {
         self.subject_der.clone()
     }
 }
+
+#[cfg(test)]
+mod tests;
