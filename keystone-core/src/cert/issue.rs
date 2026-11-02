@@ -37,8 +37,16 @@ pub const MAX_SERIAL_ATTEMPTS: usize = 32;
 /// A serial number that was checked against every known history (FR-10 AC2).
 ///
 /// Created by [`plan_serial`], which asks the caller's hook whether a candidate was
-/// ever seen, or by [`PlannedSerial::from_reserved`] when resuming an operation
-/// whose journal entry already reserved the serial (FR-22 AC1).
+/// ever seen, or, inside this crate only, by `PlannedSerial::from_reserved` when the
+/// operations layer resumes an operation whose journal entry already reserved the
+/// serial (FR-22 AC1). Code outside keystone-core cannot make one from an arbitrary
+/// serial, so it cannot sign without the uniqueness check:
+///
+/// ```compile_fail
+/// use keystone_core::cert::PlannedSerial;
+/// let serial = keystone_core::crypto::rand::random_serial().unwrap();
+/// let _unchecked = PlannedSerial::from_reserved(serial);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedSerial(Serial);
 
@@ -49,8 +57,9 @@ impl PlannedSerial {
     }
 
     /// A serial that a pending journal entry already reserved for this same
-    /// operation (recovery after a restart). Do not use for new operations.
-    pub fn from_reserved(serial: Serial) -> Self {
+    /// operation (recovery after a restart, `ops`), or one the `ops` test seam
+    /// checked against every known serial itself. Never for new operations.
+    pub(crate) fn from_reserved(serial: Serial) -> Self {
         PlannedSerial(serial)
     }
 }
