@@ -24,7 +24,7 @@ use crate::support::*;
 
 #[test]
 fn flow_b_hardens_the_yubikey_and_creates_the_main_intermediate() {
-    // Covers: FR-05 AC3, FR-06 AC1, FR-06 AC2, FR-06 AC3, FR-06 AC4, FR-07 AC1, FR-07 AC2, FR-07 AC3, FR-07 AC5, FR-13 AC6, FR-18 AC1, FR-18 AC2, FR-20 AC1, FR-22 AC7
+    // Covers: FR-05 AC3, FR-06 AC1, FR-06 AC2, FR-06 AC3, FR-06 AC4, FR-07 AC1, FR-07 AC2, FR-07 AC3, FR-07 AC5, FR-13 AC6, FR-18 AC1, FR-20 AC1, FR-22 AC7
     let mut test = new_ca("B1");
     let (mut token, controller) = token(20_000_001);
     // FR-05 AC3: serial and firmware shown before any action; defaults detected.
