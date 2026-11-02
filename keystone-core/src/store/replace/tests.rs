@@ -476,3 +476,98 @@ fn regression_a_drive_whose_addition_is_not_recorded_is_never_used() {
         .cancel(ts(40))
         .expect("cancel");
 }
+
+#[test]
+fn sec11_no_drive_is_copied_from_damaged_drives() {
+    // Covers: SEC-11, FR-22 AC2, SEC-22
+    // Mutation-found gap (M9): removing the refusal of damaged drives broke no test.
+    let mut drives = ca(2);
+    let new = drives.add_ca_drive();
+    // The only healthy drive left lost a completed output: copying it would spread an
+    // incomplete CA.
+    let backup = open_some(&drives, &[1]);
+    let log_before = backup.audit_log().expect("log");
+    let cert = drives
+        .ca_drive(1)
+        .join(format!("keystone/certs/{}.crt", serial(2).to_hex()));
+    fs::remove_file(&cert).expect("remove a certificate");
+    match backup.plan_add_drive(&new) {
+        Err(StoreError::Damaged(problems)) => assert!(
+            problems.iter().any(|p| p.contains("is missing")),
+            "{problems:?}"
+        ),
+        other => panic!("expected damage to be refused, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(&new).expect("list").count(), 0, "untouched");
+    assert_eq!(backup.audit_log().expect("log"), log_before);
+}
+
+#[test]
+fn sec11_no_drive_is_copied_while_the_connected_drives_diverge() {
+    // Covers: SEC-11, FR-12 AC3, SEC-22
+    // Mutation-found gap (M10): removing the refusal of diverged drives broke no test.
+    let mut drives = crate::store::testutil::diverged_ca();
+    let new = drives.add_ca_drive();
+    let diverged = open_some(&drives, &[0, 3]);
+    assert!(matches!(
+        diverged.compare().expect("compare"),
+        DriveComparison::Diverged { .. }
+    ));
+    match diverged.plan_add_drive(&new) {
+        Err(StoreError::OutOfSync(message)) => {
+            assert!(message.contains("different histories"), "{message}");
+        }
+        other => panic!("expected diverged drives to be refused, got {other:?}"),
+    }
+    assert_eq!(fs::read_dir(&new).expect("list").count(), 0, "untouched");
+}
+
+#[test]
+fn sec11_a_copy_that_differs_from_its_source_never_gets_an_identity() {
+    // Covers: SEC-11, FR-12 AC2, SEC-20
+    // Mutation-found gap (M6): removing the whole-copy check before the identity write
+    // broke no test. Here the interrupted copy holds a binary-hash record that the
+    // source drive does not have; every file the copy writes verifies, but the copy as a
+    // whole does not equal the source, so it must never become a CA drive.
+    let mut drives = ca(2);
+    let new = drives.add_ca_drive();
+    let primary = open_some(&drives, &[0]);
+    let keystone = new.join("keystone");
+    fs::create_dir(&keystone).expect("mkdir");
+    let marker = DriveIdentity {
+        format: IDENTITY_FORMAT,
+        ca_id: primary.ca_id(),
+        drive_id: DriveId::random().expect("id"),
+        role: DriveRole::Backup,
+        created: ts(30),
+    };
+    fs::write(
+        keystone.join(REPLACEMENT_FILE),
+        crate::store::drive::to_json_file(&marker),
+    )
+    .expect("marker");
+    fs::write(
+        keystone.join(BINARY_HASH_FILE),
+        crate::store::binhash::format_binary_hash_record(crate::model::Sha256Digest([5; 32])),
+    )
+    .expect("binary hash record");
+    let plan = primary.plan_add_drive(&new).expect("plan");
+    assert_eq!(plan.state, NewDriveState::PartialCopy);
+    let error = primary.add_drive(&plan, ts(31)).expect_err("refused");
+    assert!(
+        error.to_string().contains("the binary hash record differs"),
+        "{error}"
+    );
+    assert!(
+        !keystone.join(IDENTITY_FILE).exists(),
+        "no identity was written"
+    );
+    assert!(matches!(
+        classify_drive(&new).expect("classify"),
+        DriveClass::DamagedKeystone(_)
+    ));
+    assert!(
+        added_entries(&open_some(&drives, &[0])).is_empty(),
+        "nothing was recorded"
+    );
+}

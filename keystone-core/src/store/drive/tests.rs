@@ -6,7 +6,7 @@ use std::fs;
 use keystone_testkit::TestDrives;
 
 use super::*;
-use crate::store::testutil::{new_ca, open_all, open_some, ts};
+use crate::store::testutil::{copy_folder, new_ca, open_all, open_some, ts};
 
 #[test]
 fn classify_empty_ca_damaged_export_and_other_drives() {
@@ -218,19 +218,6 @@ fn regression_two_ca_drives_on_one_device_are_refused() {
         "untouched"
     );
     crate::store::fault::clear_devices();
-}
-
-fn copy_folder(from: &std::path::Path, to: &std::path::Path) {
-    fs::create_dir_all(to).expect("mkdir");
-    for entry in fs::read_dir(from).expect("list") {
-        let entry = entry.expect("entry");
-        let target = to.join(entry.file_name());
-        if entry.file_type().expect("type").is_dir() {
-            copy_folder(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), &target).expect("copy");
-        }
-    }
 }
 
 #[test]

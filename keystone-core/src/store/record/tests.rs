@@ -6,7 +6,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::store::journal::OperationKind;
-use crate::store::testutil::{cert, cert_pem, issue, issue_master, new_ca, serial, ts};
+use crate::store::testutil::{cert, cert_pem, issue_master, new_ca, open_some, serial, ts};
 
 fn issued(op: u64, certificate: CertificateRecord) -> RecordUpdate {
     RecordUpdate::new(
@@ -267,21 +267,35 @@ fn fr10_ac2_known_serials_cover_records_journals_and_every_drive() {
             Err(StoreError::SerialAlreadyUsed(s)) if s == reused
         ));
     }
-    // A serial seen only on one drive (a divergent history) still counts.
-    let other = TestDrives::new(2);
-    let other_set = new_ca(&other);
-    issue(
-        &other_set,
-        OperationKind::CreateMaster,
-        cert(serial(9), CaLevel::Master, serial(9)),
-        ts(5),
-    );
-    let mixed = vec![
-        CaDrive::open(drives.ca_drive(0)).expect("open"),
-        CaDrive::open(other.ca_drive(1)).expect("open"),
-    ];
-    let all = known_serials(&mixed).expect("serials");
-    assert!(all.contains(&serial(9)) && all.contains(&serial(7)));
+    // A serial seen only on one drive (a divergent history of this CA) still counts, on
+    // the drive set that serial planning and begin_operation use. (The earlier version
+    // of this check mixed drives of two different CAs through the free function, which
+    // no signing path does: such drives are never opened together.)
+    let diverged = crate::store::testutil::diverged_ca();
+    let set = open_some(&diverged, &[0, 3]);
+    assert_eq!(set.drives().len(), 2);
+    assert!(matches!(
+        set.compare().expect("compare"),
+        crate::store::DriveComparison::Diverged { .. }
+    ));
+    let only_on_primary = set.drives()[0].seen_serials().expect("primary");
+    let only_on_backup = set.drives()[1].seen_serials().expect("backup");
+    assert!(only_on_primary.contains(&serial(7)) && !only_on_primary.contains(&serial(9)));
+    assert!(only_on_backup.contains(&serial(9)) && !only_on_backup.contains(&serial(7)));
+    let known = set.known_serials().expect("serials");
+    assert!(known.contains(&serial(7)) && known.contains(&serial(9)));
+    // Nothing is begun on these drives while they diverge, whatever its serial.
+    for planned in [serial(7), serial(9), serial(11)] {
+        assert!(matches!(
+            set.begin_operation(
+                OperationKind::CreateSubIntermediate,
+                "sub",
+                &[planned],
+                ts(30)
+            ),
+            Err(StoreError::OutOfSync(_))
+        ));
+    }
 }
 
 #[test]
