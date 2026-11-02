@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use super::audit::{AuditDraft, AuditResult};
+use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult};
 use super::compare::drive_problems;
 use super::drive::{DriveSet, to_json_file};
 use super::fsio::{EntryKind, WriteMode};
@@ -280,16 +280,41 @@ impl DriveSet {
     /// Copies outputs of a completed operation to the export drive (create-only,
     /// read-back verified), but only after [`DriveSet::export_ready`] passed (FR-22 AC2).
     /// `files` pairs each output with its name on the export drive.
+    ///
+    /// - The only key that may leave the CA drives is a sub-intermediate's encrypted key
+    ///   (FR-09 AC1); the master's key is never exported (review finding 15).
+    /// - A file already on the export drive with the same content is kept (a retried
+    ///   export); a different file of that name is never overwritten.
+    /// - Every export appends one `export` audit entry (no operation) naming the
+    ///   operation and every file, after the files are written and verified.
+    ///
+    /// Returns each export name with its SHA-256.
     pub fn export_outputs(
         &self,
         id: OperationId,
         export: &ExportDrive,
         files: &[(OutputPath, String)],
+        time: Timestamp,
     ) -> Result<Vec<(String, Sha256Digest)>, StoreError> {
+        self.ensure_writable()?;
         let (outputs, verified) = self.export_ready(id)?;
         let source = &self.drives()[verified[0]];
-        let mut written = Vec::new();
+        let journal = source
+            .operation_journal(id)?
+            .ok_or_else(|| StoreError::Unsafe(format!("{id} has no journal")))?;
+        let mut contents = Vec::new();
         for (path, export_name) in files {
+            if path.dir() == OutputDir::Keys
+                && journal.kind() != OperationKind::CreateSubIntermediate
+            {
+                return Err(StoreError::Unsafe(format!(
+                    "{path} is the {} key of {id}; only a sub-intermediate's encrypted key is ever exported, never the master's",
+                    match journal.kind() {
+                        OperationKind::CreateMaster => "master",
+                        _ => "issuer",
+                    }
+                )));
+            }
             let output = outputs
                 .iter()
                 .find(|o| o.path == *path)
@@ -301,8 +326,38 @@ impl DriveSet {
                     StoreError::Unsafe(format!("{path} changed on {}", source.label()))
                 })?;
             check_no_plaintext_key(path, &data)?;
-            written.push((export_name.clone(), export.write_file(export_name, &data)?));
+            match export.read_existing(export_name)? {
+                Some(existing) if sha256(&existing) == output.sha256 => {}
+                Some(_) => {
+                    return Err(StoreError::AlreadyExists {
+                        path: export.path_of(export_name),
+                    });
+                }
+                None => {}
+            }
+            contents.push((export_name, data, output.sha256));
         }
+        let mut written = Vec::new();
+        for (export_name, data, digest) in contents {
+            if export.read_existing(export_name)?.is_none() {
+                export.write_file(export_name, &data)?;
+            }
+            written.push((export_name.clone(), digest));
+        }
+        let mut draft =
+            AuditDraft::new(AuditAction::Export, journal.subject(), AuditResult::Success);
+        draft.details = Some(AuditDetails {
+            note: Some(format!(
+                "{id}: {} written to the export drive",
+                written
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            ..AuditDetails::default()
+        });
+        self.append_audit(&[draft], time)?;
         Ok(written)
     }
 }

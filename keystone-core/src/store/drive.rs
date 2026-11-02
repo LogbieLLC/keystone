@@ -549,6 +549,16 @@ impl ExportDrive {
     pub fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
         self.dir.read(name, limit)
     }
+
+    /// Reads an exported file of at most the output-file limit, or `None` if missing.
+    pub(crate) fn read_existing(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        if !is_valid_name(name) {
+            return Err(StoreError::Unsafe(format!(
+                "invalid export file name {name:?}"
+            )));
+        }
+        self.dir.read_if_exists(name, MAX_OUTPUT_FILE_BYTES)
+    }
 }
 
 #[cfg(test)]
