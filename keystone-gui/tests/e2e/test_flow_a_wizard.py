@@ -1,18 +1,30 @@
-"""Flow A wizard end to end, keyboard only, up to the backend adapter.
+"""Flow A end to end, keyboard only: the master is really created.
 
 Drive selection, start-up checks and clock confirmation, then: master name and
 validity with live validation, passphrase length, show-once and confirmation, the
-review step, and "Create the master". The operations layer is not connected in this
-build, so the adapter answers "not connected yet" and nothing is written: the drives
-stay empty. The confirmed time is used by one execute step only.
+review step, and "Create the master". The operations layer generates the RSA 8,192
+key, self-signs the master, signs its first CRL and writes everything to both drives
+and the CRL to the export drive. The result screen shows every drive read back and
+the SHA-256 fingerprint, which must equal the fingerprint of the certificate file
+on the drive. The confirmed time is used by one execute step only, and no plaintext
+private key exists anywhere afterwards.
 
-# Covers: PRD section 6 Flow A, FR-02 AC4, FR-03 AC2, FR-03 AC3, FR-03 AC4, FR-10 AC3, FR-16 AC1, SEC-16, SEC-17, NFR-04, NFR-10
+# Covers: PRD section 6 Flow A, FR-02 AC1, FR-02 AC4, FR-03 AC2, FR-03 AC3, FR-03 AC4, FR-04 AC1, FR-10 AC3, FR-12 AC1, FR-12 AC2, FR-13 AC6, FR-16 AC1, FR-20 AC1, SEC-04, SEC-08, SEC-16, SEC-17, NFR-04, NFR-10
 """
 
 import os
 import re
 
-from keystone_e2e import Keystone, check, drive_args, make_dirs, run
+from keystone_e2e import (
+    Keystone,
+    assert_no_plaintext_keys,
+    certificate_fingerprint,
+    check,
+    drive_args,
+    files_under,
+    make_dirs,
+    run,
+)
 
 
 def shown_words(keystone):
@@ -98,19 +110,53 @@ def test():
             f"fixed profile not shown: {keystone.labels()}",
         )
 
-        # Execute through the backend adapter: not connected yet, nothing written.
+        # Execute: RSA 8,192 generation can take minutes (NFR-03).
         keystone.activate("Create the master")
-        keystone.wait_heading("Not connected yet")
-        keystone.wait_label(
-            "Blocked: Creating the master is not connected yet: this build's operations layer is not wired to the GUI. Nothing was written to any drive or YubiKey."
+        keystone.wait_heading("The master (root) certificate was created", timeout=600)
+        for role, folder in (("primary", primary), ("backup", backup)):
+            lines = keystone.labels_matching(
+                rf"^OK: {role} drive [0-9a-f]{{8}} \({re.escape(folder)}\): every file was read back and matches its SHA-256\.$"
+            )
+            check(len(lines) == 1, f"{role} drive not verified: {keystone.labels()}")
+        for name in ("keys/master.key", "certs/master.crt"):
+            check(keystone.labels().count(name) == 2, f"{name} not listed per drive")
+        fingerprints = keystone.result_fingerprints()
+        check(len(fingerprints) == 1, f"fingerprints shown: {fingerprints}")
+        on_drive = certificate_fingerprint(os.path.join(primary, "keystone", "certs", "master.crt"))
+        check(fingerprints[0] == on_drive, f"shown {fingerprints[0]}, file {on_drive}")
+        check(
+            keystone.has_label("CN=KEYSTONE TEST E2E Root, C=US (master (root))"),
+            f"certificate title missing: {keystone.labels()}",
+        )
+        check(
+            keystone.labels_matching(r"^CRL number 1 of CN=KEYSTONE TEST E2E Root, C=US, next update "),
+            f"first CRL not shown: {keystone.labels()}",
+        )
+        check(
+            keystone.labels_matching(r"^Note: Upload the master's first CRL from the export drive"),
+            f"upload note missing: {keystone.labels()}",
         )
         # The confirmed time was used: the next flow asks for it again (SEC-16).
-        keystone.activate("Back to the start-up checks")
+        keystone.activate("Done")
         keystone.wait_heading("Start-up checks")
+        keystone.wait_label("OK: All 2 drives hold the same history.", timeout=60)
         keystone.activate("Continue")
         keystone.wait_heading("Confirm the date and time")
-    for drive in (primary, backup, export):
-        check(os.listdir(drive) == [], f"{drive} is not empty: {os.listdir(drive)}")
+    for drive in (primary, backup):
+        names = [os.path.relpath(f, drive) for f in files_under(drive)]
+        for expected in ("keystone/keys/master.key", "keystone/certs/master.crt"):
+            check(expected in names, f"{expected} missing on {drive}: {names}")
+        with open(os.path.join(drive, "keystone", "keys", "master.key")) as handle:
+            check(
+                handle.read().startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----"),
+                "the master key is not encrypted PKCS#8",
+            )
+    exported = [os.path.basename(f) for f in files_under(export)]
+    check(
+        len(exported) == 1 and exported[0].endswith("-crl-000001.crl"),
+        f"export drive: {exported}",
+    )
+    assert_no_plaintext_keys()
 
 
 if __name__ == "__main__":

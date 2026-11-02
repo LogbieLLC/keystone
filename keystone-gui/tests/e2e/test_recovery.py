@@ -3,17 +3,28 @@
 The drives hold an interrupted "create master" operation: signed and staged on both
 drives, nothing moved into place. The start-up checks send the operator to the
 recovery screen, which shows one column per drive and one for the YubiKey with
-exactly what each holds, and at most two actions, each with one plain sentence. No
-action formats, deletes or overwrites anything. Choosing the action goes through the
-backend adapter, which is not connected yet in this build, and nothing is written.
+exactly what each holds, and at most two actions, each with one plain sentence. The
+screen's content and sentences come from the operations layer
+(`ops::Ca::recovery_items`, read with the simulated YubiKey connected). No action
+formats, deletes or overwrites anything. "Finish from the primary drive" really runs:
+the staged files are moved into place on both drives, read back, and the start-up
+checks then find no interrupted operation.
 
-# Covers: FR-22 AC4, FR-22 AC8, FR-22 AC3, SEC-22, NFR-04, NFR-08
+# Covers: FR-22 AC4, FR-22 AC8, FR-22 AC3, FR-12 AC2, SEC-22, NFR-04, NFR-08
 """
 
 import os
 import re
 
-from keystone_e2e import Keystone, check, drive_args, make_dirs, prepare, run
+from keystone_e2e import (
+    Keystone,
+    assert_no_plaintext_keys,
+    check,
+    drive_args,
+    make_dirs,
+    prepare,
+    run,
+)
 
 SERIAL = "3e" + "00" * 18 + "01"
 
@@ -125,17 +136,41 @@ def test():
         )
         keystone.tab_to(finish, "push button")
         keystone.press("space")
-        keystone.wait_heading("Not connected yet")
-        keystone.wait_label(
-            "Blocked: Recovering the interrupted operation is not connected yet",
-            exact=False,
-        )
-        check(
-            keystone.labels_matching(r"Nothing was written to any drive or YubiKey\.$"),
-            f"no 'nothing was written' statement: {keystone.labels()}",
-        )
+        keystone.wait_heading("Operation 1 was finished", timeout=60)
+        for role, folder in (("primary", primary), ("backup", backup)):
+            lines = keystone.labels_matching(
+                rf"^OK: {role} drive [0-9a-f]{{8}} \({re.escape(folder)}\): every file was read back and matches its SHA-256\.$"
+            )
+            check(len(lines) == 1, f"{role} drive not verified: {keystone.labels()}")
+        # The start-up checks run again: nothing is interrupted any more.
+        keystone.activate("Done")
+        keystone.wait_heading("Start-up checks")
+        keystone.wait_label("OK: No operation was interrupted.", timeout=60)
     after = (tree_snapshot(primary), tree_snapshot(backup))
-    check(before == after, "the drives changed although nothing was executed")
+    check(before != after, "the drives did not change")
+    for drive in (primary, backup):
+        for placed in (f"certs/{SERIAL}.crt", f"keys/{SERIAL}.key"):
+            check(
+                os.path.isfile(os.path.join(drive, "keystone", placed)),
+                f"{placed} not in place on {drive}",
+            )
+        check(
+            journal_files(drive)[-1].endswith("-completed.json"),
+            f"not completed on {drive}: {journal_files(drive)}",
+        )
+    # Nothing that existed before was overwritten or deleted (FR-22 AC8): the audit log
+    # only grew, staged files were moved into place unchanged, the rest is identical.
+    for snapshot_before, snapshot_after in zip(before, after):
+        now = dict(snapshot_after)
+        contents = set(now.values())
+        for path, data in snapshot_before:
+            if path.endswith(os.path.join("keystone", "audit.log")):
+                check(now.get(path, b"").startswith(data), f"{path} was rewritten")
+            elif f"{os.sep}staging{os.sep}" in path:
+                check(data in contents, f"staged {path} was not moved into place unchanged")
+            else:
+                check(now.get(path) == data, f"{path} was changed or deleted")
+    assert_no_plaintext_keys()
 
 
 if __name__ == "__main__":

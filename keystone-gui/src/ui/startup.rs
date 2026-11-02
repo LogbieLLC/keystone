@@ -10,8 +10,8 @@ use time::OffsetDateTime;
 
 use super::clock::{self, ClockPanel};
 use super::widgets::{self, PageBuilder, StatusLine};
-use super::{App, drives, flows, recovery};
-use crate::vm::drives::DriveMode;
+use super::{App, drives, flows, recovery, replace_drive};
+use crate::vm::drives::{DriveMode, assess_probes, normalize, probe};
 use crate::vm::home::FlowKind;
 use crate::vm::startup::{Gate, StartupView, evaluate, gather};
 use crate::vm::{Line, Status};
@@ -20,13 +20,14 @@ use crate::worker::gtk_glue;
 /// Page id.
 pub const ID: &str = "startup";
 
-/// Runs the start-up checks and shows their result.
+/// Runs the start-up checks and shows their result. The drives are read again first:
+/// what they hold may have changed (a CA created, a drive replaced and a backup
+/// promoted), so the mode and every drive's role are taken from them.
 pub fn show(app: &Rc<App>) {
     let Some(selection) = app.drives() else {
         drives::show(app);
         return;
     };
-    let new_ca = matches!(app.session.borrow().mode, Some(DriveMode::NewCa));
     let page = PageBuilder::new(
         "Start-up checks",
         Some(
@@ -43,10 +44,32 @@ pub fn show(app: &Rc<App>) {
     gtk_glue::run(
         "Checking the drives",
         false,
-        move |_| gather(&selection, new_ca),
+        move |_| {
+            let probes = probe(&selection);
+            let selection = normalize(&selection, &probes);
+            let assessment = assess_probes(&probe(&selection));
+            let data = gather(&selection, assessment.mode == DriveMode::NewCa);
+            (selection, assessment, data)
+        },
         |_| {},
         move |result| match result {
-            Ok(data) => {
+            Ok((_, assessment, _)) if assessment.mode == DriveMode::Unusable => {
+                let mut page = PageBuilder::new(
+                    "Start-up checks",
+                    Some("The chosen drives cannot be used as they are now."),
+                );
+                page.add(&widgets::status_list(&assessment.lines));
+                let choose = page.primary_button("C_hoose other drives");
+                let app_ref = app.clone();
+                choose.connect_clicked(move |_| drives::show(&app_ref));
+                app.reset_to(ID, &page.build());
+            }
+            Ok((selection, assessment, data)) => {
+                {
+                    let mut session = app.session.borrow_mut();
+                    session.drives = Some(selection);
+                    session.mode = Some(assessment.mode);
+                }
                 let view = evaluate(
                     &data,
                     keystone_core::build_info::is_production_build(),
@@ -150,6 +173,18 @@ fn render(app: &Rc<App>, view: &StartupView) {
         Gate::NeedsRepair => {
             let button = render_repair(app, &page, view);
             page.focus_on(&button);
+        }
+        Gate::NeedsDriveReplacement(reason) => {
+            page.add(
+                StatusLine::new(&Line::new(
+                    Status::Blocked,
+                    format!("Every signing action is disabled. {reason}"),
+                ))
+                .widget(),
+            );
+            let replace = page.primary_button("_Replace a lost drive…");
+            let app_ref = app.clone();
+            replace.connect_clicked(move |_| replace_drive::show(&app_ref));
         }
         Gate::Blocked(reason) => {
             page.add(

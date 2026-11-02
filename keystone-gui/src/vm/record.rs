@@ -117,10 +117,10 @@ pub fn permitted_names(cert: &keystone_core::store::CertificateRecord) -> Option
     }
     let mut text = format!("Permitted DNS names: {}", cert.permitted_dns.join(", "));
     if cert.permitted_ip.is_empty() {
-        text.push_str("; IP addresses, email and URIs excluded");
+        text.push_str("; IP addresses excluded; email addresses and URIs: none allowed");
     } else {
         text.push_str(&format!(
-            "; permitted IP ranges: {}; email and URIs excluded",
+            "; permitted IP ranges: {}; email addresses and URIs: none allowed",
             cert.permitted_ip.join(", ")
         ));
     }
@@ -301,7 +301,15 @@ mod tests {
             constrained
                 .details
                 .iter()
-                .any(|d| d == "Permitted DNS names: starnet; IP addresses, email and URIs excluded")
+                .any(|d| d
+                    == "Permitted DNS names: starnet; IP addresses excluded; email addresses and URIs: none allowed")
+        );
+        assert!(
+            !constrained
+                .details
+                .iter()
+                .any(|d| d.contains("email and URIs excluded")),
+            "email and URI names are blocked through a reserved permitted domain (ADR 0001), not excluded"
         );
         assert!(
             constrained

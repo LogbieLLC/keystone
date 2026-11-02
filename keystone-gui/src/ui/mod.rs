@@ -6,10 +6,15 @@
 //!                         │           │        │                  │
 //!                         │           │        └─ correct clock baseline (FR-17 AC3)
 //!                         │           ├─▶ recovery screen (FR-22 AC8) ─▶ action confirmation ─▶ progress ─▶ result
-//!                         │           └─ drive repair (FR-12 AC3), divergent histories side by side
+//!                         │           ├─ drive repair (FR-12 AC3), divergent histories side by side
+//!                         │           └─ one drive only ─▶ Replace a lost drive (ADR 0003) ─▶ review ─▶ progress ─▶ result
 //!                         └─ blocked: broken audit chain, divergent or damaged drives
 //! home ─▶ issuance record (FR-11 AC2), CRL warning banner ─▶ Refresh CRL (FR-13 AC3)
+//! home ─▶ Replace a lost drive (ADR 0003)
 //! ```
+//!
+//! Every execute step runs through `backend::OpsBackend`, the operations layer
+//! (`keystone_core::ops`).
 //! Every flow starts with drive selection and comparison, audit-log verification, the
 //! recovery check and the clock confirmation, and ends with the write-and-verify
 //! result and the SHA-256 fingerprints (PRD section 6, FR-20). A confirmed time is used
@@ -29,6 +34,7 @@ mod home;
 mod passphrase;
 mod record;
 mod recovery;
+mod replace_drive;
 mod startup;
 mod token;
 pub mod widgets;
@@ -41,7 +47,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::backend::{Backend, ClockConfirmation, DriveSelection, NotConnected, SharedToken};
+use crate::backend::{Backend, ClockConfirmation, DriveSelection, OpsBackend, SharedToken};
 use crate::cli::Options;
 use crate::vm::drives::DriveMode;
 use crate::vm::startup::{StartupData, StartupView};
@@ -223,7 +229,7 @@ pub fn run(options: Options) -> ExitCode {
             toasts,
             title,
             pages: RefCell::new(Vec::new()),
-            backend: Arc::new(NotConnected),
+            backend: Arc::new(OpsBackend::new(&options)),
             session: RefCell::new(Session::default()),
             options,
         });

@@ -9,15 +9,22 @@
 //! - The export drive is required up front, because every flow writes to it (the first
 //!   CRL in Flows A and B, FR-13 AC6).
 //! - No folder may be the same as, or inside, another chosen folder.
-//! - A drive recorded as a backup cannot be used as the primary, and the other way
-//!   round: the roles recorded on the drives must match the operator's choice.
-//! - Mixing empty drives with CA drives is refused; adding a new backup drive to an
-//!   existing CA is not part of version 1's screens.
+//! - A drive's role is the one it has now (`CaDrive::role`): its `drive.json` role, or
+//!   primary after an audited promotion by "Replace a lost drive" (ADR 0003). A drive
+//!   chosen in the other role is refused.
+//! - A new CA needs the primary and at least one backup. An existing CA opens with a
+//!   single drive too, but then only "Replace a lost drive" can write (ADR 0003); the
+//!   start-up checks say so and keep every signing action disabled.
+//! - Drives left behind by an interrupted CA setup (`store::unfinished_setup`) are not
+//!   damaged: "Create new CA" finishes setting them up (Flow A's
+//!   `DriveSetup::FinishInterruptedSetup`), adding only what is missing.
+//! - Mixing empty drives with CA drives is refused; a new drive is added to an existing
+//!   CA only through "Replace a lost drive".
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 
-use keystone_core::store::{CaId, DriveClass, DriveRole};
+use keystone_core::store::{CaId, DriveClass, DriveRole, DriveSet, UnfinishedSetup};
 
 use super::{Line, Status};
 use crate::backend::DriveSelection;
@@ -49,17 +56,23 @@ fn folder(label: &str, text: &str, problems: &mut Vec<String>) -> Option<PathBuf
     Some(path)
 }
 
-/// Validates the form (not the drives' contents). Every problem is listed.
+/// Validates the form (not the drives' contents). Every problem is listed. One CA
+/// drive is accepted (the other may be lost, ADR 0003); with none, both the primary
+/// and a backup are asked for.
 pub fn validate_form(form: &DriveForm) -> Result<DriveSelection, Vec<String>> {
     let mut problems = Vec::new();
-    let primary = folder("primary drive", &form.primary, &mut problems);
     let filled: Vec<&String> = form
         .backups
         .iter()
         .filter(|b| !b.trim().is_empty())
         .collect();
+    let primary = if form.primary.trim().is_empty() && !filled.is_empty() {
+        None
+    } else {
+        folder("primary drive", &form.primary, &mut problems)
+    };
     let mut backups = Vec::new();
-    if filled.is_empty() {
+    if filled.is_empty() && form.primary.trim().is_empty() {
         problems.push(
             "Choose at least one backup drive: every change is written to the primary and at least one backup."
                 .to_string(),
@@ -91,8 +104,8 @@ pub fn validate_form(form: &DriveForm) -> Result<DriveSelection, Vec<String>> {
             }
         }
     }
-    match (primary, export) {
-        (Some(primary), Some(export)) if problems.is_empty() => Ok(DriveSelection {
+    match export {
+        Some(export) if problems.is_empty() => Ok(DriveSelection {
             primary,
             backups,
             export,
@@ -119,6 +132,21 @@ pub struct DriveProbe {
     pub role: ChosenRole,
     /// The classification, or why the folder could not be read.
     pub class: Result<DriveClass, String>,
+    /// The drive's role now (`CaDrive::role`, which follows an audited promotion),
+    /// when the chosen CA drives could be opened together; `None` otherwise (then the
+    /// role in `drive.json` is used).
+    pub effective_role: Option<DriveRole>,
+}
+
+/// Everything read about the chosen drives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveProbes {
+    /// The CA drives, primary first.
+    pub ca: Vec<DriveProbe>,
+    /// The export drive.
+    pub export: DriveProbe,
+    /// An interrupted CA setup these drives hold, if any.
+    pub unfinished: Option<UnfinishedSetup>,
 }
 
 /// What can be done with the chosen drives.
@@ -126,7 +154,8 @@ pub struct DriveProbe {
 pub enum DriveMode {
     /// Every CA drive is empty: a new CA can be created (Flow A).
     NewCa,
-    /// Every CA drive belongs to this CA: open it (FR-19).
+    /// Every CA drive belongs to this CA: open it (FR-19). With a single drive only
+    /// "Replace a lost drive" can write.
     ExistingCa(CaId),
     /// The drives cannot be used; the lines say why.
     Unusable,
@@ -155,6 +184,96 @@ fn role_name(role: ChosenRole) -> &'static str {
     }
 }
 
+/// Turns everything read about the drives into a [`DriveAssessment`].
+pub fn assess_probes(probes: &DriveProbes) -> DriveAssessment {
+    match &probes.unfinished {
+        Some(setup) => assess_unfinished(&probes.ca, &probes.export, setup),
+        None => assess(&probes.ca, &probes.export),
+    }
+}
+
+/// Drives an interrupted CA setup left behind: Flow A finishes setting them up.
+fn assess_unfinished(
+    ca: &[DriveProbe],
+    export: &DriveProbe,
+    setup: &UnfinishedSetup,
+) -> DriveAssessment {
+    let mut lines: Vec<Line> = ca
+        .iter()
+        .map(|probe| {
+            let name = format!("{} {}", role_name(probe.role), probe.path.display());
+            Line::new(
+                Status::Info,
+                match &probe.class {
+                    Ok(DriveClass::Empty) => format!("{name} is empty."),
+                    _ => format!("{name} holds the start of an interrupted CA setup."),
+                },
+            )
+        })
+        .collect();
+    let export_ok = export_line(export, &mut lines);
+    let primary_and_backup = ca.iter().any(|p| p.role == ChosenRole::Primary)
+        && ca.iter().any(|p| p.role == ChosenRole::Backup);
+    if !primary_and_backup {
+        lines.push(Line::new(
+            Status::Blocked,
+            "Choose the primary drive and at least one backup drive to finish setting up the new CA.",
+        ));
+    }
+    let mode = if export_ok && primary_and_backup {
+        lines.push(Line::new(
+            Status::Info,
+            format!(
+                "An earlier setup of these drives{} was interrupted before any CA was created. Create new CA finishes setting them up: what is missing is added; nothing on them is overwritten or deleted.",
+                setup
+                    .ca_id
+                    .map(|id| format!(" (CA {})", id.short()))
+                    .unwrap_or_default()
+            ),
+        ));
+        DriveMode::NewCa
+    } else {
+        DriveMode::Unusable
+    };
+    DriveAssessment { mode, lines }
+}
+
+/// The export drive's line; false when it cannot be used.
+fn export_line(export: &DriveProbe, lines: &mut Vec<Line>) -> bool {
+    match &export.class {
+        Err(reason) => {
+            lines.push(Line::new(
+                Status::Blocked,
+                format!(
+                    "Export drive {} cannot be read: {reason}",
+                    export.path.display()
+                ),
+            ));
+            false
+        }
+        Ok(DriveClass::KeystoneCa(_) | DriveClass::DamagedKeystone(_)) => {
+            lines.push(Line::new(
+                Status::Blocked,
+                format!(
+                    "Export drive {} is a CA drive. CA drives are never carried to issuing systems; use a separate export drive.",
+                    export.path.display()
+                ),
+            ));
+            false
+        }
+        Ok(_) => {
+            lines.push(Line::new(
+                Status::Ok,
+                format!(
+                    "Export drive {} can be used for files carried to issuing systems.",
+                    export.path.display()
+                ),
+            ));
+            true
+        }
+    }
+}
+
 /// Turns the probes of the CA drives and the export drive into a [`DriveAssessment`].
 pub fn assess(ca: &[DriveProbe], export: &DriveProbe) -> DriveAssessment {
     let mut lines = Vec::new();
@@ -176,7 +295,7 @@ pub fn assess(ca: &[DriveProbe], export: &DriveProbe) -> DriveAssessment {
                 lines.push(Line::new(Status::Info, format!("{name} is empty.")));
             }
             Ok(DriveClass::KeystoneCa(identity)) => {
-                let recorded = match identity.role {
+                let recorded = match probe.effective_role.unwrap_or(identity.role) {
                     DriveRole::Primary => ChosenRole::Primary,
                     DriveRole::Backup => ChosenRole::Backup,
                 };
@@ -232,43 +351,26 @@ pub fn assess(ca: &[DriveProbe], export: &DriveProbe) -> DriveAssessment {
             }
         }
     }
-    match &export.class {
-        Err(reason) => {
-            lines.push(Line::new(
-                Status::Blocked,
-                format!(
-                    "Export drive {} cannot be read: {reason}",
-                    export.path.display()
-                ),
-            ));
-            problems.push(());
-        }
-        Ok(DriveClass::KeystoneCa(_) | DriveClass::DamagedKeystone(_)) => {
-            lines.push(Line::new(
-                Status::Blocked,
-                format!(
-                    "Export drive {} is a CA drive. CA drives are never carried to issuing systems; use a separate export drive.",
-                    export.path.display()
-                ),
-            ));
-            problems.push(());
-        }
-        Ok(_) => lines.push(Line::new(
-            Status::Ok,
-            format!(
-                "Export drive {} can be used for files carried to issuing systems.",
-                export.path.display()
-            ),
-        )),
+    if !export_line(export, &mut lines) {
+        problems.push(());
     }
+    let primary_and_backup = ca.iter().any(|p| p.role == ChosenRole::Primary)
+        && ca.iter().any(|p| p.role == ChosenRole::Backup);
     let mut mode = DriveMode::Unusable;
     if problems.is_empty() {
         if empty == ca.len() && !ca.is_empty() {
-            mode = DriveMode::NewCa;
-            lines.push(Line::new(
-                Status::Info,
-                "All CA drives are empty: you can create a new CA.",
-            ));
+            if primary_and_backup {
+                mode = DriveMode::NewCa;
+                lines.push(Line::new(
+                    Status::Info,
+                    "All CA drives are empty: you can create a new CA.",
+                ));
+            } else {
+                lines.push(Line::new(
+                    Status::Blocked,
+                    "A new CA needs the primary drive and at least one backup drive: choose both.",
+                ));
+            }
         } else if ca_ids.len() == ca.len() && !ca.is_empty() {
             if ca_ids.iter().all(|id| *id == ca_ids[0]) {
                 mode = DriveMode::ExistingCa(ca_ids[0]);
@@ -279,6 +381,12 @@ pub fn assess(ca: &[DriveProbe], export: &DriveProbe) -> DriveAssessment {
                         ca_ids[0].short()
                     ),
                 ));
+                if !primary_and_backup {
+                    lines.push(Line::new(
+                        Status::Warning,
+                        "Only one CA drive is chosen. Keystone opens the CA so that you can replace the lost drive; every signing action stays disabled until the primary and at least one backup are connected.",
+                    ));
+                }
             } else {
                 lines.push(Line::new(
                     Status::Blocked,
@@ -295,14 +403,47 @@ pub fn assess(ca: &[DriveProbe], export: &DriveProbe) -> DriveAssessment {
     DriveAssessment { mode, lines }
 }
 
-/// Classifies every chosen drive (reads the drives; run it off the GUI thread).
-pub fn probe(selection: &DriveSelection) -> (Vec<DriveProbe>, DriveProbe) {
+/// The selection with each CA drive in the role it has now: after "Replace a lost
+/// drive" promoted a backup, that drive becomes the primary. Unchanged when any role
+/// is unknown or more than one drive is the primary.
+pub fn normalize(selection: &DriveSelection, probes: &DriveProbes) -> DriveSelection {
+    if probes.ca.is_empty() || probes.ca.iter().any(|p| p.effective_role.is_none()) {
+        return selection.clone();
+    }
+    let with_role = |role: DriveRole| -> Vec<PathBuf> {
+        probes
+            .ca
+            .iter()
+            .filter(|p| p.effective_role == Some(role))
+            .map(|p| p.path.clone())
+            .collect()
+    };
+    let primaries = with_role(DriveRole::Primary);
+    if primaries.len() > 1 {
+        return selection.clone();
+    }
+    DriveSelection {
+        primary: primaries.into_iter().next(),
+        backups: with_role(DriveRole::Backup),
+        export: selection.export.clone(),
+    }
+}
+
+/// Classifies every chosen drive (reads the drives; run it off the GUI thread). When
+/// every CA drive holds a CA, they are opened together to read each drive's role now
+/// (a backup promoted by "Replace a lost drive" is the primary).
+pub fn probe(selection: &DriveSelection) -> DriveProbes {
     let classify = |path: &Path, role| DriveProbe {
         path: path.to_path_buf(),
         role,
         class: keystone_core::store::classify_drive(path).map_err(|e| e.to_string()),
+        effective_role: None,
     };
-    let mut ca = vec![classify(&selection.primary, ChosenRole::Primary)];
+    let mut ca: Vec<DriveProbe> = selection
+        .primary
+        .iter()
+        .map(|p| classify(p, ChosenRole::Primary))
+        .collect();
     ca.extend(
         selection
             .backups
@@ -310,7 +451,33 @@ pub fn probe(selection: &DriveSelection) -> (Vec<DriveProbe>, DriveProbe) {
             .map(|b| classify(b, ChosenRole::Backup)),
     );
     let export = classify(&selection.export, ChosenRole::Backup);
-    (ca, export)
+    if ca
+        .iter()
+        .all(|probe| matches!(probe.class, Ok(DriveClass::KeystoneCa(_))))
+        && let Ok(set) = DriveSet::open(&selection.ca_drives())
+    {
+        for probe in &mut ca {
+            probe.effective_role = set
+                .drives()
+                .iter()
+                .find(|drive| drive.root() == probe.path)
+                .map(|drive| drive.role());
+        }
+    }
+    let unfinished = match (&selection.primary, ca.is_empty()) {
+        (Some(primary), false) => {
+            let backups: Vec<&Path> = selection.backups.iter().map(PathBuf::as_path).collect();
+            keystone_core::store::unfinished_setup(primary, &backups)
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+    DriveProbes {
+        ca,
+        export,
+        unfinished,
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +511,7 @@ mod tests {
             path: PathBuf::from(path),
             role,
             class: Ok(class),
+            effective_role: None,
         }
     }
 
@@ -356,6 +524,39 @@ mod tests {
         assert!(problems.iter().any(|p| p.contains("export drive")));
         let selection = validate_form(&form("/m/a", &["/m/b", " "], "/m/e")).expect("valid");
         assert_eq!(selection.backups, vec![PathBuf::from("/m/b")]);
+        assert_eq!(selection.primary, Some(PathBuf::from("/m/a")));
+    }
+
+    #[test]
+    fn adr0003_one_ca_drive_opens_the_ca_for_replacing_the_lost_drive() {
+        // Covers: SEC-11 (ADR 0003), FR-12 AC1
+        let lost_primary = validate_form(&form("", &["/m/b"], "/m/e")).expect("valid");
+        assert_eq!(lost_primary.primary, None);
+        assert_eq!(lost_primary.ca_drives(), vec![Path::new("/m/b")]);
+        let lost_backup = validate_form(&form("/m/a", &[""], "/m/e")).expect("valid");
+        assert!(lost_backup.backups.is_empty());
+        let id = CaId::random().expect("id");
+        let single = [probe_of(
+            "/m/b",
+            ChosenRole::Backup,
+            DriveClass::KeystoneCa(identity(id, DriveRole::Backup)),
+        )];
+        let export = probe_of("/m/e", ChosenRole::Backup, DriveClass::Empty);
+        let result = assess(&single, &export);
+        assert_eq!(result.mode, DriveMode::ExistingCa(id));
+        assert!(result.lines.iter().any(|l| l.status == Status::Warning
+            && l.text.contains("replace the lost drive")
+            && l.text.contains("signing action stays disabled")));
+        // A new CA still needs both drives (FR-12 AC1).
+        let empty = [probe_of("/m/a", ChosenRole::Primary, DriveClass::Empty)];
+        let result = assess(&empty, &export);
+        assert_eq!(result.mode, DriveMode::Unusable);
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.text.contains("primary drive and at least one backup"))
+        );
     }
 
     #[test]
@@ -491,19 +692,128 @@ mod tests {
             std::fs::create_dir(path).expect("mkdir");
         }
         let selection = DriveSelection {
-            primary: a,
+            primary: Some(a),
             backups: vec![b],
             export: e,
         };
-        let (ca, export) = probe(&selection);
-        assert_eq!(assess(&ca, &export).mode, DriveMode::NewCa);
+        let probes = probe(&selection);
+        assert_eq!(assess(&probes.ca, &probes.export).mode, DriveMode::NewCa);
+        assert_eq!(assess_probes(&probes).mode, DriveMode::NewCa);
         let missing = DriveSelection {
-            primary: dir.path().join("missing"),
+            primary: Some(dir.path().join("missing")),
             ..selection
         };
-        let (ca, export) = probe(&missing);
-        let result = assess(&ca, &export);
+        let probes = probe(&missing);
+        let result = assess(&probes.ca, &probes.export);
         assert_eq!(result.mode, DriveMode::Unusable);
         assert!(result.lines[0].text.contains("cannot be read"));
+    }
+
+    fn folders(dir: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| {
+                let path = dir.join(name);
+                std::fs::create_dir(&path).expect("mkdir");
+                path
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interrupted_ca_setup_is_finished_by_flow_a_not_called_damaged() {
+        // Covers: SEC-20, FR-22 AC4 (review finding 11: an interrupted drive setup)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = folders(dir.path(), &["a", "b", "e"]);
+        // An interrupted DriveSet::create: the primary got its empty layout only.
+        let keystone = roots[0].join("keystone");
+        std::fs::create_dir(&keystone).expect("mkdir");
+        for folder in ["journal", "record", "certs", "keys", "crls", "staging"] {
+            std::fs::create_dir(keystone.join(folder)).expect("mkdir");
+        }
+        let selection = DriveSelection {
+            primary: Some(roots[0].clone()),
+            backups: vec![roots[1].clone()],
+            export: roots[2].clone(),
+        };
+        let probes = probe(&selection);
+        assert!(probes.unfinished.is_some(), "{probes:?}");
+        let result = assess_probes(&probes);
+        assert_eq!(result.mode, DriveMode::NewCa, "{:?}", result.lines);
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.text.contains("interrupted CA setup"))
+        );
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.text.contains("Create new CA finishes setting them up"))
+        );
+        assert!(!result.lines.iter().any(|l| l.text.contains("damaged")));
+    }
+
+    #[test]
+    fn adr0003_a_promoted_backup_is_used_as_the_primary() {
+        // Covers: SEC-11 (ADR 0003), FR-19 AC1
+        use keystone_core::clock::{assess as assess_clock, confirm};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = folders(dir.path(), &["a", "b", "new", "e"]);
+        let created = keystone_core::model::Timestamp::utc(
+            keystone_core::build_info::build_date() + time::Duration::hours(1),
+        );
+        DriveSet::create(&roots[0], &[roots[1].as_path()], created).expect("create");
+        // The primary is lost: the backup and a new drive replace it.
+        let ca = keystone_core::ops::Ca::open(&[roots[1].as_path()]).expect("open");
+        let now = keystone_core::build_info::build_date() + time::Duration::days(1);
+        let time = confirm(
+            &assess_clock(now, None, keystone_core::build_info::build_date()),
+            false,
+        )
+        .expect("time");
+        let plan = ca.plan_replace_drive(&roots[2], time).expect("plan");
+        assert!(plan.promotes().is_some());
+        plan.execute(&ca, &keystone_core::ops::NoProgress)
+            .expect("replace");
+        // drive.json of b still says backup; its role now is primary.
+        let selection = DriveSelection {
+            primary: Some(roots[1].clone()),
+            backups: vec![roots[2].clone()],
+            export: roots[3].clone(),
+        };
+        let probes = probe(&selection);
+        assert_eq!(probes.ca[0].effective_role, Some(DriveRole::Primary));
+        let result = assess_probes(&probes);
+        assert!(
+            matches!(result.mode, DriveMode::ExistingCa(_)),
+            "{:?}",
+            result.lines
+        );
+        // After the replacement the new drive was added as a backup: the promoted
+        // drive is moved to the primary role.
+        let after = DriveSelection {
+            primary: None,
+            backups: vec![roots[1].clone(), roots[2].clone()],
+            export: roots[3].clone(),
+        };
+        let normalized = normalize(&after, &probe(&after));
+        assert_eq!(normalized.primary, Some(roots[1].clone()));
+        assert_eq!(normalized.backups, vec![roots[2].clone()]);
+        // Chosen as a backup, the promoted drive is refused.
+        let swapped = DriveSelection {
+            primary: Some(roots[2].clone()),
+            backups: vec![roots[1].clone()],
+            export: roots[3].clone(),
+        };
+        let result = assess_probes(&probe(&swapped));
+        assert_eq!(result.mode, DriveMode::Unusable);
+        assert!(
+            result
+                .lines
+                .iter()
+                .any(|l| l.text.contains("recorded as a primary drive"))
+        );
     }
 }

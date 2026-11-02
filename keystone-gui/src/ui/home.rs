@@ -9,7 +9,7 @@ use keystone_core::store::IssuanceRecord;
 use time::OffsetDateTime;
 
 use super::widgets::{self, PageBuilder, StatusLine};
-use super::{App, drives, flows, record, startup};
+use super::{App, drives, flows, record, replace_drive, startup};
 use crate::vm::drives::DriveMode;
 use crate::vm::home::{CaState, FlowKind, availability};
 use crate::vm::{Line, Status, format_utc};
@@ -100,6 +100,17 @@ pub fn show(app: &Rc<App>) {
     ));
     let app_ref = app.clone();
     open_record.connect_clicked(move |_| record::show(&app_ref));
+    page.add(&frame);
+    let (frame, inner) = widgets::group("Drives");
+    let replace = gtk::Button::with_label("Replace a lost drive");
+    replace.set_halign(gtk::Align::Start);
+    replace.set_sensitive(!new_ca);
+    inner.append(&replace);
+    inner.append(&widgets::paragraph(
+        "Copy the complete CA to a new, empty drive when a CA drive is lost or broken. Nothing is signed.",
+    ));
+    let app_ref = app.clone();
+    replace.connect_clicked(move |_| replace_drive::show(&app_ref));
     page.add(&frame);
     let choose = page.secondary_button("C_hoose other drives");
     let app_ref = app.clone();

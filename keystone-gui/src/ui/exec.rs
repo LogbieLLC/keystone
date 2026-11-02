@@ -25,6 +25,20 @@ pub fn execute<F>(app: &Rc<App>, title: &str, cancellable: bool, call: F)
 where
     F: FnOnce(&dyn Backend, ExecContext) -> Result<FlowOutcome, BackendError> + Send + 'static,
 {
+    execute_then(app, title, cancellable, call, |_| {});
+}
+
+/// [`execute`], then `after` on the GUI thread when the step succeeded, before the
+/// result is shown.
+pub fn execute_then<F>(
+    app: &Rc<App>,
+    title: &str,
+    cancellable: bool,
+    call: F,
+    after: impl FnOnce(&Rc<App>) + 'static,
+) where
+    F: FnOnce(&dyn Backend, ExecContext) -> Result<FlowOutcome, BackendError> + Send + 'static,
+{
     let (drives, clock, token) = {
         let mut session = app.session.borrow_mut();
         (
@@ -116,7 +130,10 @@ where
         },
         update,
         move |result: Result<Result<FlowOutcome, BackendError>, WorkerFailure>| match result {
-            Ok(Ok(outcome)) => show_result(&app_done, &outcome),
+            Ok(Ok(outcome)) => {
+                after(&app_done);
+                show_result(&app_done, &outcome);
+            }
             Ok(Err(error)) => show_error(&app_done, &title_done, &error),
             Err(failure) => show_error(
                 &app_done,
