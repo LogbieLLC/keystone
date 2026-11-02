@@ -280,7 +280,7 @@ impl Dir {
         if mode == WriteMode::CreateOnly && self.kind(name)?.is_some() {
             return Err(StoreError::AlreadyExists { path });
         }
-        #[cfg(test)]
+        #[cfg(any(test, not(feature = "production")))]
         super::fault::check(&path)?;
         let temp = temp_name(name)?;
         let fd = rfs::openat2(
@@ -308,7 +308,7 @@ impl Dir {
         target_name: &str,
     ) -> Result<(), StoreError> {
         let to = target.child(target_name);
-        #[cfg(test)]
+        #[cfg(any(test, not(feature = "production")))]
         super::fault::check(&to)?;
         match rfs::renameat_with(
             &self.fd,
@@ -328,7 +328,7 @@ impl Dir {
     /// Deletes a regular file. Used only to discard a cancelled operation's staged files
     /// (FR-16); recovery and repair never delete.
     pub(crate) fn remove_file(&self, name: &str) -> Result<(), StoreError> {
-        #[cfg(test)]
+        #[cfg(any(test, not(feature = "production")))]
         super::fault::check(&self.child(name))?;
         rfs::unlinkat(&self.fd, name, AtFlags::empty())
             .map_err(|e| io_err("delete", &self.child(name), e))?;

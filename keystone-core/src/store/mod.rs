@@ -71,7 +71,7 @@ pub mod audit;
 pub mod binhash;
 pub mod compare;
 mod drive;
-#[cfg(test)]
+#[cfg(any(test, not(feature = "production")))]
 pub(crate) mod fault;
 mod fsio;
 mod ids;

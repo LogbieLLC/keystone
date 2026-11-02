@@ -1,7 +1,10 @@
 //! Test-only fault injection (FR-22 AC6 style): makes the N-th file-system change on this
 //! thread fail, to interrupt an operation, a repair or a recovery at every step.
 //!
-//! Compiled only for unit tests (`cfg(test)`); production code never contains it.
+//! Compiled for unit tests and for development builds, never with the `production`
+//! feature, so a production binary never contains it. Integration tests reach it only
+//! through `crate::ops::testing` (FR-22 AC6: interrupting an operation between drive
+//! writes). It is inert until a test arms it.
 #![forbid(unsafe_code)]
 
 use std::cell::Cell;
