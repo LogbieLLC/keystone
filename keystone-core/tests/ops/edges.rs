@@ -386,3 +386,34 @@ fn yubikey_recovery_actions_need_the_yubikey_and_damaged_state_blocks_signing() 
         assert!(!blocker.message().is_empty());
     }
 }
+
+#[test]
+fn a_journaled_certificate_that_no_longer_reads_blocks_every_signing() {
+    // Covers: FR-19 AC1, SEC-08
+    let mut test = new_ca("X5");
+    for drive in test.drives.ca_drives() {
+        let path = drive.join("keystone/journal/op-000001/002-signed.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("MII"));
+        std::fs::write(&path, text.replacen("MII", "MIJ", 1)).unwrap();
+    }
+    test.reopen();
+    test.now += time::Duration::minutes(1);
+    let report = test.ca.startup_report(test.now).unwrap();
+    assert!(
+        report
+            .blockers
+            .iter()
+            .any(|b| matches!(b, Blocker::StateUnreadable(_))),
+        "{:?}",
+        report.blockers
+    );
+    let time = confirmed(&test.ca, test.now);
+    let (mut token, _) = crate::support::token(90_000_041);
+    let request = MainIntermediateRequest::new(test_name("X5 Main"), Some(master_crl()));
+    let error = test
+        .ca
+        .plan_yubikey_setup(&mut token, &request, time)
+        .unwrap_err();
+    assert!(matches!(error, OpsError::Damaged(_)), "{error}");
+}

@@ -659,3 +659,80 @@ pub(crate) fn crl_warnings(state: &CaState, now: OffsetDateTime) -> Vec<CrlWarni
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{DriveHistory, RepairPlan};
+
+    #[test]
+    fn every_blocker_has_one_plain_sentence() {
+        // Covers: FR-12 AC3, FR-14 AC3, FR-17 AC2, FR-22 AC4
+        let now = crate::build_info::build_date();
+        let time = Timestamp::utc(now);
+        let blockers = [
+            Blocker::NotEnoughDrives {
+                primaries: 1,
+                backups: 0,
+            },
+            Blocker::DrivesBehind {
+                plans: vec![RepairPlan {
+                    source: 0,
+                    target: 1,
+                    source_label: "primary".into(),
+                    target_label: "backup".into(),
+                    steps: Vec::new(),
+                }],
+            },
+            Blocker::DrivesDiverged {
+                common: 3,
+                histories: vec![
+                    DriveHistory {
+                        drives: vec!["a".into()],
+                        entries: Vec::new(),
+                    },
+                    DriveHistory {
+                        drives: vec!["b".into()],
+                        entries: Vec::new(),
+                    },
+                ],
+            },
+            Blocker::DrivesDamaged {
+                problems: vec!["x is missing".into()],
+            },
+            Blocker::AuditLogBroken {
+                drive: "backup".into(),
+                entry: 4,
+                problem: "changed".into(),
+            },
+            Blocker::PendingOperation {
+                operation: OperationId(2),
+                kind: OperationKind::Revoke,
+                subject: "CN=KEYSTONE TEST".into(),
+            },
+            Blocker::ClockBlocked(vec![ClockProblem::EarlierThanBuildDate {
+                now,
+                build_date: now,
+            }]),
+            Blocker::ClockConfirmationStale {
+                confirmed: time,
+                baseline: time,
+            },
+            Blocker::StateUnreadable("unreadable".into()),
+        ];
+        let expected = [
+            "connect the primary drive",
+            "1 drive(s) are behind",
+            "2 different histories after entry 3",
+            "x is missing",
+            "broken at entry 4",
+            "operation 2",
+            "build date",
+            "confirm the date and time again",
+            "unreadable",
+        ];
+        for (blocker, text) in blockers.iter().zip(expected) {
+            assert!(blocker.message().contains(text), "{}", blocker.message());
+        }
+    }
+}
