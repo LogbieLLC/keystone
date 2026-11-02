@@ -9,7 +9,7 @@ use keystone_testkit::hierarchy::{HierarchyOptions, TestHierarchy};
 use keystone_testkit::keys;
 use keystone_testkit::x509::{TestLeafNames, issue_test_leaf, issue_test_leaf_with_names};
 
-use crate::support::{Workspace, go_verify, openssl, text};
+use crate::support::{Workspace, go_verify, openssl_cli, text};
 
 /// Permitted DNS name `starnet`, no IP range (all IPs excluded).
 fn dns_only() -> &'static TestHierarchy {
@@ -48,7 +48,7 @@ fn verify_both(h: &TestHierarchy, leaf: &[u8]) -> Verdicts {
     let roots = workspace.write("master.crt", &h.master.pem);
     let intermediates = workspace.write_certs("intermediates.pem", &[&h.sub.der, &h.main.der]);
     let leaf_path = workspace.write_certs("leaf.crt", &[leaf]);
-    let output = openssl(
+    let output = openssl_cli(
         workspace.path(),
         &[
             "verify",

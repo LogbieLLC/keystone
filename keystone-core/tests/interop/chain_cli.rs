@@ -4,7 +4,7 @@
 use keystone_core::cert::chain_pem;
 use keystone_testkit::hierarchy::{HierarchyOptions, TestHierarchy};
 
-use crate::support::{Workspace, openssl, text};
+use crate::support::{Workspace, openssl_cli, text};
 
 #[test]
 fn fr09_ac2_openssl_verify_sub_against_master_with_main_untrusted() {
@@ -22,7 +22,7 @@ fn fr09_ac2_openssl_verify_sub_against_master_with_main_untrusted() {
         chain_pem(&h.sub.der, &h.main.der, &h.master.der).unwrap(),
     );
 
-    let output = openssl(
+    let output = openssl_cli(
         workspace.path(),
         &[
             "verify",
@@ -74,7 +74,7 @@ fn fr09_ac2_openssl_verify_sub_against_master_with_main_untrusted() {
             "master.crt",
         ][..],
     ] {
-        let output = openssl(workspace.path(), args);
+        let output = openssl_cli(workspace.path(), args);
         assert!(output.status.success(), "{args:?}: {}", text(&output));
         assert!(
             String::from_utf8_lossy(&output.stdout)
@@ -84,7 +84,7 @@ fn fr09_ac2_openssl_verify_sub_against_master_with_main_untrusted() {
     }
 
     // Without the main intermediate the sub-intermediate cannot be verified.
-    let output = openssl(
+    let output = openssl_cli(
         workspace.path(),
         &["verify", "-CAfile", "master.crt", "sub.crt"],
     );

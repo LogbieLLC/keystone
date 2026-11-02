@@ -8,7 +8,7 @@ use keystone_core::crypto::pkcs8::{
 use keystone_core::crypto::secret::SecretString;
 use keystone_testkit::keys;
 
-use crate::support::{Workspace, openssl, text};
+use crate::support::{Workspace, openssl_cli, text};
 
 const PASSPHRASE: &str = "KEYSTONE TEST abacus bamboo cactus dolphin eagle falcon garden harbor";
 
@@ -29,7 +29,7 @@ fn primitives(asn1parse: &str) -> Vec<(String, String)> {
 }
 
 fn asn1parse(workspace: &Workspace, file: &str) -> Vec<(String, String)> {
-    let output = openssl(workspace.path(), &["asn1parse", "-in", file]);
+    let output = openssl_cli(workspace.path(), &["asn1parse", "-in", file]);
     assert!(output.status.success(), "{}", text(&output));
     primitives(&String::from_utf8_lossy(&output.stdout))
 }
@@ -43,7 +43,7 @@ fn check_pkey_decrypts(workspace: &Workspace, key_pem: &str, expected_spki: &[u8
     workspace.write("key.pem", key_pem);
     workspace.write("pass.txt", format!("{PASSPHRASE}\n"));
     // Only the public key is printed, so no plaintext key reaches any output.
-    let output = openssl(
+    let output = openssl_cli(
         workspace.path(),
         &[
             "pkey",
@@ -63,7 +63,7 @@ fn check_pkey_decrypts(workspace: &Workspace, key_pem: &str, expected_spki: &[u8
     assert_eq!(public, expected_spki);
     assert!(!contains_plaintext_private_key(&output.stdout));
     workspace.write("wrong.txt", "KEYSTONE TEST wrong words\n");
-    let wrong = openssl(
+    let wrong = openssl_cli(
         workspace.path(),
         &[
             "pkey",

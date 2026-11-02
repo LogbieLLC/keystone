@@ -14,7 +14,7 @@ use keystone_testkit::keys;
 use keystone_testkit::x509::{issue_test_leaf, issue_test_leaf_crl};
 use time::{Duration, OffsetDateTime};
 
-use crate::support::{Workspace, openssl, text};
+use crate::support::{Workspace, openssl_cli, text};
 
 /// Every "error N at D depth lookup" line of `openssl verify`.
 fn verify_errors(output: &str) -> Vec<(u32, u32)> {
@@ -46,7 +46,7 @@ impl Files {
     }
 
     fn verify(&self) -> (bool, String) {
-        let output = openssl(
+        let output = openssl_cli(
             self.workspace.path(),
             &[
                 "verify",
