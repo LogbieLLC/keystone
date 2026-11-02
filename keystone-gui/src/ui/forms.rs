@@ -294,7 +294,7 @@ impl ConstraintsForm {
     /// Adds the choice to `container`.
     pub fn new(container: &gtk::Box) -> Rc<ConstraintsForm> {
         container.append(&widgets::paragraph(
-            "Name constraints limit the names this sub-intermediate may issue for. Enter one or more DNS names: for example starnet covers starnet and every name under it. IP addresses, email addresses and URIs are excluded unless you enter IP ranges.",
+            "Name constraints limit the names this sub-intermediate may issue for. Enter one or more DNS names: for example starnet covers starnet and every name under it. IP addresses are excluded unless you enter IP ranges. Email addresses and URIs: none allowed.",
         ));
         let on = gtk::CheckButton::with_label("Restrict to these names (recommended)");
         let off = gtk::CheckButton::with_label("No name constraints (not recommended)");

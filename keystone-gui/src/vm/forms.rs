@@ -281,6 +281,17 @@ mod tests {
         let lines = name_constraints_lines(&choice);
         assert!(lines.contains(&"permitted DNS: starnet".to_string()));
         assert!(lines.contains(&"permitted IP: 10.0.0.0/8".to_string()));
+        // ADR 0001: email and URI names are blocked through the reserved domain.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("email addresses: none allowed")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("URIs: none allowed")),
+            "{lines:?}"
+        );
         assert_eq!(
             name_constraints(&ConstraintsChoice::Off),
             Ok(NameConstraintsChoice::ExplicitlyUnconstrained)
