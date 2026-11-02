@@ -1,0 +1,306 @@
+# Keystone CI (GOVERNANCE.md setup checklist #8; TESTING.md TEST-05, TEST-06).
+#
+# Security rules for this file (SECURITY.md SECP-09): default read-only permissions,
+# every third-party action pinned to a full commit SHA, no secrets, no
+# pull_request_target. Changing this file is ask-first for agents (AGENTS.md, AGENT-02).
+#
+# Every Rust job runs in a clean Ubuntu 26.04 container pinned by digest, using the
+# distribution's GTK4, libadwaita and OpenSSL 3 packages (PRD NFR-01).
+#
+# Required checks for the dev/main rulesets (TEST-06): fmt, clippy, test, gui-e2e,
+# coverage, audit, deny, vet, boundaries, plaintext-key-scan, rfc5280-lint,
+# fuzz-short (4 targets), codeql, traceability, reproducible-build.
+# NOT required: blocked-tests (TEST-10 report job; it fails while StarnetAuth
+# dependencies are missing, by design).
+
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+  schedule:
+    # Nightly long fuzz run (TEST-05).
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - run: cargo fmt --all --check
+
+  clippy:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - name: clippy (development build, PRD SEC-18)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy (production build)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          cargo clippy -p keystone-core -p keystone-gui --no-default-features --features production --locked -- -D warnings
+
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # golang-go: FR-21 AC5 runs Go's crypto/x509 verifier; perl: SEC-03 kernel probe.
+      - run: scripts/ci-setup.sh golang-go
+      - run: cargo test --workspace --locked
+
+  gui-e2e:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh python3-dogtail python3-gi at-spi2-core dbus-x11 dbus-daemon xvfb xauth libglib2.0-bin
+      - name: Dogtail E2E with the YubiKey simulator (TESTING.md, NFR-04, NFR-08)
+        run: keystone-gui/tests/e2e/run.sh
+
+  coverage:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh golang-go
+      - run: cargo install --locked cargo-llvm-cov@0.9.1
+      - name: keystone-core line coverage at least 90% (PRD NFR-07, TEST-04)
+        run: cargo llvm-cov --package keystone-core --locked --fail-under-lines 90
+
+  audit:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - run: cargo install --locked cargo-audit@0.22.2
+      - name: cargo audit (PRD SEC-01)
+        run: cargo audit --deny warnings
+
+  deny:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - run: cargo install --locked cargo-deny@0.20.2
+      - name: cargo deny (licences, advisories, banned networking crates; SEC-01, SEC-03)
+        run: cargo deny --locked check
+
+  vet:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - run: cargo install --locked cargo-vet@0.10.3
+      # Fails until the maintainer creates supply-chain/ with `cargo vet init` and records
+      # audits (SECP-04). Agents may not create or edit cargo vet records (AGENT-06).
+      - name: cargo vet (PRD SEC-01)
+        run: cargo vet --locked
+
+  boundaries:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: unsafe only in crypto/ffi.rs, OpenSSL only in crypto/, no networking APIs (SEC-18)
+        run: scripts/check-boundaries.sh
+
+  traceability:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: every acceptance criterion has a test or a documented reason (TEST-01, NFR-06)
+        run: python3 scripts/traceability.py --report
+
+  plaintext-key-scan:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - name: generate a synthetic KEYSTONE TEST hierarchy and scan every output file (SEC-04)
+        run: |
+          out="$RUNNER_TEMP/samples"
+          cargo run --locked -p keystone-testkit --example generate_samples -- "$out"
+          scripts/scan-plaintext-keys.sh "$out"
+
+  rfc5280-lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh golang-go python3-venv
+      - name: install pinned linters (ADR 0002)
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/zmap/zlint/v3/cmd/zlint@v3.7.3
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pkilint==0.13.3
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: lint every generated certificate and CRL (FR-10 AC4, SEC-13)
+        run: |
+          out="$RUNNER_TEMP/samples"
+          cargo run --locked -p keystone-testkit --example generate_samples -- "$out"
+          scripts/lint-samples.sh "$out"
+
+  fuzz-short:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - name: install the pinned fuzzing toolchain and cargo-fuzz
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' fuzz/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rust-src --component llvm-tools-preview
+          cargo install --locked cargo-fuzz@0.13.2
+      - name: short fuzz run (SEC-08, TEST-06)
+        working-directory: fuzz
+        run: |
+          mkdir -p "corpus/${{ matrix.target }}" "seeds/${{ matrix.target }}"
+          cargo fuzz run -O "${{ matrix.target }}" "corpus/${{ matrix.target }}" "seeds/${{ matrix.target }}" -- \
+            -max_total_time=120 -timeout=10 -rss_limit_mb=2048
+
+  fuzz-nightly:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - name: install the pinned fuzzing toolchain and cargo-fuzz
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' fuzz/rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rust-src --component llvm-tools-preview
+          cargo install --locked cargo-fuzz@0.13.2
+      - name: long fuzz run (SEC-08, TEST-05)
+        working-directory: fuzz
+        run: |
+          mkdir -p "corpus/${{ matrix.target }}" "seeds/${{ matrix.target }}"
+          cargo fuzz run -O "${{ matrix.target }}" "corpus/${{ matrix.target }}" "seeds/${{ matrix.target }}" -- \
+            -max_total_time=3600 -timeout=10 -rss_limit_mb=2048
+
+  reproducible-build:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - name: build the production binary twice and compare SHA-256 (SEC-02)
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/keystone --remap-path-prefix=$HOME/.cargo=/cargo"
+          for n in 1 2; do
+            CARGO_TARGET_DIR="$RUNNER_TEMP/build-$n" cargo build --locked --release \
+              -p keystone-gui --no-default-features --features production
+          done
+          sha256sum "$RUNNER_TEMP"/build-1/release/keystone "$RUNNER_TEMP"/build-2/release/keystone
+          cmp "$RUNNER_TEMP"/build-1/release/keystone "$RUNNER_TEMP"/build-2/release/keystone
+
+  codeql:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:rust
+
+  blocked-tests:
+    # TEST-10 report job: NOT a required check. These tests fail with "BLOCKED: ..." until
+    # StarnetAuth ships encrypted-key import (FR-09 AC3) and CRL hosting (FR-13 AC5).
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/ci-setup.sh
+      - run: cargo test --locked -p keystone-core --features blocked-tests --test interop blocked
