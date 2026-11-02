@@ -9,6 +9,9 @@
 const DEVELOPMENT_FALLBACK_EPOCH: i64 = 1_793_491_200;
 
 fn main() {
+    // `cargo fuzz` builds with `--cfg fuzzing`; the fuzzing entry point in
+    // `crypto::pkcs8` exists only then. Declared so the cfg is not an unknown one.
+    println!("cargo::rustc-check-cfg=cfg(fuzzing)");
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     let production = std::env::var_os("CARGO_FEATURE_PRODUCTION").is_some();
     let epoch = match std::env::var("SOURCE_DATE_EPOCH") {

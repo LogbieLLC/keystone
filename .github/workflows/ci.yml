@@ -9,7 +9,7 @@
 #
 # Required checks for the dev/main rulesets (TEST-06): fmt, clippy, test, gui-e2e,
 # coverage, audit, deny, vet, boundaries, plaintext-key-scan, rfc5280-lint,
-# fuzz-short (4 targets), codeql, traceability, reproducible-build.
+# fuzz-short (5 targets), codeql, traceability, reproducible-build.
 # NOT required: blocked-tests (TEST-10 report job; it fails while StarnetAuth
 # dependencies are missing, by design).
 
@@ -212,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record]
+        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record, pkcs8_key_decode]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

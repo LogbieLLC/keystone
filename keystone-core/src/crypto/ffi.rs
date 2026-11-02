@@ -680,6 +680,37 @@ pub(crate) fn decrypt_pkcs8_der(der: &[u8], passphrase: &[u8]) -> Result<Private
     rsa_key_from_pkcs8_info(&p8)
 }
 
+/// Fuzzing entry point (SEC-08): reads a plaintext `PrivateKeyInfo` the way
+/// `PKCS8_decrypt` does after a successful decryption (`d2i_PKCS8_PRIV_KEY_INFO`,
+/// trailing bytes ignored) and decodes it with [`rsa_key_from_pkcs8_info`], so the
+/// fuzzer reaches that decoder without a key derivation per input.
+///
+/// Compiled only by `cargo fuzz` (`--cfg fuzzing`) and never with the `production`
+/// feature, so no test, development or production build contains it.
+#[cfg(all(fuzzing, not(feature = "production")))]
+pub(crate) fn decode_private_key_info_for_fuzzing(der: &[u8]) -> Result<PrivateKey, CryptoError> {
+    init_secure_heap()?;
+    rsa_key_from_pkcs8_info(&pkcs8_info_from_der(der)?)
+}
+
+/// Reads a plaintext `PrivateKeyInfo` as `PKCS8_decrypt` does. Only for the fuzzing
+/// entry point and the unit tests below; never in a production build.
+#[cfg(any(test, all(fuzzing, not(feature = "production"))))]
+fn pkcs8_info_from_der(der: &[u8]) -> Result<P8InfoGuard, CryptoError> {
+    let len = c_len(der.len(), "key")?;
+    let mut cursor = der.as_ptr();
+    // SAFETY: `cursor` points to `len` readable bytes; OpenSSL allocates a new object,
+    // owned by the guard below.
+    let p8 =
+        unsafe { sys::d2i_PKCS8_PRIV_KEY_INFO(ptr::null_mut(), &mut cursor, c_long::from(len)) };
+    if p8.is_null() {
+        // SAFETY: clears this thread's error queue.
+        unsafe { sys::ERR_clear_error() };
+        return Err(CryptoError::Der("not a PrivateKeyInfo".into()));
+    }
+    Ok(P8InfoGuard(p8))
+}
+
 /// Turns a decrypted `PrivateKeyInfo` into a [`PrivateKey`] without leaving any copy
 /// of the private numbers outside OpenSSL's secure heap (SEC-07).
 ///
@@ -1003,6 +1034,77 @@ mod tests {
         assert_eq!(region.as_slice()[0], 7);
         let large = LockedRegion::new(PAGE_SIZE + 1).expect("mlock");
         assert_eq!(large.capacity(), 2 * PAGE_SIZE);
+    }
+
+    /// DER tag, short-form length and content (contents here stay below 128 bytes).
+    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+        let len = u8::try_from(content.len()).ok().filter(|len| *len < 0x80);
+        [&[tag, len.expect("short form")][..], content].concat()
+    }
+
+    /// rsaEncryption and id-ecPublicKey, as OID contents.
+    const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+    /// The textbook RSA example (p = 61, q = 53, e = 17, a 12-bit modulus) as a PKCS#1
+    /// `RSAPrivateKey`: synthetic, not a usable key.
+    fn textbook_rsa() -> Vec<u8> {
+        let numbers: [&[u8]; 9] = [
+            &[0],          // version
+            &[0x0c, 0xa1], // n = 3233
+            &[0x11],       // e = 17
+            &[0x0a, 0xc1], // d = 2753
+            &[0x3d],       // p = 61
+            &[0x35],       // q = 53
+            &[0x35],       // dP = 53
+            &[0x31],       // dQ = 49
+            &[0x26],       // qInv = 38
+        ];
+        tlv(0x30, &numbers.map(|number| tlv(0x02, number)).concat())
+    }
+
+    /// A plaintext `PrivateKeyInfo` with algorithm `oid` around `private_key`.
+    fn private_key_info(oid: &[u8], private_key: &[u8]) -> Vec<u8> {
+        let algorithm = tlv(0x30, &[tlv(0x06, oid), vec![0x05, 0x00]].concat());
+        tlv(
+            0x30,
+            &[tlv(0x02, &[0]), algorithm, tlv(0x04, private_key)].concat(),
+        )
+    }
+
+    fn decode(der: &[u8]) -> Result<PrivateKey, CryptoError> {
+        init_secure_heap().expect("secure heap");
+        rsa_key_from_pkcs8_info(&pkcs8_info_from_der(der).expect("PrivateKeyInfo"))
+    }
+
+    #[test]
+    fn sec07_decrypted_key_info_is_decoded_as_rsa_only() {
+        // Covers: SEC-07, FR-04 AC3
+        // The decoder that replaced EVP_PKCS82PKEY: an RSA PrivateKeyInfo becomes a key.
+        let key = decode(&private_key_info(RSA_ENCRYPTION, &textbook_rsa())).expect("RSA");
+        assert!(key.is_rsa());
+        assert_eq!(key.bits(), 12);
+        assert!(!key.public_key_der().expect("public key").is_empty());
+        // Another algorithm is refused, whatever it contains.
+        assert!(matches!(
+            decode(&private_key_info(EC_PUBLIC_KEY, &textbook_rsa())),
+            Err(CryptoError::UnsupportedKey(_))
+        ));
+        // A damaged RSAPrivateKey, or one followed by extra bytes, reads as a wrong
+        // passphrase or damaged file (FR-04 AC3), never as a key.
+        let mut damaged = textbook_rsa();
+        damaged[1] += 1;
+        let mut trailing = textbook_rsa();
+        trailing.push(0);
+        for content in [damaged, trailing, Vec::new(), vec![0x30, 0x00]] {
+            assert!(
+                matches!(
+                    decode(&private_key_info(RSA_ENCRYPTION, &content)),
+                    Err(CryptoError::WrongPassphrase)
+                ),
+                "{content:02x?}"
+            );
+        }
     }
 
     /// OpenSSL calls back at most this many times after the callback returned 0:
