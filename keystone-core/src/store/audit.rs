@@ -287,6 +287,12 @@ pub enum AuditProblem {
         /// The entry holding the link.
         next_entry: u64,
     },
+    /// This entry's link to the previous entry was changed: the previous entry still
+    /// verifies, and the next entry's link no longer matches this one.
+    #[error(
+        "its link to the previous entry was changed (the previous entry still verifies and the next entry no longer links to this one)"
+    )]
+    LinkChanged,
 }
 
 /// A parsed and verified audit log.
@@ -356,10 +362,21 @@ pub fn parse_audit_log(bytes: &[u8]) -> Result<AuditLog, ParseError> {
                 return Err(audit_err(number, AuditProblem::WrongGenesis));
             }
             Some(previous) if entry.prev != *previous => {
-                return Err(audit_err(
-                    number - 1,
-                    AuditProblem::HashMismatch { next_entry: number },
-                ));
+                // Entry n-1 verified against its own predecessor. If entry n+1 still
+                // links to entry n, entry n is unchanged and n-1 was edited; if it does
+                // not, entry n itself (its link) was edited (FR-14 AC3).
+                let next_links_here = rest[newline + 1..]
+                    .split(|b| *b == b'\n')
+                    .next()
+                    .and_then(|next| serde_json::from_slice::<AuditEntry>(next).ok())
+                    .map(|next| next.prev == sha256(line));
+                return Err(match next_links_here {
+                    Some(false) => audit_err(number, AuditProblem::LinkChanged),
+                    _ => audit_err(
+                        number - 1,
+                        AuditProblem::HashMismatch { next_entry: number },
+                    ),
+                });
             }
             _ => {}
         }
