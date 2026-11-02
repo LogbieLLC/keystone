@@ -1,5 +1,6 @@
 //! CRL tests: issuers, v2 structure, refresh, and revocation seen by OpenSSL's
-//! verifier (FR-13 AC1, AC2, AC4, AC6).
+//! verifier (FR-13 AC1, AC2, AC4). FR-13 AC6 is shown by the operation tests
+//! (tests/ops).
 #![forbid(unsafe_code)]
 
 use std::sync::OnceLock;
@@ -30,8 +31,10 @@ fn hierarchy() -> &'static TestHierarchy {
 }
 
 #[test]
-fn fr13_ac1_ac2_ac6_first_crls_are_empty_v2_with_number_and_aki() {
-    // Covers: FR-13 AC1, FR-13 AC2, FR-13 AC6
+fn fr13_ac1_ac2_first_crls_are_empty_v2_with_number_and_aki() {
+    // Covers: FR-13 AC1, FR-13 AC2
+    // first_crl builds the empty CRL; that every issuer gets it in the operation that
+    // creates it, and signs no child before (FR-13 AC6), is shown in tests/ops.
     let h = hierarchy();
     for (crl, issuer, days) in [
         (&h.master_crl, &h.master, 365..=366),

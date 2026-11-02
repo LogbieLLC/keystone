@@ -228,6 +228,16 @@ fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup
             .unwrap();
         }
         assert_no_lost_record(&ca);
+        // FR-13 AC6: a master that exists after recovery has its first, empty CRL, so
+        // recovery never leaves an issuer that could sign a child without one.
+        let state = ca.state().unwrap();
+        if let Some(master) = state.master() {
+            let crl = state
+                .current_crl(master.serial())
+                .unwrap_or_else(|| panic!("change {crash_at}: the recovered master has no CRL"));
+            assert_eq!(crl.info.crl_number, 1, "change {crash_at}");
+            assert!(crl.info.revoked.is_empty(), "change {crash_at}");
+        }
         if ca.state().unwrap().master().is_none() {
             // Abandoned before anything was signed: Flow A runs again on the same drives.
             drop(ca);

@@ -92,7 +92,11 @@ fn build(
 
 #[test]
 fn fr13_ac5_scenario_a_revoked_sub_intermediate_fails_at_depth_1() {
-    // Covers: FR-13 AC5, FR-13 AC1, FR-13 AC6, SEC-12, SEC-14
+    // Covers: FR-13 AC5, FR-13 AC1, SEC-12, SEC-14
+    // Before revocation the chain passes -crl_check_all with each issuer's first,
+    // empty CRL. That an issuer gets that CRL in the operation that creates it, and
+    // cannot sign a child before (FR-13 AC6), is shown by the Flow A, Flow B and
+    // recovery tests in tests/ops.
     let (h, leaf, sub_crl) = build("CLI Scenario A", 0, 4);
     let files = Files::new(&h, &leaf, &sub_crl);
     let (ok, output) = files.verify();
@@ -126,7 +130,9 @@ fn fr13_ac5_scenario_a_revoked_sub_intermediate_fails_at_depth_1() {
 
 #[test]
 fn fr13_ac5_scenario_b_revoked_main_intermediate_fails_at_depth_2() {
-    // Covers: FR-13 AC5, FR-13 AC1, FR-13 AC6, SEC-12
+    // Covers: FR-13 AC5, FR-13 AC1, SEC-12
+    // As in scenario A, the first CRLs alone pass -crl_check_all before revocation;
+    // FR-13 AC6 itself is shown by the tests in tests/ops.
     let (h, leaf, sub_crl) = build("CLI Scenario B", 1, 5);
     let files = Files::new(&h, &leaf, &sub_crl);
     let (ok, output) = files.verify();

@@ -1,5 +1,12 @@
 //! YubiKey rules through the `TokenSigner` trait, run against the simulator
 //! (NFR-08): detection, hardening, slot protection, attestation, signing.
+//!
+//! What the FR-07 AC5 tests here show: every rule of `verify_piv_attestation`
+//! (chain, signature by this device's F9, key, serial, policies, firmware) against
+//! the simulator's own attestation hierarchy. They do not show verification against
+//! Yubico's embedded roots and intermediates or genuine Yubico certificates (the real
+//! driver and the hardware E2E, NFR-09), nor that setup stops on a failure: that is
+//! shown by the operation tests in tests/ops.
 #![forbid(unsafe_code)]
 
 use std::time::Duration;
