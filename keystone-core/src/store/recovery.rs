@@ -18,9 +18,13 @@
 //!   entry: mark it abandoned; its serial stays reserved. An audit entry that an earlier,
 //!   interrupted cancel or abandon wrote to some drives only is first copied to every
 //!   drive (an earlier abandon entry is reused, not written twice);
-//! - for YubiKey setup with recorded steps and nothing staged,
+//! - for YubiKey setup with nothing staged,
 //!   [`RecoveryAction::ResumeYubikeySetup`] tells the operations layer to read the
 //!   YubiKey's real state and continue from the first incomplete step (FR-22 AC5, AC7).
+//!   While nothing was signed it is followed by [`RecoveryAction::Abandon`]: YubiKey
+//!   steps are not signed output (FR-22 AC4), and a setup whose YubiKey is lost must not
+//!   block the CA for ever. The operations layer offers Abandon only while the setup's
+//!   YubiKey (by serial) is not connected.
 //!
 //! Recovery never formats, deletes or overwrites anything.
 #![forbid(unsafe_code)]
@@ -413,7 +417,14 @@ impl DriveSet {
                 drive_index: source,
                 drive: drives[source].drive.clone(),
             });
-        } else if !signed_output_exists && !signed_or_staged {
+        } else if !signed_or_staged && longest.kind() == OperationKind::SetupYubikey {
+            // FR-22 AC5, AC7: read the YubiKey and resume. Nothing was signed, so FR-22
+            // AC4 also allows abandoning it (for a YubiKey that is lost or will be
+            // replaced); the operations layer offers that only while the setup's YubiKey
+            // is not connected (review finding 10).
+            actions.push(RecoveryAction::ResumeYubikeySetup { next_step });
+            actions.push(RecoveryAction::Abandon);
+        } else if !signed_or_staged {
             actions.push(RecoveryAction::Abandon);
         } else if longest.kind() == OperationKind::SetupYubikey
             && longest.staged_outputs().is_none()

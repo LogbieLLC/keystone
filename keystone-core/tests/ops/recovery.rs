@@ -335,8 +335,10 @@ fn fr22_ac7_yubikey_setup_resumes_after_an_interruption_between_every_pair_of_st
         ] {
             serial += 1;
             let taken = yubikey_setup_interrupted_at(point, serial);
+            // With the YubiKey connected the setup is always resumed from its real
+            // state, even when the interruption came before the first journaled step
+            // (review finding 10: abandoning there ignored what the YubiKey holds).
             let expected = match point {
-                FaultPoint::AfterTokenStep(YubikeySetupStep::PinChanged) => RecoveryAction::Abandon,
                 FaultPoint::AfterTokenStep(YubikeySetupStep::KeyGenerated)
                 | FaultPoint::AfterTokenStepRecorded(YubikeySetupStep::KeyGenerated) => {
                     RecoveryAction::CompleteSetupWithExistingKey
@@ -516,6 +518,149 @@ fn fr22_ac5_a_key_without_certificate_is_completed_only_after_its_attestation_ve
         key
     );
     assert_no_lost_record(&test.ca);
+}
+
+#[test]
+fn regression_a_yubikey_setup_whose_yubikey_is_lost_can_be_abandoned() {
+    // Covers: FR-22 AC4, FR-22 AC7, FR-22 AC8, FR-10 AC2
+    // Review finding 10 and the ops open point: with the setup's YubiKey connected only
+    // the resume is offered; when it is absent (lost, or to be replaced) abandoning is
+    // offered as well, because nothing was signed. Never more than two actions.
+    let mut test = new_ca("R12");
+    let (mut token, _) = token(70_000_701);
+    testing::arm_fault(FaultPoint::AfterTokenStepRecorded(
+        YubikeySetupStep::PukChanged,
+    ));
+    injected(run_flow_b(&mut test, &mut token, "R12", false).unwrap_err());
+    test.reopen();
+    let present = test.ca.recovery_items(Some(&mut token)).unwrap();
+    assert_eq!(
+        present[0]
+            .actions
+            .iter()
+            .map(|c| c.action.clone())
+            .collect::<Vec<_>>(),
+        [RecoveryAction::ResumeYubikeySetup {
+            next_step: Some(YubikeySetupStep::ManagementKeySet)
+        }]
+    );
+    // Another YubiKey is not the setup's: abandoning is offered too.
+    let (mut other, _) = crate::support::token(70_000_702);
+    let with_other = test.ca.recovery_items(Some(&mut other)).unwrap();
+    assert!(
+        !with_other[0]
+            .yubikey
+            .as_ref()
+            .unwrap()
+            .is_this_operations_yubikey
+    );
+    let absent = test.ca.recovery_items(None).unwrap();
+    for item in [&with_other[0], &absent[0]] {
+        let actions: Vec<_> = item.actions.iter().map(|c| c.action.clone()).collect();
+        assert_eq!(
+            actions,
+            [
+                RecoveryAction::ResumeYubikeySetup {
+                    next_step: Some(YubikeySetupStep::ManagementKeySet)
+                },
+                RecoveryAction::Abandon
+            ]
+        );
+        let sentence = &item.actions[1].description;
+        assert!(sentence.contains("lost or will be replaced"), "{sentence}");
+        assert!(
+            sentence.contains("serial number stays reserved"),
+            "{sentence}"
+        );
+    }
+    let operation = absent[0].operation;
+    let reserved = absent[0].planned_serials[0];
+    let time = test.tick();
+    test.ca
+        .run_recovery(
+            operation,
+            &RecoveryAction::Abandon,
+            &RecoverySecrets::default(),
+            time,
+        )
+        .unwrap();
+    assert_no_lost_record(&test.ca);
+    assert!(
+        test.ca
+            .drive_set()
+            .known_serials()
+            .unwrap()
+            .contains(&reserved)
+    );
+    // A new YubiKey is set up afterwards.
+    let (mut replacement, _) = crate::support::token(70_000_703);
+    run_flow_b(&mut test, &mut replacement, "R12", false).expect("Flow B on a new YubiKey");
+    assert!(test.ca.state().unwrap().active_main(test.now).is_some());
+    assert_no_lost_record(&test.ca);
+}
+
+#[test]
+fn fr22_ac5_a_key_that_fails_attestation_is_never_completed_but_its_setup_can_be_left() {
+    // Covers: FR-22 AC5, FR-07 AC5, FR-22 AC4
+    let mut test = new_ca("R13");
+    let (mut token, controller) = token(70_000_801);
+    testing::arm_fault(FaultPoint::AfterTokenStepRecorded(
+        YubikeySetupStep::KeyGenerated,
+    ));
+    injected(run_flow_b(&mut test, &mut token, "R13", false).unwrap_err());
+    test.reopen();
+    controller.set_attested_serial(1);
+    let items = test.ca.recovery_items(Some(&mut token)).unwrap();
+    assert_eq!(items[0].actions.len(), 1);
+    assert_eq!(
+        items[0].actions[0].action,
+        RecoveryAction::CompleteSetupWithExistingKey
+    );
+    let master = test.master_entered();
+    let secrets = secrets_for(&mut token, Some(&master));
+    let request = main_request(&test, "R13");
+    let trust = token.attestation_trust();
+    let time = test.tick();
+    let error = test
+        .ca
+        .resume_yubikey_setup(
+            items[0].operation,
+            &mut token,
+            Some(&request),
+            &secrets,
+            &trust,
+            time,
+            None,
+            &NoProgress,
+            &CancelFlag::new(),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be completed with this key"),
+        "{error}"
+    );
+    assert!(test.ca.state().unwrap().main_intermediates().is_empty());
+    // The operator sets that YubiKey aside: the setup can then be abandoned.
+    controller.remove();
+    let items = test.ca.recovery_items(Some(&mut token)).unwrap();
+    assert!(items[0].yubikey.is_none());
+    assert_eq!(items[0].actions.len(), 2);
+    assert_eq!(items[0].actions[1].action, RecoveryAction::Abandon);
+    let time = test.tick();
+    test.ca
+        .run_recovery(
+            items[0].operation,
+            &RecoveryAction::Abandon,
+            &RecoverySecrets::default(),
+            time,
+        )
+        .unwrap();
+    assert_no_lost_record(&test.ca);
+    let (mut replacement, _) = crate::support::token(70_000_802);
+    run_flow_b(&mut test, &mut replacement, "R13", false).expect("Flow B on another YubiKey");
+    assert!(test.ca.state().unwrap().active_main(test.now).is_some());
 }
 
 #[test]

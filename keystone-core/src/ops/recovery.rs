@@ -11,14 +11,13 @@
 //!   whose first CRL was not signed yet needs the master passphrase to sign it.
 //! - an interrupted YubiKey setup becomes [`RecoveryAction::ResumeYubikeySetup`], or
 //!   [`RecoveryAction::CompleteSetupWithExistingKey`] when the connected YubiKey holds a
-//!   key without a certificate (FR-22 AC5): it is never offered to replace the key.
-//!
-//! Known limit (store rule, raised with the maintainer): the store offers "abandon" only
-//! when nothing irreversible was journaled, and a journaled YubiKey step counts as
-//! irreversible. A YubiKey setup interrupted after such a step can therefore only be
-//! resumed with the same YubiKey; if that YubiKey is lost, or its attestation fails even
-//! after an explicit wipe, the operation stays pending. PRD FR-22 AC4 would allow
-//! abandoning it, because no signed output exists.
+//!   key without a certificate (FR-22 AC5): it is never offered to replace the key, and
+//!   a key whose attestation fails is never completed (replacing it stays the separate,
+//!   typed-serial wipe of FR-07 AC4).
+//! - YubiKey setup with nothing signed (maintainer's reading of FR-22 AC4, AC5, AC7):
+//!   while the setup's YubiKey (by serial; any YubiKey when no step was journaled yet) is
+//!   connected, only the resume is offered; when it is absent, "Abandon" is offered as
+//!   well, for a YubiKey that is lost or will be replaced. Never more than two actions.
 #![forbid(unsafe_code)]
 
 use crate::cert::{SoftwareSigner, parse_certificate_pem};
@@ -264,6 +263,14 @@ impl Ca {
             .is_some_and(|c| c.key_without_certificate && c.is_this_operations_yubikey)
             && pending.kind == OperationKind::SetupYubikey
             && what.certificate.is_none();
+        // FR-22 AC5, AC7 with the maintainer's reading of AC4 (review finding 10): while
+        // the setup's YubiKey (by serial) is connected, only resuming from its real state
+        // is offered; when it is absent, abandoning is offered as well, for a YubiKey
+        // that is lost or will be replaced (nothing was signed).
+        let setup_yubikey_present = pending.kind == OperationKind::SetupYubikey
+            && column
+                .as_ref()
+                .is_some_and(|c| c.is_this_operations_yubikey);
         let mut actions = Vec::new();
         let mut blocked_reason = pending.blocked_reason.clone();
         for action in &pending.actions {
@@ -297,11 +304,15 @@ impl Ca {
                         None => choice(action, operation),
                     });
                 }
-                StoreAction::Abandon if existing_key => {
-                    actions.push(choice(
-                        RecoveryAction::CompleteSetupWithExistingKey,
-                        operation,
-                    ));
+                StoreAction::Abandon if pending.kind == OperationKind::SetupYubikey => {
+                    if !setup_yubikey_present {
+                        actions.push(RecoveryChoice {
+                            action: RecoveryAction::Abandon,
+                            description: format!(
+                                "Mark {operation} as abandoned, for when this YubiKey is lost or will be replaced; nothing was signed, its serial number stays reserved, and nothing is deleted, overwritten or wiped."
+                            ),
+                        });
+                    }
                 }
                 StoreAction::Abandon => actions.push(choice(RecoveryAction::Abandon, operation)),
                 StoreAction::ResumeYubikeySetup { next_step } => {

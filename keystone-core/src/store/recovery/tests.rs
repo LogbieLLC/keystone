@@ -239,11 +239,17 @@ fn fr22_ac7_interrupted_yubikey_setup_offers_resume() {
     drop(op);
     let set = open_all(&drives);
     let pending = only_pending(&set);
+    // Resume first (FR-22 AC5, AC7). Nothing was signed, so abandoning is safe too
+    // (FR-22 AC4); the operations layer offers it only while the setup's YubiKey is
+    // not connected (review finding 10).
     assert_eq!(
         pending.actions,
-        vec![RecoveryAction::ResumeYubikeySetup {
-            next_step: Some(YubikeySetupStep::KeyGenerated)
-        }]
+        vec![
+            RecoveryAction::ResumeYubikeySetup {
+                next_step: Some(YubikeySetupStep::KeyGenerated)
+            },
+            RecoveryAction::Abandon
+        ]
     );
     assert_eq!(pending.drives[0].yubikey_steps.len(), 3);
     assert_eq!(pending.drives[1].yubikey_steps.len(), 2);
@@ -255,6 +261,79 @@ fn fr22_ac7_interrupted_yubikey_setup_offers_resume() {
     set.sync_operation_journal(id).expect("sync");
     let resumed = set.resume_operation(id).expect("resume");
     assert_eq!(resumed.completed_yubikey_steps().expect("steps").len(), 3);
+}
+
+#[test]
+fn fr22_ac4_a_yubikey_setup_with_steps_but_nothing_signed_can_be_abandoned() {
+    // Covers: FR-22 AC4, FR-22 AC7, FR-10 AC2
+    // Review finding 10 and the ops open point: a setup whose YubiKey is lost after a
+    // journaled step stayed pending for ever. Nothing was signed, so FR-22 AC4 allows
+    // abandoning it; its serial stays reserved. After a signature it is never abandoned.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::SetupYubikey,
+            "CN=KEYSTONE TEST main",
+            &[serial(2)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    for step in [
+        YubikeySetupStep::PinChanged,
+        YubikeySetupStep::PukChanged,
+        YubikeySetupStep::ManagementKeySet,
+        YubikeySetupStep::KeyGenerated,
+    ] {
+        op.record_yubikey_step(step, 77, ts(5)).expect("step");
+    }
+    drop(op);
+    let set = open_all(&drives);
+    let pending = only_pending(&set);
+    assert!(pending.actions.contains(&RecoveryAction::Abandon));
+    set.abandon_operation(id, ts(6)).expect("abandon");
+    assert_recovered(&drives, "abandoned YubiKey setup");
+    assert!(
+        open_all(&drives)
+            .known_serials()
+            .expect("serials")
+            .contains(&serial(2))
+    );
+
+    // Signed: never abandoned, only resumed.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    crate::store::testutil::issue_master(&set, 1, ts(1));
+    let mut op = set
+        .begin_operation(
+            OperationKind::SetupYubikey,
+            "CN=KEYSTONE TEST main",
+            &[serial(2)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.record_yubikey_step(YubikeySetupStep::KeyGenerated, 77, ts(5))
+        .expect("step");
+    op.record_signed(
+        SignedObject::Certificate {
+            record: Box::new(cert(serial(2), CaLevel::MainIntermediate, serial(1))),
+            pem: cert_pem(serial(2)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    drop(op);
+    let set = open_all(&drives);
+    let pending = only_pending(&set);
+    assert_eq!(
+        pending.actions,
+        vec![RecoveryAction::ResumeYubikeySetup {
+            next_step: Some(YubikeySetupStep::PinChanged)
+        }]
+    );
+    assert!(set.abandon_operation(id, ts(6)).is_err());
 }
 
 /// Simulates the operations layer finishing an operation whose signature is journaled
