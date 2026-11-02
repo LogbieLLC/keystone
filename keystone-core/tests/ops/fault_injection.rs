@@ -288,6 +288,7 @@ fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup
                 &RecoverySecrets {
                     master_passphrase: Some(&master),
                 },
+                None,
                 time,
             )
             .unwrap();
@@ -428,6 +429,7 @@ fn recover_without_yubikey(test: &mut TestCa, context: &str) {
                 &RecoverySecrets {
                     master_passphrase: Some(&master),
                 },
+                None,
                 time,
             )
             .unwrap_or_else(|e| panic!("{context}: {e}"));

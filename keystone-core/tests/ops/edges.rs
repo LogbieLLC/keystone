@@ -327,6 +327,7 @@ fn yubikey_recovery_actions_need_the_yubikey_and_damaged_state_blocks_signing() 
             items[0].operation,
             &action,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap_err();
@@ -337,6 +338,7 @@ fn yubikey_recovery_actions_need_the_yubikey_and_damaged_state_blocks_signing() 
             keystone_core::store::OperationId(99),
             &action,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap_err();

@@ -246,6 +246,7 @@ fn fr22_ac4_flow_a_without_its_first_crl_needs_the_master_passphrase_to_finish()
             items[0].operation,
             &action,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap_err();
@@ -257,6 +258,7 @@ fn fr22_ac4_flow_a_without_its_first_crl_needs_the_master_passphrase_to_finish()
         &RecoverySecrets {
             master_passphrase: Some(&master),
         },
+        None,
         time,
     )
     .unwrap();
@@ -607,6 +609,7 @@ fn regression_a_yubikey_setup_whose_yubikey_is_lost_can_be_abandoned() {
             operation,
             &RecoveryAction::Abandon,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap();
@@ -675,11 +678,13 @@ fn fr22_ac5_a_key_that_fails_attestation_is_never_completed_but_its_setup_can_be
     assert_eq!(items[0].actions.len(), 2);
     assert_eq!(items[0].actions[1].action, RecoveryAction::Abandon);
     let time = test.tick();
+    // The YubiKey connection reports no YubiKey: that states it is absent.
     test.ca
         .run_recovery(
             items[0].operation,
             &RecoveryAction::Abandon,
             &RecoverySecrets::default(),
+            Some(&mut token),
             time,
         )
         .unwrap();
@@ -687,6 +692,71 @@ fn fr22_ac5_a_key_that_fails_attestation_is_never_completed_but_its_setup_can_be
     let (mut replacement, _) = crate::support::token(70_000_802);
     run_flow_b(&mut test, &mut replacement, "R13", false).expect("Flow B on another YubiKey");
     assert!(test.ca.state().unwrap().active_main(test.now).is_some());
+}
+
+#[test]
+fn regression_a_yubikey_setup_is_never_abandoned_while_its_yubikey_is_connected() {
+    // Covers: FR-22 AC5, FR-22 AC7, FR-22 AC4
+    // Regression (review finding 10, rest): run_recovery checked the offered actions
+    // without the YubiKey, so Abandon of a YubiKey setup was accepted while the setup's
+    // own YubiKey was connected (and should have been resumed from its real state).
+    let mut test = new_ca("R16");
+    let (mut token, controller) = token(70_001_601);
+    testing::arm_fault(FaultPoint::AfterTokenStepRecorded(
+        YubikeySetupStep::PinChanged,
+    ));
+    injected(run_flow_b(&mut test, &mut token, "R16", false).unwrap_err());
+    test.reopen();
+    let operation = test.ca.recovery_items(None).unwrap()[0].operation;
+    let entries = test.ca.drive_set().audit_log().unwrap().len();
+    let time = test.tick();
+    // The setup's YubiKey is connected: Abandon is refused.
+    let error = test
+        .ca
+        .run_recovery(
+            operation,
+            &RecoveryAction::Abandon,
+            &RecoverySecrets::default(),
+            Some(&mut token),
+            time,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("not offered"), "{error}");
+    // A YubiKey is connected but cannot be read: it may be the setup's, so refused too.
+    controller.fail_next(SimOp::SlotStatus, 1, FaultKind::FailBefore);
+    let error = test
+        .ca
+        .run_recovery(
+            operation,
+            &RecoveryAction::Abandon,
+            &RecoverySecrets::default(),
+            Some(&mut token),
+            time,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be read"), "{error}");
+    assert_eq!(
+        test.ca.drive_set().audit_log().unwrap().len(),
+        entries,
+        "nothing was written"
+    );
+    assert_eq!(
+        test.ca.recovery_items(None).unwrap().len(),
+        1,
+        "still pending"
+    );
+    // With another YubiKey connected, the setup's YubiKey is absent: Abandon runs.
+    let (mut other, _) = crate::support::token(70_001_602);
+    test.ca
+        .run_recovery(
+            operation,
+            &RecoveryAction::Abandon,
+            &RecoverySecrets::default(),
+            Some(&mut other),
+            time,
+        )
+        .unwrap();
+    assert_no_lost_record(&test.ca);
 }
 
 #[test]
@@ -722,6 +792,7 @@ fn regression_a_signed_main_intermediate_whose_yubikey_is_lost_is_recorded_then_
             items[0].operation,
             &RecoveryAction::FinishWithoutYubikey,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap();
@@ -844,6 +915,7 @@ fn fr22_ac8_recovery_offers_at_most_two_plain_actions_and_never_destroys() {
             items[0].operation,
             &RecoveryAction::Abandon,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap_err();
@@ -854,6 +926,7 @@ fn fr22_ac8_recovery_offers_at_most_two_plain_actions_and_never_destroys() {
             items[0].operation,
             &RecoveryAction::CompleteSetupWithExistingKey,
             &RecoverySecrets::default(),
+            None,
             time,
         )
         .unwrap_err();

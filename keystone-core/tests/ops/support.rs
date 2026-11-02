@@ -399,6 +399,7 @@ pub fn recover_all(
                     &RecoverySecrets {
                         master_passphrase: Some(&master),
                     },
+                    token.as_deref_mut().map(|t| t as &mut dyn TokenSigner),
                     time,
                 )
                 .expect("recovery action"),
