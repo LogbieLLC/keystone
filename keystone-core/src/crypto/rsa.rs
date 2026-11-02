@@ -60,7 +60,7 @@ impl CancelFlag {
 /// write it out is encrypted PKCS#8 (`crypto::pkcs8`).
 ///
 /// The OpenSSL key object is owned by the FFI module and reachable only from inside
-/// `crypto` ([`RsaPrivateKey::handle`] is `pub(super)`), so no other module can
+/// `crypto` (its accessor `handle` is `pub(super)`), so no other module can
 /// call an OpenSSL function on it (SEC-04, SEC-18).
 pub struct RsaPrivateKey {
     key: ffi::PrivateKey,
