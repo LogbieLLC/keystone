@@ -335,8 +335,14 @@ fn fr16_ac2_failures_before_the_signature_cancel_and_keep_the_serial() {
     assert!(matches!(error, OpsError::Stopped { .. }), "{error}");
     assert!(error.to_string().contains("YubiKey"), "{error}");
     controller.reinsert();
-    // A different YubiKey cannot sign for the main intermediate.
-    let (mut other, _) = crate::support::token(30_000_055);
+    // A different YubiKey cannot sign for the main intermediate. Its key is generated
+    // fresh: the simulator's pooled keys are shared by every device in the process, so a
+    // pooled key could equal the main intermediate's key.
+    let mut other = keystone_testkit::SimulatedYubiKey::new(keystone_testkit::SimulatorConfig {
+        serial: 30_000_055,
+        key_source: keystone_testkit::simulator::KeySource::Fresh,
+        ..keystone_testkit::SimulatorConfig::default()
+    });
     harden(&mut other, PIN, PUK).unwrap();
     other.generate_signing_key(&s(PIN)).unwrap();
     let error = run_flow_c(&mut test, &mut other, "C5", 4, false).unwrap_err();
@@ -421,23 +427,27 @@ fn fr16_ac1_operations_run_on_a_worker_thread_and_report_progress() {
         );
         (ca, outcome)
     });
+    // The "GUI" loop keeps running and receives progress while the worker signs. (Wall
+    // clock gaps are not asserted: they measure the test machine's scheduler, not
+    // Keystone.)
     let mut events = Vec::new();
-    let mut longest_gap = StdDuration::ZERO;
-    let mut last = Instant::now();
+    let mut polls_while_running = 0u32;
+    let mut events_while_running = 0usize;
+    let started = Instant::now();
     while !worker.is_finished() {
         if let Ok(event) = receiver.recv_timeout(StdDuration::from_millis(10)) {
             events.push(event);
         }
-        longest_gap = longest_gap.max(last.elapsed());
-        last = Instant::now();
+        polls_while_running += 1;
+        events_while_running = events.len();
     }
+    let elapsed = started.elapsed();
     let (ca, outcome) = worker.join().unwrap();
     events.extend(receiver.try_iter());
     outcome.expect("Flow C on a worker thread");
-    assert!(
-        longest_gap < StdDuration::from_millis(100),
-        "{longest_gap:?}"
-    );
+    assert!(elapsed >= StdDuration::from_millis(400), "{elapsed:?}");
+    assert!(polls_while_running >= 5, "{polls_while_running} polls");
+    assert!(events_while_running >= 3, "{events_while_running} events");
     assert!(events.contains(&Progress::TouchYubiKey));
     for step in [
         Step::Journaling,
