@@ -244,7 +244,7 @@ pub enum StoreError {
     #[error("the CA drives cannot be verified, so nothing can be signed: {}", .0.join("; "))]
     Damaged(Vec<String>),
     /// An operation is pending; recovery must run first (FR-22 AC4).
-    #[error("operation {0} was interrupted; finish or abandon it on the recovery screen first")]
+    #[error("{0} was interrupted; finish or abandon it on the recovery screen first")]
     PendingOperation(OperationId),
     /// FR-10 AC2: the planned serial has been seen before in some history.
     #[error("serial number {0} was already used or reserved; a serial is never reused")]
