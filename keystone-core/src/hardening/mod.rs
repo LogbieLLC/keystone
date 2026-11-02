@@ -3,10 +3,17 @@
 //! (GOVERNANCE.md section 3: the network guard, the seccomp filter and all code behind
 //! the `production` feature).
 //!
-//! FR-01 AC2: the network guard, the seccomp filter, the inherited-socket check and the
-//! binary self-check are compiled only with the `production` Cargo feature (and in this
-//! crate's own unit tests, so they can be tested); ordinary development and test builds
-//! omit them. Disabling core dumps (SEC-07) is compiled into every build.
+//! FR-01 AC2: the network guard and the binary self-check are compiled only with the
+//! `production` Cargo feature (and in this crate's own unit tests, so they can be
+//! tested); ordinary development and test builds omit them. Disabling core dumps
+//! (SEC-07) is compiled into every build.
+//!
+//! The SEC-03 socket guard (the seccomp filter and the refusal of inherited network
+//! sockets and io_uring instances, [`install_socket_guard`]) is compiled into every build
+//! as well, but only the production `main` installs it unconditionally. A development
+//! build installs it only when started with `--harden`, so the strace E2E run (SEC-03)
+//! can drive the GUI and the YubiKey simulator with the filter on. Without that flag a
+//! development build never calls it.
 //!
 //! # Startup order in the production `main`
 //! 1. [`harden_at_startup`] as the very first action, before GTK, OpenSSL or PC/SC
@@ -22,17 +29,16 @@ mod process;
 
 #[cfg(any(feature = "production", test))]
 pub mod network;
-#[cfg(any(feature = "production", test))]
 pub mod seccomp;
 #[cfg(any(feature = "production", test))]
 pub mod selfcheck;
-#[cfg(any(feature = "production", test))]
 pub mod sockets;
 
 pub use process::{core_dumps_disabled, disable_core_dumps};
 
-/// True when the network guard, socket filter and binary self-check are compiled into
-/// this build (FR-01 AC2): production builds, and this crate's own unit tests.
+/// True when the network guard and the binary self-check are compiled into this build
+/// (FR-01 AC2): production builds, and this crate's own unit tests. (The socket guard
+/// is compiled into every build; see the module documentation.)
 pub const PRODUCTION_GUARDS_COMPILED: bool = cfg!(any(feature = "production", test));
 
 /// Errors from this module. Each one names what to fix.
@@ -96,6 +102,15 @@ pub enum HardeningError {
         /// Why.
         reason: String,
     },
+}
+
+/// SEC-03 without the FR-01 interface check: installs the socket filter, then refuses
+/// inherited network sockets and io_uring instances. [`harden_at_startup`] does the
+/// same as part of the production start; development builds call this only for
+/// `keystone --harden` (the strace E2E run).
+pub fn install_socket_guard() -> Result<(), HardeningError> {
+    seccomp::install_socket_filter()?;
+    sockets::check_no_inherited_network_sockets(std::path::Path::new(sockets::PROC_ROOT))
 }
 
 /// The first call in the production `main` (SEC-03, SEC-07, FR-01): installs the socket

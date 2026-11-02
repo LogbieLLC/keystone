@@ -7,11 +7,18 @@
 //! file chooser.
 //!
 //! ```text
-//! keystone [--primary DIR] [--backup DIR]... [--export DIR]
-//!          [--test-hook passphrase-confirmation] [--test-words N]
+//! keystone [--primary DIR] [--backup DIR]... [--export DIR] [--new-drive DIR]
+//!          [--test-hook passphrase-confirmation|slow-keygen] [--test-words N]
 //!          [--sim-serial N] [--sim-firmware X.Y.Z]
 //!          [--sim-slot empty|key-only|key-and-certificate|certificate-only]
+//!          [--harden]
 //! ```
+//!
+//! `--harden` (development builds only) installs the SEC-03 socket filter and refuses
+//! inherited network sockets and io_uring instances before anything else starts, as the
+//! production build always does; it is how the strace E2E run checks SEC-03 with the
+//! YubiKey simulator. The FR-01 network-interface check stays production-only (FR-01
+//! AC2). `--new-drive` prefills the new, empty drive of "Replace a lost drive".
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
@@ -41,7 +48,7 @@ pub struct SimOptions {
     pub slot: SimSlot,
 }
 
-/// Test hooks: start the GUI directly on one screen (development builds only).
+/// Test hooks (development builds only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestHook {
     /// Generate a master passphrase of `words` words and open its show-once screen.
@@ -49,6 +56,10 @@ pub enum TestHook {
         /// Number of words (10 to 20).
         words: usize,
     },
+    /// NFR-03: software key generation keeps running until the operator presses Cancel
+    /// (or the backend's slow-keygen limit passes), so the E2E test can check that the
+    /// window stays responsive and that Cancel works, whatever the machine's speed.
+    SlowKeygen,
 }
 
 /// Parsed command-line options.
@@ -64,6 +75,11 @@ pub struct Options {
     pub test_hook: Option<TestHook>,
     /// Simulator settings.
     pub sim: SimOptions,
+    /// The new, empty drive for "Replace a lost drive" (prefills its field).
+    pub new_drive: Option<PathBuf>,
+    /// Install the SEC-03 socket filter at start (development builds; production
+    /// always does).
+    pub harden: bool,
 }
 
 /// A command line that cannot be used. The message is shown to the operator.
@@ -115,6 +131,13 @@ pub fn parse(args: &[String], production: bool) -> Result<Options, CliError> {
     let mut words: Option<usize> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if arg == HARDEN_FLAG {
+            if options.harden {
+                return Err(CliError::Repeated(HARDEN_FLAG));
+            }
+            options.harden = true;
+            continue;
+        }
         let (name, inline) = match arg.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(value.to_string())),
             _ => (arg.as_str(), None),
@@ -128,18 +151,22 @@ pub fn parse(args: &[String], production: bool) -> Result<Options, CliError> {
             "--primary" => set_once(&mut options.primary, option, path(option, &value)?)?,
             "--backup" => options.backups.push(path(option, &value)?),
             "--export" => set_once(&mut options.export, option, path(option, &value)?)?,
+            "--new-drive" => set_once(&mut options.new_drive, option, path(option, &value)?)?,
             "--test-hook" => {
                 if hook.is_some() {
                     return Err(CliError::Repeated(option));
                 }
-                if value != "passphrase-confirmation" {
-                    return Err(CliError::InvalidValue {
-                        option,
-                        value,
-                        reason: "the only test hook is passphrase-confirmation",
-                    });
-                }
-                hook = Some("passphrase-confirmation");
+                hook = Some(match value.as_str() {
+                    "passphrase-confirmation" => "passphrase-confirmation",
+                    "slow-keygen" => "slow-keygen",
+                    _ => {
+                        return Err(CliError::InvalidValue {
+                            option,
+                            value,
+                            reason: "the test hooks are passphrase-confirmation and slow-keygen",
+                        });
+                    }
+                });
             }
             "--test-words" => {
                 let parsed = value
@@ -192,21 +219,31 @@ pub fn parse(args: &[String], production: bool) -> Result<Options, CliError> {
         }
     }
     match (hook, words) {
-        (Some(_), words) => {
+        (Some("slow-keygen"), None) => options.test_hook = Some(TestHook::SlowKeygen),
+        (Some("passphrase-confirmation"), words) => {
             options.test_hook = Some(TestHook::PassphraseConfirmation {
                 words: words.unwrap_or(MIN_TEST_WORDS),
             });
         }
-        (None, Some(_)) => {
+        (_, Some(_)) => {
             return Err(CliError::InvalidValue {
                 option: "--test-words",
                 value: String::new(),
                 reason: "it is used only with --test-hook passphrase-confirmation",
             });
         }
-        (None, None) => {}
+        (_, None) => {}
     }
     Ok(options)
+}
+
+/// The development-only flag that installs the SEC-03 socket filter at start.
+pub const HARDEN_FLAG: &str = "--harden";
+
+/// True when a development build was asked to install the socket filter. Read before
+/// anything else starts, so it only looks for the flag; [`parse`] checks the rest.
+pub fn wants_hardening(args: &[String], production: bool) -> bool {
+    !production && args.iter().any(|arg| arg == HARDEN_FLAG)
 }
 
 fn known_option(name: &str) -> Option<&'static str> {
@@ -214,6 +251,7 @@ fn known_option(name: &str) -> Option<&'static str> {
         "--primary",
         "--backup",
         "--export",
+        "--new-drive",
         "--test-hook",
         "--test-words",
         "--sim-serial",
@@ -326,6 +364,56 @@ mod tests {
         assert_eq!(
             default_words.test_hook,
             Some(TestHook::PassphraseConfirmation { words: 10 })
+        );
+    }
+
+    #[test]
+    fn sec03_harden_flag_is_a_development_option_only() {
+        // Covers: SEC-03 (strace E2E with the filter on), FR-01 AC2
+        let options = parse(&args(&["--harden", "--primary", "/tmp/a"]), false).expect("valid");
+        assert!(options.harden);
+        assert!(
+            !parse(&args(&["--primary", "/tmp/a"]), false)
+                .expect("valid")
+                .harden
+        );
+        assert!(wants_hardening(
+            &args(&["--primary", "/a", "--harden"]),
+            false
+        ));
+        assert!(!wants_hardening(&args(&["--primary", "/a"]), false));
+        // A production build installs the filter anyway and refuses every argument.
+        assert!(!wants_hardening(&args(&["--harden"]), true));
+        assert_eq!(
+            parse(&args(&["--harden"]), true),
+            Err(CliError::ArgumentsInProduction)
+        );
+        assert_eq!(
+            parse(&args(&["--harden", "--harden"]), false),
+            Err(CliError::Repeated("--harden"))
+        );
+    }
+
+    #[test]
+    fn nfr03_slow_keygen_hook_and_new_drive_folder() {
+        // Covers: NFR-03, FR-16 AC2 (deterministic slow key generation for the E2E test)
+        let options = parse(
+            &args(&["--test-hook", "slow-keygen", "--new-drive", "/tmp/n"]),
+            false,
+        )
+        .expect("valid");
+        assert_eq!(options.test_hook, Some(TestHook::SlowKeygen));
+        assert_eq!(options.new_drive, Some(PathBuf::from("/tmp/n")));
+        assert!(matches!(
+            parse(
+                &args(&["--test-hook", "slow-keygen", "--test-words", "12"]),
+                false
+            ),
+            Err(CliError::InvalidValue { .. })
+        ));
+        assert_eq!(
+            parse(&args(&["--test-hook=slow-keygen"]), true),
+            Err(CliError::ArgumentsInProduction)
         );
     }
 
