@@ -5,10 +5,15 @@
 //! Contents:
 //! - `LockedRegion`: page-aligned memory that is locked into RAM (never swapped),
 //!   excluded from core dumps, and wiped before it is freed (SEC-07).
-//! - `generate_rsa_der`: cancellable RSA key generation with a progress callback
+//! - `PrivateKey`: the only owner of a private key (`EVP_PKEY`) in Keystone. The
+//!   key never leaves this module as an OpenSSL object, as DER or as PEM; callers
+//!   can only sign with it, read its public key, or encrypt it (SEC-04, SEC-07).
+//! - `generate_rsa_key`: cancellable RSA key generation with a progress callback
 //!   (FR-02 AC1, FR-16, NFR-03).
-//! - `encrypt_pkcs8_der`: encrypted PKCS#8 with explicit PBES2 parameters
-//!   (FR-04 AC1, SEC-04).
+//! - `encrypt_pkcs8_der` / `decrypt_pkcs8_der`: encrypted PKCS#8 with explicit PBES2
+//!   parameters (FR-04 AC1, SEC-04). The passphrase is passed to OpenSSL as a
+//!   pointer into its locked buffer with an explicit length; no C-string copy is
+//!   made (SEC-07).
 //! - `verify_chain`: `X509_verify_cert` with in-memory trusted roots, untrusted
 //!   intermediates, CRLs and an explicit verification time.
 //!
@@ -17,8 +22,8 @@
 //!   every path, including early returns.
 //! - Nothing here panics across the FFI boundary: the keygen callback catches
 //!   unwinding and turns it into "abort".
-//! - Secrets cross into the safe `openssl` crate only as DER inside a
-//!   `LockedRegion`, which is wiped on drop.
+//! - A private key is generated or decrypted directly into an `EVP_PKEY` owned by
+//!   `PrivateKey`; there is no plaintext DER round trip.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::{CStr, c_char, c_int, c_long, c_ulong, c_void};
@@ -73,6 +78,12 @@ unsafe extern "C" {
     ) -> *mut X509_SIG;
     fn X509_SIG_free(sig: *mut X509_SIG);
     fn i2d_X509_SIG(sig: *const X509_SIG, out: *mut *mut u8) -> c_int;
+    fn d2i_X509_SIG(sig: *mut *mut X509_SIG, input: *mut *const u8, len: c_long) -> *mut X509_SIG;
+    fn PKCS8_decrypt(
+        p8: *const X509_SIG,
+        pass: *const c_char,
+        passlen: c_int,
+    ) -> *mut sys::PKCS8_PRIV_KEY_INFO;
     fn X509_STORE_add_crl(store: *mut sys::X509_STORE, crl: *mut sys::X509_CRL) -> c_int;
     fn X509_STORE_CTX_set_time(ctx: *mut sys::X509_STORE_CTX, flags: c_ulong, t: c_long);
 }
@@ -144,16 +155,20 @@ struct KeygenState<'a> {
     cancel: &'a AtomicBool,
     progress: &'a (dyn Fn(u64) + Sync),
     steps: AtomicU64,
+    callbacks: AtomicU64,
+    callbacks_after_abort: AtomicU64,
+    aborted: AtomicBool,
     callback_failed: AtomicBool,
 }
 
 /// Called by OpenSSL during prime generation. Returning 0 makes OpenSSL abort.
 ///
 /// Never unwinds into C: any panic in the progress callback is caught and turns
-/// into "abort".
+/// into "abort". Once it has returned 0 it keeps returning 0 without calling the
+/// progress callback, and counts any such late call (`KeygenTrace`).
 unsafe extern "C" fn keygen_callback(ctx: *mut sys::EVP_PKEY_CTX) -> c_int {
     // SAFETY: OpenSSL passes the context we created; its app data is either null or the
-    // `KeygenState` that `generate_rsa_der` keeps alive for the whole keygen call.
+    // `KeygenState` that `generate_with_state` keeps alive for the whole keygen call.
     let state = unsafe { EVP_PKEY_CTX_get_app_data(ctx) }.cast::<KeygenState<'_>>();
     if state.is_null() {
         return 0;
@@ -161,6 +176,11 @@ unsafe extern "C" fn keygen_callback(ctx: *mut sys::EVP_PKEY_CTX) -> c_int {
     // SAFETY: non-null and valid for the duration of this call (see above); only shared
     // references and atomics are used.
     let state = unsafe { &*state };
+    state.callbacks.fetch_add(1, Ordering::SeqCst);
+    if state.aborted.load(Ordering::SeqCst) {
+        state.callbacks_after_abort.fetch_add(1, Ordering::SeqCst);
+        return 0;
+    }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         if state.cancel.load(Ordering::SeqCst) {
             return false;
@@ -169,26 +189,130 @@ unsafe extern "C" fn keygen_callback(ctx: *mut sys::EVP_PKEY_CTX) -> c_int {
         (state.progress)(step);
         !state.cancel.load(Ordering::SeqCst)
     }));
-    match outcome {
-        Ok(true) => 1,
-        Ok(false) => 0,
+    let keep_going = match outcome {
+        Ok(keep_going) => keep_going,
         Err(_) => {
             state.callback_failed.store(true, Ordering::SeqCst);
-            0
+            false
         }
+    };
+    if keep_going {
+        1
+    } else {
+        state.aborted.store(true, Ordering::SeqCst);
+        0
     }
 }
 
-/// Plaintext private-key DER held only in locked, wiped-on-drop memory.
-pub(crate) struct LockedDer {
-    region: LockedRegion,
-    len: usize,
-}
+// ---------------------------------------------------------------------------
+// Private keys (SEC-04, SEC-07, SEC-18)
+// ---------------------------------------------------------------------------
 
-impl LockedDer {
-    /// The DER bytes.
-    pub(crate) fn as_bytes(&self) -> &[u8] {
-        &self.region.as_slice()[..self.len]
+/// A private key owned by this module.
+///
+/// The `EVP_PKEY` is created by key generation or decryption and freed on drop
+/// (`EVP_PKEY_free` clears the private numbers). It is never handed out as an
+/// OpenSSL object, so only this module can reach the private key; the methods
+/// below are the only things anyone can do with it.
+pub(crate) struct PrivateKey(PkeyGuard);
+
+// SAFETY: `PrivateKey` exclusively owns its `EVP_PKEY`. Every method takes `&self` and
+// only reads the key (public-key encoding, signing through a fresh per-call
+// `EVP_PKEY_CTX`, PKCS#8 encoding); OpenSSL 3 documents such read-only use of one
+// `EVP_PKEY` from several threads as safe (openssl-threads(7)), and the `openssl` crate
+// marks its `PKey` wrapper `Send` and `Sync` for the same reason.
+unsafe impl Send for PrivateKey {}
+// SAFETY: see `Send` above.
+unsafe impl Sync for PrivateKey {}
+
+impl PrivateKey {
+    fn from_raw(raw: *mut sys::EVP_PKEY, context: &str) -> Result<Self, CryptoError> {
+        Ok(PrivateKey(PkeyGuard::checked(raw, context)?))
+    }
+
+    /// True for an RSA key (not RSA-PSS or any other type).
+    pub(crate) fn is_rsa(&self) -> bool {
+        // SAFETY: `self.0.0` is a live key owned by the guard.
+        unsafe { sys::EVP_PKEY_id(self.0.0) == sys::EVP_PKEY_RSA }
+    }
+
+    /// Modulus size in bits.
+    pub(crate) fn bits(&self) -> u32 {
+        // SAFETY: `self.0.0` is a live key owned by the guard.
+        let bits = unsafe { sys::EVP_PKEY_bits(self.0.0) };
+        u32::try_from(bits).unwrap_or(0)
+    }
+
+    /// The public key as DER `SubjectPublicKeyInfo`.
+    pub(crate) fn public_key_der(&self) -> Result<Vec<u8>, CryptoError> {
+        // SAFETY: `self.0.0` is a live key; a null output pointer asks only for the length.
+        let len = unsafe { sys::i2d_PUBKEY(self.0.0, ptr::null_mut()) };
+        let len = usize::try_from(len)
+            .ok()
+            .filter(|len| *len > 0)
+            .ok_or_else(|| openssl_error("i2d_PUBKEY (length)"))?;
+        let mut out = vec![0u8; len];
+        let mut cursor = out.as_mut_ptr();
+        // SAFETY: `out` has exactly `len` writable bytes, which is what is written.
+        let written = unsafe { sys::i2d_PUBKEY(self.0.0, &mut cursor) };
+        if usize::try_from(written).ok() != Some(len) {
+            return Err(openssl_error("i2d_PUBKEY"));
+        }
+        Ok(out)
+    }
+
+    /// Signs a SHA-384 digest with RSA PKCS#1 v1.5 (OpenSSL adds the SHA-384
+    /// DigestInfo), giving a sha384WithRSAEncryption signature.
+    pub(crate) fn sign_sha384_digest(&self, digest: &[u8; 48]) -> Result<Vec<u8>, CryptoError> {
+        // SAFETY: `self.0.0` is a live key; the new context holds its own reference.
+        let ctx = PkeyCtxGuard::checked(
+            unsafe { sys::EVP_PKEY_CTX_new(self.0.0, ptr::null_mut()) },
+            "EVP_PKEY_CTX_new",
+        )?;
+        // SAFETY: `ctx.0` is a live context owned by the guard.
+        if unsafe { sys::EVP_PKEY_sign_init(ctx.0) } <= 0 {
+            return Err(openssl_error("EVP_PKEY_sign_init"));
+        }
+        // SAFETY: as above; PKCS#1 v1.5 padding is a plain integer constant.
+        if unsafe { sys::EVP_PKEY_CTX_set_rsa_padding(ctx.0, sys::RSA_PKCS1_PADDING) } <= 0 {
+            return Err(openssl_error("EVP_PKEY_CTX_set_rsa_padding"));
+        }
+        // SAFETY: as above; `EVP_sha384` returns a static digest description.
+        if unsafe { sys::EVP_PKEY_CTX_set_signature_md(ctx.0, sys::EVP_sha384()) } <= 0 {
+            return Err(openssl_error("EVP_PKEY_CTX_set_signature_md"));
+        }
+        let mut len: usize = 0;
+        // SAFETY: a null signature pointer asks only for the maximum length; the digest
+        // is 48 readable bytes.
+        let rc = unsafe {
+            sys::EVP_PKEY_sign(
+                ctx.0,
+                ptr::null_mut(),
+                &mut len,
+                digest.as_ptr(),
+                digest.len(),
+            )
+        };
+        if rc <= 0 || len == 0 {
+            return Err(openssl_error("EVP_PKEY_sign (length)"));
+        }
+        let mut signature = vec![0u8; len];
+        // SAFETY: `signature` has `len` writable bytes; OpenSSL writes at most that many
+        // and stores the actual length in `len`.
+        let rc = unsafe {
+            sys::EVP_PKEY_sign(
+                ctx.0,
+                signature.as_mut_ptr(),
+                &mut len,
+                digest.as_ptr(),
+                digest.len(),
+            )
+        };
+        if rc <= 0 || len > signature.len() {
+            return Err(openssl_error("EVP_PKEY_sign"));
+        }
+        signature.truncate(len);
+        Ok(signature)
     }
 }
 
@@ -196,13 +320,50 @@ impl LockedDer {
 /// `EVP_PKEY_generate`, with a callback that reports progress and lets the
 /// operator cancel (FR-16).
 ///
-/// Returns the private key as PKCS#1 DER in locked memory. The raw OpenSSL key is
-/// freed before returning (`RSA_free` clears its numbers).
-pub(crate) fn generate_rsa_der(
+/// The key is generated directly into the returned [`PrivateKey`]; no encoded copy
+/// of it is ever made.
+pub(crate) fn generate_rsa_key(
     bits: u32,
     cancel: &AtomicBool,
     progress: &(dyn Fn(u64) + Sync),
-) -> Result<LockedDer, CryptoError> {
+) -> Result<PrivateKey, CryptoError> {
+    generate_rsa_key_traced(bits, cancel, progress).0
+}
+
+/// What the keygen callback saw; used by tests to prove that OpenSSL really stops
+/// after the callback asked it to (FR-16 AC2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeygenTrace {
+    /// Times OpenSSL called the callback.
+    pub(crate) callbacks: u64,
+    /// Times OpenSSL called the callback again after it had returned 0 ("abort").
+    pub(crate) callbacks_after_abort: u64,
+}
+
+fn generate_rsa_key_traced(
+    bits: u32,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(u64) + Sync),
+) -> (Result<PrivateKey, CryptoError>, KeygenTrace) {
+    let state = KeygenState {
+        cancel,
+        progress,
+        steps: AtomicU64::new(0),
+        callbacks: AtomicU64::new(0),
+        callbacks_after_abort: AtomicU64::new(0),
+        aborted: AtomicBool::new(false),
+        callback_failed: AtomicBool::new(false),
+    };
+    let result = generate_with_state(bits, &state);
+    let trace = KeygenTrace {
+        callbacks: state.callbacks.load(Ordering::SeqCst),
+        callbacks_after_abort: state.callbacks_after_abort.load(Ordering::SeqCst),
+    };
+    (result, trace)
+}
+
+fn generate_with_state(bits: u32, state: &KeygenState<'_>) -> Result<PrivateKey, CryptoError> {
+    let cancel = state.cancel;
     let bits_c = c_int::try_from(bits).map_err(|_| CryptoError::UnsupportedKeySize { bits })?;
     if cancel.load(Ordering::SeqCst) {
         return Err(CryptoError::Cancelled);
@@ -230,16 +391,11 @@ pub(crate) fn generate_rsa_der(
     if unsafe { sys::EVP_PKEY_CTX_set1_rsa_keygen_pubexp(ctx.0, exponent.0) } <= 0 {
         return Err(openssl_error("EVP_PKEY_CTX_set1_rsa_keygen_pubexp"));
     }
-    let state = KeygenState {
-        cancel,
-        progress,
-        steps: AtomicU64::new(0),
-        callback_failed: AtomicBool::new(false),
-    };
-    // SAFETY: `state` outlives the `EVP_PKEY_generate` call below; the app data pointer
-    // is cleared again right after it, before `state` is dropped.
+    // SAFETY: `state` is borrowed for the whole of this function, so it outlives the
+    // `EVP_PKEY_generate` call below; the app data pointer is cleared again right after
+    // that call.
     unsafe {
-        EVP_PKEY_CTX_set_app_data(ctx.0, ptr::from_ref(&state).cast_mut().cast::<c_void>());
+        EVP_PKEY_CTX_set_app_data(ctx.0, ptr::from_ref(state).cast_mut().cast::<c_void>());
         EVP_PKEY_CTX_set_cb(ctx.0, Some(keygen_callback));
     }
     let mut raw: *mut sys::EVP_PKEY = ptr::null_mut();
@@ -251,6 +407,7 @@ pub(crate) fn generate_rsa_der(
         EVP_PKEY_CTX_set_cb(ctx.0, None);
         EVP_PKEY_CTX_set_app_data(ctx.0, ptr::null_mut());
     }
+    // Owns the new key (if any) from here on, so it is freed on every early return.
     let key = PkeyGuard(raw);
     if cancel.load(Ordering::SeqCst) {
         // SAFETY: clears this thread's error queue (the abort leaves entries in it).
@@ -267,21 +424,7 @@ pub(crate) fn generate_rsa_der(
     if rc <= 0 || key.0.is_null() {
         return Err(openssl_error("EVP_PKEY_generate"));
     }
-    // SAFETY: `key.0` is a live key; a null output pointer asks only for the length.
-    let len = unsafe { sys::i2d_PrivateKey(key.0, ptr::null_mut()) };
-    let len = usize::try_from(len)
-        .ok()
-        .filter(|len| *len > 0)
-        .ok_or_else(|| openssl_error("i2d_PrivateKey (length)"))?;
-    let mut region = LockedRegion::new(len)?;
-    let mut out = region.as_mut_slice().as_mut_ptr();
-    // SAFETY: `region` has at least `len` writable bytes, which is exactly what
-    // `i2d_PrivateKey` writes for this key.
-    let written = unsafe { sys::i2d_PrivateKey(key.0, &mut out) };
-    if usize::try_from(written).ok() != Some(len) {
-        return Err(openssl_error("i2d_PrivateKey"));
-    }
-    Ok(LockedDer { region, len })
+    Ok(PrivateKey(key))
 }
 
 // ---------------------------------------------------------------------------
@@ -297,12 +440,15 @@ pub(crate) enum Pbes2Kdf {
     Pbkdf2HmacSha256 { iterations: u32 },
 }
 
-/// Encrypts an unencrypted PKCS#8 `PrivateKeyInfo` into an `EncryptedPrivateKeyInfo`
-/// (DER) using PBES2 with the given KDF and AES-256-CBC, with the caller's salt and IV.
+/// Encrypts `key` into an `EncryptedPrivateKeyInfo` (DER) using PBES2 with the given
+/// KDF and AES-256-CBC, with the caller's salt and IV.
 ///
-/// The output contains only ciphertext and public parameters.
+/// The key goes from the `EVP_PKEY` straight into OpenSSL's `PKCS8_PRIV_KEY_INFO`
+/// (cleared when freed) and is encrypted there; no plaintext copy reaches Rust. The
+/// passphrase is passed with its explicit length. The output contains only
+/// ciphertext and public parameters.
 pub(crate) fn encrypt_pkcs8_der(
-    private_key_info: &[u8],
+    key: &PrivateKey,
     passphrase: &[u8],
     kdf: Pbes2Kdf,
     salt: &[u8; 16],
@@ -311,14 +457,9 @@ pub(crate) fn encrypt_pkcs8_der(
     if passphrase.is_empty() {
         return Err(CryptoError::EmptyPassphrase);
     }
-    let der_len = c_len(private_key_info.len(), "private key")?;
     let pass_len = c_len(passphrase.len(), "passphrase")?;
-    let mut input = private_key_info.as_ptr();
-    // SAFETY: `input` points to `der_len` readable bytes; OpenSSL allocates a new object.
-    let p8 = P8InfoGuard::checked(
-        unsafe { sys::d2i_PKCS8_PRIV_KEY_INFO(ptr::null_mut(), &mut input, c_long::from(der_len)) },
-        "d2i_PKCS8_PRIV_KEY_INFO",
-    )?;
+    // SAFETY: `key.0.0` is a live key; OpenSSL allocates a new object, freed by the guard.
+    let p8 = P8InfoGuard::checked(unsafe { sys::EVP_PKEY2PKCS8(key.0.0) }, "EVP_PKEY2PKCS8")?;
     // SAFETY: returns a static cipher description.
     let cipher = unsafe { sys::EVP_aes_256_cbc() };
     let mut salt = *salt;
@@ -376,6 +517,55 @@ pub(crate) fn encrypt_pkcs8_der(
         return Err(openssl_error("i2d_X509_SIG"));
     }
     Ok(out)
+}
+
+/// Decrypts an `EncryptedPrivateKeyInfo` (DER) into a [`PrivateKey`] (FR-04 AC2, AC3).
+///
+/// The caller checks the encryption parameters first (`pkcs8.rs`, SEC-08). The
+/// passphrase is passed to `PKCS8_decrypt` as a pointer into the caller's (locked)
+/// buffer with an explicit length, so no copy of it is made on the Rust side and a
+/// NUL byte is an ordinary byte. The decrypted `PKCS8_PRIV_KEY_INFO` is cleared by
+/// OpenSSL when freed, and `EVP_PKCS82PKEY` decodes it straight into the key.
+///
+/// A malformed structure is [`CryptoError::Der`]; a failed decryption (wrong
+/// passphrase or damaged ciphertext) is [`CryptoError::WrongPassphrase`].
+pub(crate) fn decrypt_pkcs8_der(der: &[u8], passphrase: &[u8]) -> Result<PrivateKey, CryptoError> {
+    let der_len = c_len(der.len(), "key file")?;
+    let pass_len = c_len(passphrase.len(), "passphrase")?;
+    let start = der.as_ptr();
+    let mut cursor = start;
+    // SAFETY: `cursor` points to `der_len` readable bytes; OpenSSL allocates a new object.
+    let sig = unsafe { d2i_X509_SIG(ptr::null_mut(), &mut cursor, c_long::from(der_len)) };
+    if sig.is_null() {
+        // SAFETY: clears this thread's error queue.
+        unsafe { sys::ERR_clear_error() };
+        return Err(CryptoError::Der(
+            "the encrypted key structure could not be read".into(),
+        ));
+    }
+    let sig = SigGuard(sig);
+    if cursor != start.wrapping_add(der.len()) {
+        return Err(CryptoError::Der(
+            "trailing data after the encrypted key".into(),
+        ));
+    }
+    // SAFETY: `sig.0` is live; `passphrase` points to `pass_len` readable bytes, and
+    // OpenSSL reads exactly that many (an explicit length, not a C string).
+    let p8 = unsafe { PKCS8_decrypt(sig.0, passphrase.as_ptr().cast::<c_char>(), pass_len) };
+    if p8.is_null() {
+        // SAFETY: clears this thread's error queue (bad decrypt leaves entries in it).
+        unsafe { sys::ERR_clear_error() };
+        return Err(CryptoError::WrongPassphrase);
+    }
+    let p8 = P8InfoGuard(p8);
+    // SAFETY: `p8.0` is live; OpenSSL allocates a new key, owned by `PrivateKey` below.
+    let raw = unsafe { sys::EVP_PKCS82PKEY(p8.0) };
+    if raw.is_null() {
+        // SAFETY: as above.
+        unsafe { sys::ERR_clear_error() };
+        return Err(CryptoError::WrongPassphrase);
+    }
+    PrivateKey::from_raw(raw, "EVP_PKCS82PKEY")
 }
 
 // ---------------------------------------------------------------------------

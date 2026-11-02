@@ -198,6 +198,33 @@ fn fr04_ac3_wrong_passphrase_is_a_clear_error_with_no_output() {
 }
 
 #[test]
+fn sec07_passphrase_reaches_openssl_with_explicit_length_and_a_nul_byte_never_panics() {
+    // Covers: SEC-07, FR-04 AC3
+    // The passphrase goes from its locked buffer to PKCS8_decrypt as a pointer and an
+    // explicit length; no C-string copy is made, so a NUL byte is just another byte
+    // (the old path copied it into an unwiped CString and panicked on a NUL).
+    let key = keys::rsa2048(1);
+    let with_nul = passphrase("KEYSTONE TEST\0words");
+    let pem = encrypt_sub_key_pem(key, &with_nul).expect("encrypt and read back");
+    let back = decrypt_key_pem(pem.as_bytes(), &with_nul).expect("decrypt");
+    assert_eq!(
+        back.public_key_spki_der().unwrap(),
+        key.public_key_spki_der().unwrap()
+    );
+    // Everything after the NUL counts: the prefix is a different passphrase.
+    assert!(matches!(
+        decrypt_key_pem(pem.as_bytes(), &passphrase("KEYSTONE TEST")),
+        Err(CryptoError::WrongPassphrase)
+    ));
+    let plain = encrypt_master_key_pem(keys::rsa2048(1), &passphrase("KEYSTONE TEST words"))
+        .expect("encrypt");
+    assert!(matches!(
+        decrypt_key_pem(plain.as_bytes(), &passphrase("KEYSTONE TEST\0")),
+        Err(CryptoError::WrongPassphrase)
+    ));
+}
+
+#[test]
 fn fr04_refuses_empty_passphrase_plaintext_keys_and_oversized_files() {
     // Covers: FR-04 AC1, SEC-04, SEC-08
     let key = keys::rsa2048(1);

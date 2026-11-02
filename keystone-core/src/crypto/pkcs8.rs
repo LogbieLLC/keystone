@@ -17,9 +17,6 @@
 //! never written.
 #![forbid(unsafe_code)]
 
-use openssl::pkey::PKey;
-use zeroize::Zeroizing;
-
 use super::CryptoError;
 use super::ffi::{self, Pbes2Kdf};
 use super::pem;
@@ -82,11 +79,13 @@ fn encrypt(
     let mut iv = [0u8; 16];
     super::rand::fill(&mut salt)?;
     super::rand::fill(&mut iv)?;
-    let encrypted = {
-        // The unencrypted PrivateKeyInfo exists only for this call and is wiped on drop.
-        let plain = Zeroizing::new(key.pkey().private_key_to_pkcs8()?);
-        ffi::encrypt_pkcs8_der(&plain, passphrase.expose().as_bytes(), kdf, &salt, &iv)?
-    };
+    let encrypted = ffi::encrypt_pkcs8_der(
+        key.handle(),
+        passphrase.as_secret_bytes().expose(),
+        kdf,
+        &salt,
+        &iv,
+    )?;
     let pem = pem::encode(pem::LABEL_ENCRYPTED_PRIVATE_KEY, &encrypted);
     let check = decrypt_key_pem(pem.as_bytes(), passphrase)?;
     if check.public_key_spki_der()? != key.public_key_spki_der()? {
@@ -121,9 +120,10 @@ pub fn decrypt_key_pem(
     if passphrase.is_empty() {
         return Err(CryptoError::WrongPassphrase);
     }
-    let pkey = PKey::private_key_from_pkcs8_passphrase(&der, passphrase.expose().as_bytes())
-        .map_err(|_| CryptoError::WrongPassphrase)?;
-    RsaPrivateKey::from_pkey(pkey)
+    // The passphrase goes to OpenSSL straight from its locked buffer, with its length
+    // (SEC-07); see `ffi::decrypt_pkcs8_der`.
+    let key = ffi::decrypt_pkcs8_der(&der, passphrase.as_secret_bytes().expose())?;
+    RsaPrivateKey::from_handle(key)
 }
 
 /// True when `bytes` contain an unencrypted private key: a PEM block labelled
