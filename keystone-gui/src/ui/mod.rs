@@ -6,10 +6,15 @@
 //!                         │           │        │                  │
 //!                         │           │        └─ correct clock baseline (FR-17 AC3)
 //!                         │           ├─▶ recovery screen (FR-22 AC8) ─▶ action confirmation ─▶ progress ─▶ result
-//!                         │           └─ drive repair (FR-12 AC3), divergent histories side by side
+//!                         │           ├─ drive repair (FR-12 AC3), divergent histories side by side
+//!                         │           └─ one drive only ─▶ Replace a lost drive (ADR 0003) ─▶ review ─▶ progress ─▶ result
 //!                         └─ blocked: broken audit chain, divergent or damaged drives
 //! home ─▶ issuance record (FR-11 AC2), CRL warning banner ─▶ Refresh CRL (FR-13 AC3)
+//! home ─▶ Replace a lost drive (ADR 0003)
 //! ```
+//!
+//! Every execute step runs through `backend::OpsBackend`, the operations layer
+//! (`keystone_core::ops`).
 //! Every flow starts with drive selection and comparison, audit-log verification, the
 //! recovery check and the clock confirmation, and ends with the write-and-verify
 //! result and the SHA-256 fingerprints (PRD section 6, FR-20). A confirmed time is used
