@@ -256,10 +256,57 @@ class Keystone:
 
     # -- common steps ------------------------------------------------------------
 
-    def type_into(self, name, text, role="text"):
-        """Moves the focus to the field `name` with Tab and types `text`."""
-        self.tab_to(name, role)
-        self.type(text)
+    FIELD_ROLES = ("text", "password text", "spin button", "entry")
+
+    def focused_field(self):
+        """The focused field's (role, name): a password entry's inner text node takes
+        its name from the entry around it."""
+        node = self.focused()
+        if node is None:
+            return None, None
+        name = node.name
+        if not name and node.parent is not None:
+            name = node.parent.name
+        return node.roleName, name
+
+    def choose_radio(self, prefix, max_tabs=60, max_moves=12):
+        """Selects the radio button whose name starts with `prefix` by keyboard: Tab
+        reaches the group (only its active button is in the Tab chain), the arrow
+        keys move within it, Space selects."""
+        roles = ("radio button", "check box")
+        # GTK 4 gives grouped check buttons the role "check box" or "radio button".
+        for _ in range(max_tabs + 1):
+            node = self.focused()
+            if node is not None and node.roleName in roles and node.name:
+                break
+            rawinput.pressKey("Tab")
+            time.sleep(0.12)
+        else:
+            raise E2EFailure(f"no radio button reached; focus is on {self.describe(self.focused())}")
+        for _ in range(max_moves):
+            node = self.focused()
+            if node is not None and node.roleName in roles and node.name.startswith(prefix):
+                if not node.checked:
+                    self.press("space")
+                check(self.focused().checked, f"radio button {node.name!r} not selected")
+                return node.name
+            rawinput.pressKey("Down")
+            time.sleep(0.15)
+        raise E2EFailure(f"radio button {prefix!r} not reached with the arrow keys")
+
+    def fill(self, name, text, max_tabs=60):
+        """Moves the focus with Tab to the field named `name` and types `text`."""
+        for _ in range(max_tabs + 1):
+            role, focused = self.focused_field()
+            if role in self.FIELD_ROLES and focused == name:
+                self.type(text)
+                return
+            rawinput.pressKey("Tab")
+            time.sleep(0.12)
+        raise E2EFailure(
+            f"field {name!r} was not reached with the keyboard; focus is on "
+            f"{self.describe(self.focused())}"
+        )
 
     def open_home(self):
         """Drive selection (prefilled) -> start-up checks -> clock -> home."""
