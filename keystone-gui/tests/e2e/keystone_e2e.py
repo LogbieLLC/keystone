@@ -135,7 +135,31 @@ class Keystone:
         with open(self.log_path) as handle:
             return handle.read()
 
+    def children(self):
+        """Process ids whose parent is the started process (the program run by a
+        wrapper such as strace)."""
+        found = []
+        for status in os.listdir("/proc"):
+            if not status.isdigit():
+                continue
+            try:
+                with open(f"/proc/{status}/status") as handle:
+                    for line in handle:
+                        if line.startswith("PPid:") and line.split()[1] == str(self.process.pid):
+                            found.append(int(status))
+            except OSError:
+                continue
+        return found
+
     def close(self):
+        # A wrapper (strace) detaches on SIGTERM: stop the program it runs first.
+        for pid in self.children():
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
+        if self.children():
+            time.sleep(1)
         if self.process.poll() is None:
             self.process.terminate()
             try:
