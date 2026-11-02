@@ -127,10 +127,15 @@ fn sec03_only_af_unix_sockets_are_allowed() {
 #[test]
 fn sec03_alternative_socket_paths_are_blocked() {
     // Covers: SEC-03
-    assert_eq!(
-        verdict(SYS_IO_URING_SETUP, AUDIT_ARCH_X86_64, 1),
-        errno(ENOSYS)
-    );
+    // io_uring: setting up an instance, and using or extending one (an inherited
+    // instance could create sockets with IORING_OP_SOCKET; review finding 12).
+    for call in [
+        SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
+    ] {
+        assert_eq!(verdict(call, AUDIT_ARCH_X86_64, 1), errno(ENOSYS), "{call}");
+    }
     assert_eq!(
         verdict(SYS_PIDFD_GETFD, AUDIT_ARCH_X86_64, 3),
         errno(ENOSYS)
@@ -139,6 +144,8 @@ fn sec03_alternative_socket_paths_are_blocked() {
         SYS_SOCKET,
         SYS_SOCKETPAIR,
         SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
         SYS_PIDFD_GETFD,
     ] {
         // x32 ABI: blocked even for AF_UNIX.
@@ -186,6 +193,17 @@ my $ipair = socketpair(my $c, my $d, AF_INET, SOCK_STREAM, PF_UNSPEC);
 print "inetpair=", ($ipair ? "ok" : ($! + 0)), "\n";
 my $ring = syscall(425, 1, 0);
 print "io_uring=", ($ring >= 0 ? "ok" : ($! + 0)), "\n";
+my $enter = syscall(426, -1, 0, 0, 0, 0, 0);
+print "io_uring_enter=", ($enter >= 0 ? "ok" : ($! + 0)), "\n";
+my $register = syscall(427, -1, 0, 0, 0);
+print "io_uring_register=", ($register >= 0 ? "ok" : ($! + 0)), "\n";
+# An invalid socket type: the kernel refuses it with EINVAL before it looks the family up,
+# so the result without the filter does not depend on which families this kernel has; the
+# filter answers EAFNOSUPPORT before the kernel runs. A baseline for every family.
+for my $family (2, 10, 17, 16, 31, 40) {
+    my $ok = socket(my $s, $family, 999, 0);
+    print "family$family=", ($ok ? "ok" : ($! + 0)), "\n";
+}
 "#;
 
 fn probe() -> BTreeMap<String, String> {
@@ -231,27 +249,62 @@ fn sec03_filter_child() {
     std::fs::write(dir.join("probe.txt"), report.join("\n")).expect("write report");
 }
 
+/// Every family the filter must refuse, as the probe's `family<N>` key.
+const REFUSED_FAMILIES: [u64; 6] = [
+    AF_INET,
+    AF_INET6,
+    AF_PACKET,
+    AF_NETLINK,
+    AF_BLUETOOTH,
+    AF_VSOCK,
+];
+
+/// The control run (no filter) must give, for every refusal the test asserts, a result
+/// that differs from the filter's answer; otherwise the assertion would pass without
+/// the filter. A probe whose control result equals the refusal fails the test loudly:
+/// on such a kernel the filter's effect cannot be shown (review: SEC-03 kernel test).
+fn assert_control_baselines(control: &BTreeMap<String, String>) {
+    let get = |key: &str| {
+        control
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or_else(|| panic!("the control probe printed no {key}: {control:?}"))
+    };
+    assert_eq!(
+        get("unix"),
+        "ok",
+        "AF_UNIX must work without the filter: {control:?}"
+    );
+    assert_eq!(
+        get("inet"),
+        "ok",
+        "AF_INET must work without the filter: {control:?}"
+    );
+    assert_ne!(get("inetpair"), "97", "{control:?}");
+    for family in REFUSED_FAMILIES {
+        assert_eq!(
+            get(&format!("family{family}")),
+            "22",
+            "without the filter, socket(family {family}, invalid type) must fail with EINVAL; otherwise the refusal of family {family} cannot be told apart from the kernel's own answer: {control:?}"
+        );
+    }
+    for call in ["io_uring", "io_uring_enter", "io_uring_register"] {
+        assert_ne!(
+            get(call),
+            "38",
+            "{call} is not available on this kernel (ENOSYS without the filter), so the test cannot show that the filter blocks it; run the SEC-03 kernel test on a kernel with io_uring: {control:?}"
+        );
+    }
+}
+
 #[test]
 fn sec03_filter_blocks_network_sockets_in_a_child_process() {
     // Covers: SEC-03, FR-01 AC3
-    // Control: without the filter the probe can create AF_INET and AF_UNIX sockets, so
-    // the results below come from the filter and not from the environment.
+    // Control: without the filter every refusal asserted below has a different result,
+    // so the results come from the filter and not from the environment (a kernel without
+    // IPv6 or io_uring cannot make the test pass by itself).
     let control = probe();
-    assert_eq!(
-        control.get("unix").map(String::as_str),
-        Some("ok"),
-        "{control:?}"
-    );
-    assert_eq!(
-        control.get("inet").map(String::as_str),
-        Some("ok"),
-        "{control:?}"
-    );
-    assert_ne!(
-        control.get("inetpair").map(String::as_str),
-        Some("97"),
-        "{control:?}"
-    );
+    assert_control_baselines(&control);
 
     let dir = tempfile::tempdir().expect("tempdir");
     child::run("hardening::seccomp::tests::sec03_filter_child", dir.path());
@@ -271,7 +324,16 @@ fn sec03_filter_blocks_network_sockets_in_a_child_process() {
             "{refused} must fail with EAFNOSUPPORT: {text}"
         );
     }
-    assert_eq!(report.get("io_uring"), Some(&"38"), "{text}");
+    for family in REFUSED_FAMILIES {
+        assert_eq!(
+            report.get(format!("family{family}").as_str()),
+            Some(&"97"),
+            "family {family} must be refused by the filter (EAFNOSUPPORT, not the kernel's EINVAL): {text}"
+        );
+    }
+    for call in ["io_uring", "io_uring_enter", "io_uring_register"] {
+        assert_eq!(report.get(call), Some(&"38"), "{call}: {text}");
+    }
     assert_eq!(
         report.get("unix"),
         Some(&"ok"),

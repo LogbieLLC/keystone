@@ -4,10 +4,12 @@
 //! - `socket()` and `socketpair()` fail with `EAFNOSUPPORT` for every address family
 //!   except `AF_UNIX`, which PC/SC (pcscd), Wayland and D-Bus need. Only the low 32 bits
 //!   of the family are compared, exactly as the kernel reads the `int` argument;
-//! - `io_uring_setup()` fails with `ENOSYS`: io_uring can create sockets without calling
-//!   `socket()`;
+//! - `io_uring_setup()`, `io_uring_enter()` and `io_uring_register()` fail with `ENOSYS`:
+//!   io_uring can create sockets without calling `socket()` (IORING_OP_SOCKET), also
+//!   through an instance inherited from the parent (which [`super::sockets`] refuses
+//!   at start as well);
 //! - `pidfd_getfd()` fails with `ENOSYS`: it could copy a socket out of another process;
-//! - the same four calls through the x32 ABI (syscall number + `0x4000_0000`) fail with
+//! - the same six calls through the x32 ABI (syscall number + `0x4000_0000`) fail with
 //!   `ENOSYS`;
 //! - any system call from another architecture (for example 32-bit `int 0x80`) kills the
 //!   process (seccompiler's architecture check).
@@ -43,6 +45,10 @@ pub const SYS_SOCKET: i64 = 41;
 pub const SYS_SOCKETPAIR: i64 = 53;
 /// `io_uring_setup`.
 pub const SYS_IO_URING_SETUP: i64 = 425;
+/// `io_uring_enter`.
+pub const SYS_IO_URING_ENTER: i64 = 426;
+/// `io_uring_register`.
+pub const SYS_IO_URING_REGISTER: i64 = 427;
 /// `pidfd_getfd`.
 pub const SYS_PIDFD_GETFD: i64 = 438;
 /// Bit that marks x32-ABI system calls on x86_64.
@@ -70,13 +76,20 @@ pub fn socket_filter_programs() -> Result<Vec<BpfProgram>, HardeningError> {
     )
     .map_err(seccomp_err)?;
     let mut blocked = BTreeMap::new();
-    for call in [SYS_IO_URING_SETUP, SYS_PIDFD_GETFD] {
+    for call in [
+        SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
+        SYS_PIDFD_GETFD,
+    ] {
         blocked.insert(call, Vec::new());
     }
     for call in [
         SYS_SOCKET,
         SYS_SOCKETPAIR,
         SYS_IO_URING_SETUP,
+        SYS_IO_URING_ENTER,
+        SYS_IO_URING_REGISTER,
         SYS_PIDFD_GETFD,
     ] {
         blocked.insert(call | X32_SYSCALL_BIT, Vec::new());

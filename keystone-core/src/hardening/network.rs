@@ -58,6 +58,12 @@ pub fn active_interfaces(class_net: &Path) -> Result<Vec<ActiveInterface>, Harde
     for entry in fs::read_dir(class_net).map_err(|e| unreadable(e.to_string()))? {
         let entry = entry.map_err(|e| unreadable(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Interfaces are links to the device folders (or folders). A regular file such as
+        // `bonding_masters` (bonding module) is not an interface (review finding 13).
+        // An entry whose kind cannot be read is checked as an interface (fail closed).
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
         // sysfs entries are links to the device folders; follow them.
         let dir = entry.path();
         let flags = read_attribute(&dir, "flags")
@@ -189,6 +195,28 @@ mod tests {
                 "{flags} {state}"
             );
         }
+    }
+
+    #[test]
+    fn regression_regular_files_in_the_interface_folder_are_not_interfaces() {
+        // Covers: FR-01 AC1, FR-01 AC3
+        // Regression (review finding 13): with the bonding module loaded,
+        // /sys/class/net/bonding_masters (a plain file) was read as an interface whose
+        // state cannot be read, so a laptop with networking off was refused.
+        let sysfs = FakeSysfs::new();
+        sysfs.add("lo", Some("0x9"), Some("unknown"));
+        sysfs.add("enp1s0", Some("0x1002"), Some("down"));
+        fs::write(sysfs.path().join("bonding_masters"), "\n").expect("file");
+        assert!(check_no_active_network(sysfs.path()).is_ok());
+        // Interfaces are folders or links to device folders; a link is still checked.
+        let device = sysfs.add("device-wlan0", Some("0x1003"), Some("up"));
+        std::os::unix::fs::symlink(&device, sysfs.path().join("wlan0")).expect("link");
+        let names: Vec<String> = active_interfaces(sysfs.path())
+            .expect("read")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, vec!["device-wlan0".to_string(), "wlan0".to_string()]);
     }
 
     #[test]

@@ -67,6 +67,16 @@ pub enum HardeningError {
         /// File descriptor numbers of the non-AF_UNIX sockets.
         descriptors: Vec<u32>,
     },
+    /// SEC-03: the process inherited an io_uring instance, which could create sockets
+    /// without calling `socket()` (IORING_OP_SOCKET).
+    #[error(
+        "Keystone will not start: it was started with an open io_uring instance (file descriptors {}), which could open network sockets. Start it again from the desktop.",
+        .descriptors.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    InheritedIoUring {
+        /// File descriptor numbers of the io_uring instances.
+        descriptors: Vec<u32>,
+    },
     /// `/proc` could not be read, so inherited sockets cannot be ruled out.
     #[error("Keystone will not start: cannot read {path}: {reason}")]
     ProcUnreadable {
