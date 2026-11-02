@@ -1,0 +1,53 @@
+# Parser fuzz targets (PRD SEC-08, TESTING.md section 1 and TEST-13).
+# A separate workspace with its own Cargo.lock: never part of the application.
+# Toolchain: the pinned nightly in fuzz/rust-toolchain.toml ("Keystone Dependencies.md":
+# "a separately pinned compatible fuzzing toolchain"). libfuzzer-sys approved by the
+# maintainer on 2026-11-02.
+[package]
+name = "keystone-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+keystone-core = { path = "../keystone-core" }
+
+[workspace]
+members = ["."]
+
+# 1. PEM and encrypted PKCS#8 parser, including decryption.
+[[bin]]
+name = "pem_pkcs8"
+path = "fuzz_targets/pem_pkcs8.rs"
+test = false
+doc = false
+bench = false
+
+# 2. Certificate and CRL parser.
+[[bin]]
+name = "cert_crl"
+path = "fuzz_targets/cert_crl.rs"
+test = false
+doc = false
+bench = false
+
+# 3. Audit-log and operation-journal parser.
+[[bin]]
+name = "audit_journal"
+path = "fuzz_targets/audit_journal.rs"
+test = false
+doc = false
+bench = false
+
+# 4. Issuance-record parser (plus the small drive metadata files).
+[[bin]]
+name = "issuance_record"
+path = "fuzz_targets/issuance_record.rs"
+test = false
+doc = false
+bench = false

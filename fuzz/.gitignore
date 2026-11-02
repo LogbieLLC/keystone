@@ -1,0 +1,7 @@
+target/
+artifacts/
+coverage/
+# corpus/ is libFuzzer's working corpus (grown by every run, cached in CI).
+corpus/
+# seeds/ is committed: hand-picked inputs plus every crash or hang input, which also
+# becomes a regression test (TESTING.md TEST-13).

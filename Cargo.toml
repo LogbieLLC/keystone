@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["keystone-core", "keystone-gui", "keystone-testkit"]
+# The fuzz targets are a separate workspace with their own toolchain and lock file.
+exclude = ["fuzz"]
 
 [workspace.package]
 # GOV-13: YYYY.M.BUILD, "-dev" until milestone M8 is accepted.
