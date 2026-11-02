@@ -126,7 +126,14 @@ fn reason(flow: FlowKind, state: CaState<'_>, now: OffsetDateTime) -> Option<Str
         }
         CaState::Existing { record, blocked } => (record, blocked),
     };
+    // Drives whose CA holds no certificate at all (only cancelled or abandoned
+    // attempts, for example a Flow A cancelled during key generation) hold no CA yet:
+    // Flow A may run on them again (ops: `DriveSetup::ReuseEmptyCa`).
+    let no_certificate = record.certificates().is_empty();
     if flow == FlowKind::CreateMaster {
+        if no_certificate && blocked.is_none() {
+            return None;
+        }
         return Some(
             "Not available: these drives already hold a CA. A new CA is never created over an existing one."
                 .to_string(),
@@ -199,6 +206,23 @@ mod tests {
                 .as_deref()
                 .is_some_and(|r| r.starts_with("Not available"))
         }));
+    }
+
+    #[test]
+    fn fr16_ac2_flow_a_can_run_again_after_a_cancelled_attempt() {
+        // Covers: FR-16 AC2, SEC-20 (regression: after a cancelled Flow A the drives
+        // hold an empty CA, and "Create new CA" must be offered again)
+        let now = keystone_core::build_info::build_date();
+        let record = IssuanceRecord::empty();
+        let list = availability(
+            CaState::Existing {
+                record: &record,
+                blocked: None,
+            },
+            now,
+        );
+        assert!(list[0].flow == FlowKind::CreateMaster && list[0].unavailable.is_none());
+        assert!(list[1..].iter().all(|a| a.unavailable.is_some()));
     }
 
     #[test]
