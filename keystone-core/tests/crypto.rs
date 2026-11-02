@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keystone_core::crypto::hash::sha384;
@@ -49,25 +50,52 @@ fn fr16_cancel_before_start_produces_nothing() {
     assert!(matches!(result, Err(CryptoError::Cancelled)));
 }
 
+/// Longest time a cancel may take to stop RSA 8,192 generation. OpenSSL stops within
+/// tens of milliseconds of the request (its next prime-search callback); a full
+/// RSA 8,192 generation takes many seconds, so a cancel that did not really abort
+/// generation cannot meet this bound.
+const CANCEL_LATENCY_LIMIT: Duration = Duration::from_secs(2);
+
 #[test]
 fn fr16_cancel_during_rsa_8192_generation_stops_it() {
     // Covers: FR-16 AC2, NFR-03
     let cancel = CancelFlag::new();
     let worker_cancel = cancel.clone();
-    let started = Instant::now();
-    let worker = std::thread::spawn(move || {
-        // Cancel from inside the progress callback after a few steps, which is the
-        // same as the GUI pressing Cancel while generation runs.
-        generate_rsa(8192, &worker_cancel, &|step| {
-            if step == 3 {
-                worker_cancel.cancel();
-            }
-        })
+    let cancelled_at: Mutex<Option<Instant>> = Mutex::new(None);
+    let late_progress = AtomicU64::new(0);
+    let (result, returned_at) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Cancel from inside the progress callback after a few steps, which is
+                // the same as the GUI pressing Cancel while generation runs.
+                let result = generate_rsa(8192, &worker_cancel, &|step| {
+                    if worker_cancel.is_cancelled() {
+                        // Progress after the cancelling step: OpenSSL went on.
+                        late_progress.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if step == 3 {
+                        *cancelled_at.lock().unwrap() = Some(Instant::now());
+                        worker_cancel.cancel();
+                    }
+                });
+                (result, Instant::now())
+            })
+            .join()
+            .expect("worker thread")
     });
-    let result = worker.join().expect("worker thread");
     assert!(matches!(result, Err(CryptoError::Cancelled)), "{result:?}");
     assert!(cancel.is_cancelled());
-    assert!(started.elapsed() < Duration::from_secs(60));
+    let cancelled_at = cancelled_at.lock().unwrap().expect("cancel was requested");
+    let latency = returned_at - cancelled_at;
+    assert!(
+        latency < CANCEL_LATENCY_LIMIT,
+        "generation went on for {latency:?} after Cancel"
+    );
+    assert_eq!(
+        late_progress.load(Ordering::SeqCst),
+        0,
+        "no progress is reported after the callback asked OpenSSL to stop"
+    );
     // The next generation on this thread is not affected by the aborted one.
     let key = generate_rsa(2048, &CancelFlag::new(), &|_| {}).expect("generation after cancel");
     assert_eq!(key.bits(), 2048);
@@ -75,14 +103,40 @@ fn fr16_cancel_during_rsa_8192_generation_stops_it() {
 
 #[test]
 fn fr16_cancel_from_another_thread() {
-    // Covers: FR-16 AC2
+    // Covers: FR-16 AC2, NFR-03
     let cancel = CancelFlag::new();
     let worker_cancel = cancel.clone();
-    let worker = std::thread::spawn(move || generate_rsa(8192, &worker_cancel, &|_| {}));
-    std::thread::sleep(Duration::from_millis(200));
+    let steps = Arc::new(AtomicU64::new(0));
+    let worker_steps = Arc::clone(&steps);
+    let worker = std::thread::spawn(move || {
+        let result = generate_rsa(8192, &worker_cancel, &|step| {
+            worker_steps.store(step, Ordering::SeqCst);
+        });
+        (result, Instant::now())
+    });
+    // Wait until generation is really running, then press Cancel.
+    let waiting = Instant::now();
+    while steps.load(Ordering::SeqCst) < 2 {
+        assert!(waiting.elapsed() < Duration::from_secs(30), "no progress");
+        std::thread::yield_now();
+    }
+    let cancelled_at = Instant::now();
     cancel.cancel();
-    let result = worker.join().expect("worker thread");
+    let steps_at_cancel = steps.load(Ordering::SeqCst);
+    let (result, returned_at) = worker.join().expect("worker thread");
     assert!(matches!(result, Err(CryptoError::Cancelled)), "{result:?}");
+    let latency = returned_at - cancelled_at;
+    assert!(
+        latency < CANCEL_LATENCY_LIMIT,
+        "generation went on for {latency:?} after Cancel"
+    );
+    // At most the one step already running when Cancel was pressed reports progress.
+    assert!(
+        steps.load(Ordering::SeqCst) <= steps_at_cancel + 1,
+        "progress after Cancel: {} -> {}",
+        steps_at_cancel,
+        steps.load(Ordering::SeqCst)
+    );
 }
 
 #[test]

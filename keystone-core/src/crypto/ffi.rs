@@ -418,6 +418,10 @@ pub(crate) struct KeygenTrace {
     /// Times OpenSSL called the callback.
     pub(crate) callbacks: u64,
     /// Times OpenSSL called the callback again after it had returned 0 ("abort").
+    /// OpenSSL 3's FIPS 186-4 prime search ignores the result of its per-candidate
+    /// callback and stops at the next callback whose result it checks, so a few such
+    /// calls are normal. Each is answered with 0 at once and never reaches the
+    /// progress callback.
     pub(crate) callbacks_after_abort: u64,
 }
 
@@ -906,5 +910,68 @@ mod tests {
         assert_eq!(region.as_slice()[0], 7);
         let large = LockedRegion::new(PAGE_SIZE + 1).expect("mlock");
         assert_eq!(large.capacity(), 2 * PAGE_SIZE);
+    }
+
+    /// OpenSSL calls back at most this many times after the callback returned 0:
+    /// it ignores the result of its per-candidate callback in the FIPS 186-4 prime
+    /// search and stops at the next callback whose result it checks (the next
+    /// Miller-Rabin round), normally within a few dozen cheap trial divisions.
+    const LATE_CALLBACK_LIMIT: u64 = 1_000;
+
+    #[test]
+    fn fr16_no_progress_is_reported_after_the_callback_returned_zero() {
+        // Covers: FR-16 AC2, NFR-03
+        // Cancel at the third progress step of an RSA 8,192 generation. From then on
+        // the callback answers 0 without calling the progress callback, and OpenSSL
+        // aborts at its next checked callback.
+        let cancel = AtomicBool::new(false);
+        let progress_after_cancel = AtomicU64::new(0);
+        let (result, trace) = generate_rsa_key_traced(8192, &cancel, &|step| {
+            if cancel.load(Ordering::SeqCst) {
+                progress_after_cancel.fetch_add(1, Ordering::SeqCst);
+            }
+            if step == 3 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        });
+        assert!(matches!(result, Err(CryptoError::Cancelled)));
+        assert_eq!(progress_after_cancel.load(Ordering::SeqCst), 0);
+        assert!(trace.callbacks >= 3, "{trace:?}");
+        assert_eq!(
+            trace.callbacks,
+            3 + trace.callbacks_after_abort,
+            "every call after the third was answered with 0: {trace:?}"
+        );
+        assert!(
+            trace.callbacks_after_abort < LATE_CALLBACK_LIMIT,
+            "{trace:?}"
+        );
+
+        // The same when the progress callback panics at its first step: it is
+        // called exactly once.
+        let progress_calls = AtomicU64::new(0);
+        let (result, trace) = generate_rsa_key_traced(2048, &AtomicBool::new(false), &|_| {
+            progress_calls.fetch_add(1, Ordering::SeqCst);
+            panic!("KEYSTONE TEST progress failure")
+        });
+        assert!(matches!(result, Err(CryptoError::OpenSsl(_))));
+        assert_eq!(progress_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            trace.callbacks,
+            1 + trace.callbacks_after_abort,
+            "{trace:?}"
+        );
+        assert!(
+            trace.callbacks_after_abort < LATE_CALLBACK_LIMIT,
+            "{trace:?}"
+        );
+
+        // Without a cancel, generation completes and every callback answered 1.
+        let (result, trace) = generate_rsa_key_traced(2048, &AtomicBool::new(false), &|_| {});
+        let key = result.expect("RSA 2048");
+        assert_eq!(key.bits(), 2048);
+        assert!(key.is_rsa());
+        assert!(trace.callbacks > 0);
+        assert_eq!(trace.callbacks_after_abort, 0);
     }
 }
