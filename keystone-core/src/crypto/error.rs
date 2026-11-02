@@ -55,6 +55,13 @@ pub enum CryptoError {
     /// A DER structure (certificate, CRL, key) could not be parsed.
     #[error("invalid DER encoding: {0}")]
     Der(String),
+    /// An encrypted key file uses other encryption parameters than the two sets
+    /// Keystone writes (SEC-08). Refused before any key derivation runs, so a file
+    /// with a raised KDF cost cannot hang decryption.
+    #[error(
+        "the key file uses encryption parameters Keystone does not write ({0}); Keystone reads only PBES2 with scrypt (N = 16384, r = 8, p = 1) or PBKDF2-HMAC-SHA256 (600,000 iterations), each with AES-256-CBC and a 16-byte salt and IV"
+    )]
+    UnsupportedKeyEncryption(String),
     /// A private key file is not encrypted. Keystone refuses plaintext keys (SEC-04).
     #[error("the key file is not encrypted; Keystone accepts only encrypted PKCS#8 keys")]
     NotEncrypted,
