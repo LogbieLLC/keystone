@@ -68,8 +68,10 @@ pub enum Blocker {
     },
     /// FR-17 AC2: the clock is earlier than the newest audit entry or the build date.
     ClockBlocked(Vec<ClockProblem>),
-    /// The confirmed time is earlier than the newest audit entry (it was confirmed
-    /// before a later entry was written); confirm the time again.
+    /// SEC-16, FR-17 AC1: the confirmed time is not later than the newest audit entry
+    /// (it was confirmed before a later entry was written, or it already served an
+    /// operation: every CA-changing operation needs its own confirmation); confirm the
+    /// time again.
     ClockConfirmationStale {
         /// The confirmed time.
         confirmed: Timestamp,
@@ -115,7 +117,7 @@ impl Blocker {
                 confirmed,
                 baseline,
             } => format!(
-                "the confirmed time {} is earlier than the newest audit entry ({}); confirm the date and time again",
+                "the confirmed time {} is not later than the newest audit entry ({}); every operation needs its own confirmation, so confirm the date and time again",
                 confirmed.get(),
                 baseline.get()
             ),
@@ -345,9 +347,32 @@ impl Ca {
     }
 
     /// FR-12 AC3: copies the missing operations to the behind drives after the operator
-    /// confirmed `plans` (from [`Blocker::DrivesBehind`]).
+    /// confirmed `plans` (from [`Blocker::DrivesBehind`]). `time` must be later than the
+    /// newest audit entry ([`Blocker::ClockConfirmationStale`]).
     pub fn repair_drives(&self, plans: &[RepairPlan], time: ConfirmedTime) -> Result<(), OpsError> {
+        self.check_confirmed_time(time)?;
         Ok(self.drives.repair(plans, time.get())?)
+    }
+
+    /// The blocker for a confirmed time that is not strictly later than the newest audit
+    /// entry on any drive (the clock baseline, which respects clock corrections), if any.
+    fn stale_confirmation(&self, time: ConfirmedTime) -> Option<Blocker> {
+        let baseline = self.clock_baseline()?;
+        (time.get() <= baseline).then_some(Blocker::ClockConfirmationStale {
+            confirmed: time.get(),
+            baseline,
+        })
+    }
+
+    /// SEC-16, FR-17 AC1: every CA-changing operation (signing, recovery, drive repair,
+    /// Replace a lost drive) needs a confirmed time strictly later than the newest audit
+    /// entry. Each of them writes an audit entry at its confirmed time, so one
+    /// confirmation can never serve two operations.
+    pub(crate) fn check_confirmed_time(&self, time: ConfirmedTime) -> Result<(), OpsError> {
+        match self.stale_confirmation(time) {
+            Some(blocker) => Err(OpsError::Blocked(vec![blocker])),
+            None => Ok(()),
+        }
     }
 
     /// The start checks (PRD section 6, FR-19 AC1): drives, audit logs, drive comparison,
@@ -485,7 +510,7 @@ impl Ca {
     }
 
     /// The signing gate: drives writable and identical, no interrupted operation, the
-    /// confirmed time not earlier than the newest audit entry. Returns the state.
+    /// confirmed time later than the newest audit entry (SEC-16). Returns the state.
     pub(crate) fn ready_for_signing(&self, time: ConfirmedTime) -> Result<CaState, OpsError> {
         let mut blockers = Vec::new();
         if let Err(StoreError::NotEnoughDrives { primaries, backups }) =
@@ -511,15 +536,7 @@ impl Ca {
             });
         }
         if blockers.is_empty() {
-            let log = self.drives.audit_log()?;
-            if let Some(baseline) = clock::baseline(log.entries())
-                && time.get() < baseline
-            {
-                blockers.push(Blocker::ClockConfirmationStale {
-                    confirmed: time.get(),
-                    baseline,
-                });
-            }
+            blockers.extend(self.stale_confirmation(time));
         }
         if !blockers.is_empty() {
             return Err(OpsError::Blocked(blockers));

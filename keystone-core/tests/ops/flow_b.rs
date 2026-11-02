@@ -385,7 +385,25 @@ fn flow_b_on_a_yubikey_that_was_already_hardened_asks_for_its_current_pin() {
         .unwrap_err();
     assert!(matches!(error, OpsError::Stopped { .. }), "{error}");
     assert!(error.to_string().contains("current PIN"));
-    let outcome = plan
+    // The stopped attempt was an operation of its own (cancelled and audited at `time`),
+    // so the retry needs a new confirmation (SEC-16).
+    assert!(matches!(
+        plan.execute(
+            &test.ca,
+            &mut token,
+            &current_secrets(Some(&master)),
+            &trust,
+            None,
+            &NoProgress,
+            &CancelFlag::new(),
+        ),
+        Err(OpsError::Blocked(_))
+    ));
+    let retry = test.tick();
+    let outcome = test
+        .ca
+        .plan_yubikey_setup(&mut token, &request, retry)
+        .unwrap()
         .execute(
             &test.ca,
             &mut token,

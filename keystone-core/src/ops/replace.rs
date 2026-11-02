@@ -49,8 +49,8 @@ impl Ca {
     /// Plans replacing a lost drive with the new, empty drive at `new_drive` (SEC-11).
     /// Refuses while the connected drives are behind, diverged or damaged, while an
     /// operation is interrupted, for a drive that is not empty (except an interrupted
-    /// copy of this CA, which is continued), and for a confirmed time earlier than the
-    /// newest audit entry. Nothing is written.
+    /// copy of this CA, which is continued), and for a confirmed time that is not later
+    /// than the newest audit entry (SEC-16). Nothing is written.
     pub fn plan_replace_drive(
         &self,
         new_drive: &Path,

@@ -261,8 +261,10 @@ fn fr22_ac4_flow_a_without_its_first_crl_needs_the_master_passphrase_to_finish()
     )
     .unwrap();
     assert_no_lost_record(&ca);
-    // Once the first CRL exists, Flow B can be planned.
-    ca.plan_yubikey_setup(&mut yubikey, &flow_b_request, time)
+    // Once the first CRL exists, Flow B can be planned (with its own confirmed time:
+    // the recovery used `time`, SEC-16).
+    let later = confirmed(&ca, now + time::Duration::minutes(2));
+    ca.plan_yubikey_setup(&mut yubikey, &flow_b_request, later)
         .expect("Flow B after the master's first CRL exists");
     let state = ca.state().unwrap();
     let master_cert = state.master().unwrap();

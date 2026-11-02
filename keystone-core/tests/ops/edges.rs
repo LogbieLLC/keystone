@@ -183,8 +183,10 @@ fn reviews_that_became_stale_and_impossible_requests_are_refused() {
             .is_err()
     );
     assert!(test.ca.plan_refresh_crl(unknown, time).is_err());
-    // A review made before another CRL was published is stale.
-    let stale = test.ca.plan_refresh_crl(main, time).unwrap();
+    // A review made before another CRL was published is stale (it carries a later
+    // confirmed time of its own, so only the review check can refuse it).
+    let own_time = test.tick();
+    let stale = test.ca.plan_refresh_crl(main, own_time).unwrap();
     assert_eq!(stale.issuer_serial(), main);
     assert!(!stale.needs_master());
     let pin = s(PIN);
@@ -222,6 +224,7 @@ fn reviews_that_became_stale_and_impossible_requests_are_refused() {
     let master = test.master_entered();
     let unlock = IssuerUnlock::Master(&master);
     assert!(!format!("{unlock:?}").contains(&test.master_words));
+    let time = test.tick();
     let error = test
         .ca
         .plan_refresh_crl(main, time)
@@ -416,4 +419,91 @@ fn a_journaled_certificate_that_no_longer_reads_blocks_every_signing() {
         .plan_yubikey_setup(&mut token, &request, time)
         .unwrap_err();
     assert!(matches!(error, OpsError::Damaged(_)), "{error}");
+}
+
+/// True when `result` was refused because its confirmed time is not later than the
+/// newest audit entry.
+fn stale<T: std::fmt::Debug>(result: Result<T, OpsError>) -> bool {
+    match result {
+        Err(OpsError::Blocked(blockers)) => blockers.iter().any(|b| {
+            matches!(b, Blocker::ClockConfirmationStale { .. })
+                && b.message().contains("confirm the date and time again")
+        }),
+        _ => false,
+    }
+}
+
+#[test]
+fn regression_one_confirmed_time_never_serves_two_operations() {
+    // Covers: SEC-16, FR-17 AC1
+    // Regression (final storage review, SEC-16): a ConfirmedTime equal to the newest
+    // audit entry passed the signing gate, so one confirmation signed two certificates.
+    let (mut test, mut token, _) = ca_with_main("T16", 91_160_001);
+    let time = test.tick();
+    let request = |label: &str, crl: Option<keystone_core::profile::CrlLocation>| {
+        SubIntermediateRequest::new(test_name(label), constrained(&["starnet"]), crl)
+    };
+    // Two reviews made with the same confirmation, before either is executed.
+    let first = test
+        .ca
+        .plan_sub_intermediate(&request("T16 a", Some(main_crl())), time)
+        .unwrap();
+    let second = test
+        .ca
+        .plan_sub_intermediate(&request("T16 b", Some(main_crl())), time)
+        .unwrap();
+    let (passphrase, _) = sub_passphrase();
+    testing::supply_generated_key(keys::rsa4096(1));
+    first
+        .execute(
+            &test.ca,
+            &mut token,
+            &s(PIN),
+            &passphrase,
+            None,
+            &NoProgress,
+            &CancelFlag::new(),
+        )
+        .expect("the first signing");
+    testing::reset();
+    let entries = test.ca.drive_set().audit_log().unwrap().len();
+    // The second signing with that confirmation is refused, at execute and at plan.
+    let (passphrase, _) = sub_passphrase();
+    assert!(stale(second.execute(
+        &test.ca,
+        &mut token,
+        &s(PIN),
+        &passphrase,
+        None,
+        &NoProgress,
+        &CancelFlag::new(),
+    )));
+    assert!(stale(
+        test.ca.plan_sub_intermediate(&request("T16 c", None), time)
+    ));
+    // So is every other CA-changing operation.
+    assert!(stale(test.ca.plan_refresh_crl(test.master.serial, time)));
+    let main = test
+        .ca
+        .state()
+        .unwrap()
+        .active_main(test.now)
+        .unwrap()
+        .serial();
+    assert!(stale(test.ca.plan_revoke(
+        main,
+        RevocationReason::Superseded,
+        time
+    )));
+    let new = test.drives.add_ca_drive();
+    assert!(stale(test.ca.plan_replace_drive(&new, time)));
+    assert!(stale(test.ca.repair_drives(&[], time)));
+    assert_eq!(
+        test.ca.drive_set().audit_log().unwrap().len(),
+        entries,
+        "nothing was written"
+    );
+    // A new confirmation (a later time) signs again.
+    run_flow_c(&mut test, &mut token, "T16 d", 2, false).expect("a new confirmation");
+    assert_consistent(&test.ca);
 }

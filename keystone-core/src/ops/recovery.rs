@@ -471,25 +471,10 @@ impl Ca {
         }
     }
 
+    /// SEC-16: a recovery action (or Replace a lost drive) needs a confirmed time later
+    /// than the newest audit entry on any drive, like every CA-changing operation.
     pub(super) fn check_recovery_time(&self, time: ConfirmedTime) -> Result<(), OpsError> {
-        let baseline = self
-            .drive_set()
-            .drives()
-            .iter()
-            .filter_map(|drive| drive.audit_log().ok())
-            .filter_map(|log| crate::clock::baseline(log.entries()))
-            .max();
-        if let Some(baseline) = baseline
-            && time.get() < baseline
-        {
-            return Err(OpsError::Blocked(vec![
-                super::Blocker::ClockConfirmationStale {
-                    confirmed: time.get(),
-                    baseline,
-                },
-            ]));
-        }
-        Ok(())
+        self.check_confirmed_time(time)
     }
 
     /// [`RecoveryAction::FinishWithoutYubikey`]: stages the journaled main-intermediate
