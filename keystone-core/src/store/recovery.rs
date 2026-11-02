@@ -36,6 +36,7 @@ use super::journal::{
     OutputFile, SignedObject, YubikeySetupStep,
 };
 use super::paths::{JOURNAL_DIR, OutputDir, OutputPath, STAGING_DIR};
+use super::record::{RecordChange, parse_record};
 use crate::crypto::hash::sha256;
 use crate::limits::MAX_OUTPUT_FILE_BYTES;
 use crate::model::{Serial, Sha256Digest, Timestamp};
@@ -487,23 +488,7 @@ impl DriveSet {
             return Ok(());
         }
         if !audited {
-            let mut draft = AuditDraft::new(
-                AuditAction::RecoveryFinish,
-                journal.subject(),
-                AuditResult::Success,
-            );
-            draft.operation = Some(operation);
-            if let Some(SignedObject::Certificate { record, .. }) = journal.signed().next() {
-                draft.serial = Some(record.serial);
-                draft.fingerprint = Some(record.fingerprint);
-            }
-            draft.details = Some(AuditDetails {
-                note: Some(format!(
-                    "finished from {} after an interruption",
-                    src.label()
-                )),
-                ..AuditDetails::default()
-            });
+            let draft = recovery_finish_draft(src, &journal, &outputs)?;
             self.append_audit(&[draft], time)?;
         }
         let entry = JournalEntry {
@@ -653,6 +638,94 @@ impl DriveSet {
         }
         Ok(has_entries)
     }
+}
+
+/// The `recovery_finish` audit entry of an operation finished from `src` (FR-14 AC1,
+/// FR-21 AC6, review finding 8): the original action, the subject, the first serial and
+/// fingerprint, the issuer, the permitted names, the revocation reason, the CRL number and
+/// every serial the operation signed or changed in the issuance record.
+fn recovery_finish_draft(
+    src: &CaDrive,
+    journal: &OperationJournal,
+    outputs: &[OutputFile],
+) -> Result<AuditDraft, StoreError> {
+    let operation = journal.operation();
+    let mut draft = AuditDraft::new(
+        AuditAction::RecoveryFinish,
+        journal.subject(),
+        AuditResult::Success,
+    );
+    draft.operation = Some(operation);
+    let mut details = AuditDetails {
+        original_action: Some(journal.kind().into()),
+        note: Some(format!(
+            "finished from {} after an interruption",
+            src.label()
+        )),
+        ..AuditDetails::default()
+    };
+    let mut serials: Vec<Serial> = Vec::new();
+    let add = |serial: Serial, serials: &mut Vec<Serial>| {
+        if !serials.contains(&serial) {
+            serials.push(serial);
+        }
+    };
+    for object in journal.signed() {
+        match object {
+            SignedObject::Certificate { record, .. } => {
+                add(record.serial, &mut serials);
+                if draft.fingerprint.is_none() {
+                    draft.fingerprint = Some(record.fingerprint);
+                    details.issuer_serial = Some(record.issuer_serial);
+                    if record.level == crate::model::CaLevel::SubIntermediate {
+                        details.name_constraints = Some(record.name_constraints);
+                        details.permitted_dns = Some(record.permitted_dns.clone());
+                        details.permitted_ip = Some(record.permitted_ip.clone());
+                    }
+                }
+            }
+            SignedObject::Crl(crl) => {
+                details.crl_number = Some(crl.crl_number);
+                details.issuer_serial.get_or_insert(crl.issuer_serial);
+            }
+        }
+    }
+    // The issuance-record update lists every revocation (and every sub-intermediate cut
+    // off by it); it is one of the verified outputs on `src`.
+    for output in outputs.iter().filter(|o| o.path.dir() == OutputDir::Record) {
+        let (dir, name) = (output.path.dir(), output.path.name());
+        let data = match src.read_at(dir.name(), name, MAX_OUTPUT_FILE_BYTES)? {
+            Some(data) if sha256(&data) == output.sha256 => Some(data),
+            _ => src
+                .read_at(&staging_rel(operation, dir), name, MAX_OUTPUT_FILE_BYTES)?
+                .filter(|data| sha256(data) == output.sha256),
+        };
+        let Some(data) = data else { continue };
+        let update = parse_record(&data).map_err(|source| StoreError::Parse {
+            path: src.keystone().child(&output.path.to_string()),
+            source,
+        })?;
+        for change in &update.changes {
+            match change {
+                RecordChange::Issued { certificate } => add(certificate.serial, &mut serials),
+                RecordChange::Revoked { serial, reason, .. } => {
+                    add(*serial, &mut serials);
+                    details.revocation_reason.get_or_insert(*reason);
+                }
+                RecordChange::RevokedByAncestor { serial, .. } => add(*serial, &mut serials),
+            }
+        }
+    }
+    draft.serial = serials
+        .first()
+        .copied()
+        .or_else(|| journal.planned_serials().first().copied());
+    if !serials.is_empty() {
+        serials.truncate(super::audit::MAX_AUDIT_SERIALS);
+        details.serials = Some(serials);
+    }
+    draft.details = Some(details);
+    Ok(draft)
 }
 
 /// Puts one output in place on `drive`: already there and verified, moved from this

@@ -363,6 +363,129 @@ fn fr22_ac6_an_operation_interrupted_at_every_step_recovers_without_losing_a_rec
     }
 }
 
+#[test]
+fn regression_the_recovery_finish_entry_keeps_the_action_names_and_every_serial() {
+    // Covers: FR-14 AC1, FR-21 AC6, FR-22 AC4
+    // Regression (review finding 8): the entry written when recovery finished an
+    // operation lost its original action, the permitted names and every serial but the
+    // first certificate's.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    crate::store::testutil::issue_master(&set, 1, ts(1));
+    // A sub-intermediate with name constraints, staged and sealed, then interrupted.
+    let sub = cert(serial(3), CaLevel::SubIntermediate, serial(1));
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateSubIntermediate,
+            &sub.subject.display(),
+            &[serial(3)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.record_signed(
+        SignedObject::Certificate {
+            record: Box::new(sub.clone()),
+            pem: cert_pem(serial(3)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    let update = RecordUpdate::new(
+        id,
+        vec![RecordChange::Issued {
+            certificate: Box::new(sub.clone()),
+        }],
+    );
+    op.stage(
+        OutputPath::new(OutputDir::Certs, "sub.crt").expect("path"),
+        cert_pem(serial(3)).as_bytes(),
+    )
+    .expect("stage");
+    op.stage(update.output_path(), &update.to_bytes())
+        .expect("stage");
+    op.seal_staging(ts(5)).expect("seal");
+    drop(op);
+    let set = open_all(&drives);
+    set.finish_operation(id, 0, ts(6)).expect("finish");
+    let log = set.audit_log().expect("log");
+    let entry = log.entries().last().expect("entry");
+    assert_eq!(entry.action, AuditAction::RecoveryFinish);
+    assert_eq!(entry.operation, Some(id));
+    assert_eq!(entry.serial, Some(serial(3)));
+    assert_eq!(entry.fingerprint, Some(sub.fingerprint));
+    assert_eq!(entry.result, AuditResult::Success);
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(
+        details.original_action,
+        Some(AuditAction::CreateSubIntermediate)
+    );
+    assert_eq!(details.issuer_serial, Some(serial(1)));
+    assert_eq!(details.name_constraints, Some(true));
+    assert_eq!(details.permitted_dns, Some(vec!["starnet".to_string()]));
+    assert_eq!(details.serials, Some(vec![serial(3)]));
+
+    // A revocation that also marks two children: every serial and the reason are kept.
+    let main = cert(serial(4), CaLevel::MainIntermediate, serial(1));
+    let child_a = cert(serial(5), CaLevel::SubIntermediate, serial(4));
+    let child_b = cert(serial(6), CaLevel::SubIntermediate, serial(4));
+    for record in [main, child_a, child_b] {
+        let kind = if record.level == CaLevel::MainIntermediate {
+            OperationKind::SetupYubikey
+        } else {
+            OperationKind::CreateSubIntermediate
+        };
+        crate::store::testutil::issue(&set, kind, record, ts(7));
+    }
+    let mut op = set
+        .begin_operation(
+            OperationKind::ReplaceYubikey,
+            "CN=KEYSTONE TEST main",
+            &[],
+            ts(8),
+        )
+        .expect("begin");
+    let id = op.id();
+    let update = RecordUpdate::new(
+        id,
+        vec![
+            RecordChange::Revoked {
+                serial: serial(4),
+                date: ts(8),
+                reason: crate::model::RevocationReason::KeyCompromise,
+            },
+            RecordChange::RevokedByAncestor {
+                serial: serial(5),
+                ancestor: serial(4),
+                date: ts(8),
+            },
+            RecordChange::RevokedByAncestor {
+                serial: serial(6),
+                ancestor: serial(4),
+                date: ts(8),
+            },
+        ],
+    );
+    op.stage(update.output_path(), &update.to_bytes())
+        .expect("stage");
+    op.seal_staging(ts(8)).expect("seal");
+    drop(op);
+    let set = open_all(&drives);
+    set.finish_operation(id, 0, ts(9)).expect("finish");
+    let log = set.audit_log().expect("log");
+    let entry = log.entries().last().expect("entry");
+    assert_eq!(entry.action, AuditAction::RecoveryFinish);
+    assert_eq!(entry.serial, Some(serial(4)));
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(details.original_action, Some(AuditAction::ReplaceYubikey));
+    assert_eq!(
+        details.revocation_reason,
+        Some(crate::model::RevocationReason::KeyCompromise)
+    );
+    assert_eq!(details.serials, Some(vec![serial(4), serial(5), serial(6)]));
+    assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+}
+
 /// Every drive's journals parse, no operation is pending, the drives agree and a new
 /// operation can begin.
 fn assert_recovered(drives: &TestDrives, context: &str) {

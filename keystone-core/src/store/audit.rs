@@ -46,6 +46,9 @@ pub const GENESIS_PREV: Sha256Digest = Sha256Digest([0; 32]);
 /// Longest subject or note text accepted in an audit entry.
 pub const MAX_AUDIT_TEXT: usize = 4096;
 
+/// Most serials listed in one audit entry's details.
+pub const MAX_AUDIT_SERIALS: usize = 256;
+
 /// What was done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +141,13 @@ pub struct AuditDetails {
     /// Clock correction (FR-17 AC3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_correction: Option<ClockCorrectionDetails>,
+    /// The action of the operation a `recovery_finish` entry finished (FR-14 AC1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_action: Option<AuditAction>,
+    /// Every serial the entry concerns when there is more than the entry's `serial`
+    /// (for example a revoked main intermediate and the sub-intermediates it cut off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serials: Option<Vec<Serial>>,
     /// Free text (for example which drive was repaired from which).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -200,6 +210,13 @@ fn validate_details(details: &AuditDetails) -> Result<(), String> {
         .is_some_and(|n| n.len() > MAX_AUDIT_TEXT)
     {
         return Err("note is too long".to_string());
+    }
+    if details
+        .serials
+        .as_ref()
+        .is_some_and(|serials| serials.len() > MAX_AUDIT_SERIALS)
+    {
+        return Err("too many serials".to_string());
     }
     if let Some(correction) = &details.clock_correction {
         check_timestamp(correction.previous_newest, "previous_newest")
