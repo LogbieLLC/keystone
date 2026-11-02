@@ -1,0 +1,31 @@
+{
+  "format": 1,
+  "operation": 2,
+  "step": 10,
+  "time": "2026-11-02T12:46:21Z",
+  "event": {
+    "completed": {
+      "outputs": [
+        {
+          "path": "certs/main-intermediate-58e34caceba0d1bc.crt",
+          "sha256": "5d54f3f9c47a2039857cb819ccec5a6da9543922742581c16fdaba2035904e07",
+          "size": 2752
+        },
+        {
+          "path": "crls/main-intermediate-58e34caceba0d1bc-crl-000001.crl",
+          "sha256": "daac3e500b4e0e1db3c4fc7d13aab39bc72d5b8f82249cba56b44f01f240505f",
+          "size": 712
+        },
+        {
+          "path": "record/op-000002.json",
+          "sha256": "8f55e2a9495681da41ec175e7371ce2a03182c349b78dc7001fc128341b048f1",
+          "size": 2493
+        }
+      ],
+      "audit": {
+        "seq": 3,
+        "sha256": "5a6e96b52114ced7cc7d059b1b8d3f17ea54324f13dec045b74838b73112a739"
+      }
+    }
+  }
+}

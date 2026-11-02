@@ -1,0 +1,37 @@
+{
+  "format": 1,
+  "operation": 2,
+  "step": 6,
+  "time": "2026-11-02T12:46:21Z",
+  "event": {
+    "signed": {
+      "object": {
+        "certificate": {
+          "record": {
+            "serial": "58e34caceba0d1bcef1498b7c65ce2c250ff5a5a",
+            "level": "main_intermediate",
+            "subject": {
+              "common_name": "KEYSTONE TEST Samples Main",
+              "organization": "KEYSTONE TEST",
+              "country": "US"
+            },
+            "issuer_serial": "3cceae720ca502f7c869b5cf665f7fd0f62d4486",
+            "issuer": {
+              "common_name": "KEYSTONE TEST Samples Master",
+              "organization": "KEYSTONE TEST",
+              "country": "US"
+            },
+            "not_before": "2026-11-02T12:46:21Z",
+            "not_after": "2036-11-02T12:46:21Z",
+            "fingerprint": "a6f5aae223eba5b2fa5234ae79ab14ef7da1042b17268fbc803ce081dea88e2e",
+            "name_constraints": false,
+            "permitted_dns": [],
+            "permitted_ip": [],
+            "attestation_pem": "-----BEGIN CERTIFICATE-----\nMIIELzCCAxegAwIBAgIUIIPgKvX0TT2Jh6324YS5NtROGV4wDQYJKoZIhvcNAQEM\nBQAwLzEtMCsGA1UEAwwkS0VZU1RPTkUgVEVTVCBZdWJpY28gUElWIEF0dGVzdGF0\naW9uMCAXDTI2MTAwMzEyNDUyMVoYDzIwNTYxMDI1MTI0NTIxWjAzMTEwLwYDVQQD\nDChLRVlTVE9ORSBURVNUIFl1YmlLZXkgUElWIEF0dGVzdGF0aW9uIDljMIICIjAN\nBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEArt/AlZ+810kMhkQ7spjJKY5oBtrB\n1twPy93onWscsTfuvqtuZxqwEWpvztDfXmFJZS5NraLKNTcL/whmIm0I18tJK5lZ\nteXsDhnO22iHAVF4CCZcqZqOs/rGNDsk0R63h/mfnQl8hkBjfdAwLD98rPohILHl\nl4IJffPRdN2sqJISBiOhhwWUcr5ek4DDiUfKQNVczf3SCjeOCgLK/4v9ULQ4yunD\n9K0N1yhu6AL4QmaBl0b5D7uNxiNox3EBsDGgacSOc93RjDy29WepMX8yeTKljNY1\nuIo9sZl6rEgdmR4Tu/UT6sdklBLfM4jtACo6uWSHFNyTf924znh438XkZkVn2KJ1\nMiOfrp3p4cQHM/psAp+GeFAAD51CV5D7l/Ub0Fh7aIC25awGeHZNSSnKVFYTu4cK\nQadIhaJ7aabnM4x7GTZBYVTnECWtUDOYekzmjvZInvt4o3ARB/nzdR1adsBIFbjf\n9k4W0CciB75pizcMJy/0erVwoHiVTXHwyN4v/1jFQsOwxW7QZ0432LKT53z8xrHw\nIAbseuBnMPkskJKImEJ0aiPGKTRMMn8KexS5JB1VpahXmkVWHVSd6Uz60wAt0yoe\nVuziZHDOkXsS4gpvqrSZCGSTSxJq42AuvIU8mrhnboui2q6h08UmnsZoSXVLdNt3\n21HjwuB2Sq6urQ0CAwEAAaM9MDswEQYKKwYBBAGCxAoDAwQDBQcEMBQGCisGAQQB\ngsQKAwcEBgIEAcnDgTAQBgorBgEEAYLECgMIBAIDAjANBgkqhkiG9w0BAQwFAAOC\nAQEAbcb/aYTSVeTDQfm5omRjSuJapb4v0WEzRquXPa2uOhRU9pROWdMH0jCcpxph\n5Ar1Go0n3txA2LZHSV/jcXzAZjbxZBsj5FPOuh0DjBMpQbRtd65j4RoTi/30PgoA\n/V1rgph+pzGw0fUzWKAba0KYCj1h7zqn1Z/aDX+429KJEK69Jj8jtDpxBz1JF3EA\nPhy9mhnzsQUtcrsBKeiU7xp+GnCBo8udRBYVtMa9RwkLKNdBZSTO8wUagKMmjEnl\nNZGDRArKH4ySLMmuWp03xYrm/i2EVSsLbZkvLjDDzkb/FpmLAIHDNxHD8rOmpSM8\nHv3i5TOcQTeXmv4t6EtAkGrAnA==\n-----END CERTIFICATE-----\n"
+          },
+          "pem": "-----BEGIN CERTIFICATE-----\nMIIHwjCCA6qgAwIBAgIUWONMrOug0bzvFJi3xlziwlD/WlowDQYJKoZIhvcNAQEM\nBQAwTDELMAkGA1UEBhMCVVMxFjAUBgNVBAoMDUtFWVNUT05FIFRFU1QxJTAjBgNV\nBAMMHEtFWVNUT05FIFRFU1QgU2FtcGxlcyBNYXN0ZXIwHhcNMjYxMTAyMTI0NjIx\nWhcNMzYxMTAyMTI0NjIxWjBKMQswCQYDVQQGEwJVUzEWMBQGA1UECgwNS0VZU1RP\nTkUgVEVTVDEjMCEGA1UEAwwaS0VZU1RPTkUgVEVTVCBTYW1wbGVzIE1haW4wggIi\nMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu38CVn7zXSQyGRDuymMkpjmgG\n2sHW3A/L3eidaxyxN+6+q25nGrARam/O0N9eYUllLk2toso1Nwv/CGYibQjXy0kr\nmVm15ewOGc7baIcBUXgIJlypmo6z+sY0OyTRHreH+Z+dCXyGQGN90DAsP3ys+iEg\nseWXggl989F03ayokhIGI6GHBZRyvl6TgMOJR8pA1VzN/dIKN44KAsr/i/1QtDjK\n6cP0rQ3XKG7oAvhCZoGXRvkPu43GI2jHcQGwMaBpxI5z3dGMPLb1Z6kxfzJ5MqWM\n1jW4ij2xmXqsSB2ZHhO79RPqx2SUEt8ziO0AKjq5ZIcU3JN/3bjOeHjfxeRmRWfY\nonUyI5+unenhxAcz+mwCn4Z4UAAPnUJXkPuX9RvQWHtogLblrAZ4dk1JKcpUVhO7\nhwpBp0iFontppuczjHsZNkFhVOcQJa1QM5h6TOaO9kie+3ijcBEH+fN1HVp2wEgV\nuN/2ThbQJyIHvmmLNwwnL/R6tXCgeJVNcfDI3i//WMVCw7DFbtBnTjfYspPnfPzG\nsfAgBux64Gcw+SyQkoiYQnRqI8YpNEwyfwp7FLkkHVWlqFeaRVYdVJ3pTPrTAC3T\nKh5W7OJkcM6RexLiCm+qtJkIZJNLEmrjYC68hTyauGdui6LarqHTxSaexmhJdUt0\n23fbUePC4HZKrq6tDQIDAQABo4GdMIGaMBIGA1UdEwEB/wQIMAYBAf8CAQEwDgYD\nVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBTcD8gPJdccQxITze/Ilv3UIHu82jAfBgNV\nHSMEGDAWgBRvbUd0Cxx/EkUwxdw8cEtlyNqcATA0BgNVHR8ELTArMCmgJ6AlhiNo\ndHRwOi8vY3JsLmtleXN0b25lLnRlc3QvbWFzdGVyLmNybDANBgkqhkiG9w0BAQwF\nAAOCBAEAYZiSOkeeo1SHlHSNeBhS/E74+zvwwht/PVOOndnL72mgLG8y3HNc2R13\nuailbNxHLolelWk5iBqLIA/s8dQGfZrVOPPRJfl8AsHUJ84qNG0MtNcwpgNVIBuL\nH/CAZ+cr/jAWPfpIJ9ebJhocAKymBPIz32Qxs+l1PrfGvFm5gYMEZKjIBrrnAqo/\nmBAgEXChxIMZ92SH86d8Ui2qfpPt1ZDcf1rn9+s8K4vdQ+30eXSTr6U9m34sf1fo\nonWaGbCZL45QR4VFok+p5oo2b7oTRf6fhWCJOf0RYhoQzPw1Y2KPm8Yrraqtu4Qg\nL5wXpB8fNBdB0eV3scWtEtvI1SPm4+L2Ku1lTGVKhqxm3mAyLFfarIlAVhHPB8vq\nDWTLH+cgaivd2S2gP64ym0N7VHLBfduUfQxnPUAvBhZTkJQNs6gytTa4Z0ZjkKwh\nbwaqcLWcOBYyFFNptdhbTPQRrw09fHDGAmgTiI/Koote2K2V5nJCqaeTGlQSPhMU\n25N7m9iVqGJ8CTbt5+dGDsDWkotcLMLGdHUhXASrI66yMrBE40OKXb59ZngqQZ+5\nzCTNhHbsuKBCzGd4ObDuLWP0MQjcTwTgyk+e5xAFKUXkOFwb99P9Y2+GSPcdOMKZ\nbGxp6VhR3dgFiwWMTdXJo9xfK7sOseS0X9VPcrsvfPKeDBnc+f7MDBF/XYQv7z5O\nbUDYNAw/Yb1PvfhKPUmKuDQ2IQEakVLIgaolSyoAad6FovKtkjndx2BpEJD/E004\nHJxE4R8o+VEH8Ntn0NVIm2OANLGN+yYZ9uWcrliPl73UTqwBYwyMcSEx8K7wWIT7\nf+5/O4ENVdfoM1V8T8PXjBoCd8wfr9dd20zithCq/zi4jSUFHmajjnOG1vbYAqcr\nJTIUvAEWIALg3ICpBsFVcXIzOgtQq74R15h54hZjPjA5xFgP7kwiCUMw5pozoKES\nRsacEQQClQaFGvku1s6UVBZyyHLjgYFYsh9ZHRQkYkjp1fyzUrNQG29xL5gQWc26\nvirPc30Cv+z7lfp8sctM+Nei7RB+MPL8spQDxGnOs1hic7wYioNWkWjCzof1CRWu\ngDRfYB00BhiTMWXtmBdHI9G6HMef53MmDsFEv96YE79pmcQfwwNuzySq34V5KwLl\nolWgpAymbGB49wcQSQrIDhnMyrb4+uWi6c44SLRD1JJWgpH6yzat5kdixUWsdib0\nzZD2CmAMgZE/Ri8l6CgGqnC6e8crJZKp3VgBfC2LV39ECm63zK8NGgNj4BT7YeAv\nU8LM7RtF1US3Zb+2k96FUEPkDoCeIODXI+1dpkBL6NLfbcL58J/j1VtdjQ17KSAl\nie/NhelZVwd4C7sqzdieZyLAPWHA9g==\n-----END CERTIFICATE-----\n"
+        }
+      }
+    }
+  }
+}

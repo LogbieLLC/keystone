@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "operation": 2,
+  "step": 2,
+  "time": "2026-11-02T12:46:21Z",
+  "event": {
+    "yubikey_step": {
+      "step": "pin_changed",
+      "device_serial": 30000001
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "format": 1,
+  "operation": 3,
+  "changes": [
+    {
+      "issued": {
+        "certificate": {
+          "serial": "19be14a215d2559d4c7127b0f06ba1b9f4b4a3dd",
+          "level": "sub_intermediate",
+          "subject": {
+            "common_name": "KEYSTONE TEST Samples Sub Constrained",
+            "organization": "KEYSTONE TEST",
+            "country": "US"
+          },
+          "issuer_serial": "58e34caceba0d1bcef1498b7c65ce2c250ff5a5a",
+          "issuer": {
+            "common_name": "KEYSTONE TEST Samples Main",
+            "organization": "KEYSTONE TEST",
+            "country": "US"
+          },
+          "not_before": "2026-11-02T12:47:21Z",
+          "not_after": "2031-11-02T12:47:21Z",
+          "fingerprint": "70536392fe3e348ff876b6bfc0beef215c5f60b916fb864507e12581b1f59dc8",
+          "name_constraints": true,
+          "permitted_dns": [
+            "starnet"
+          ],
+          "permitted_ip": [],
+          "attestation_pem": null
+        }
+      }
+    }
+  ]
+}

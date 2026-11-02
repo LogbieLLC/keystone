@@ -1,0 +1,20 @@
+{
+  "format": 1,
+  "operation": 5,
+  "step": 2,
+  "time": "2026-11-02T12:49:21Z",
+  "event": {
+    "signed": {
+      "object": {
+        "crl": {
+          "issuer_serial": "58e34caceba0d1bcef1498b7c65ce2c250ff5a5a",
+          "crl_number": 2,
+          "this_update": "2026-11-02T12:49:21Z",
+          "next_update": "2027-01-31T12:49:21Z",
+          "sha256": "8b6e3ff7e5d5ede98cea65039dd271f5b8476ca6844376f27f95a96c6f352b4e",
+          "pem": "-----BEGIN X509 CRL-----\nMIIC+zCB5AIBATANBgkqhkiG9w0BAQwFADBKMQswCQYDVQQGEwJVUzEWMBQGA1UE\nCgwNS0VZU1RPTkUgVEVTVDEjMCEGA1UEAwwaS0VZU1RPTkUgVEVTVCBTYW1wbGVz\nIE1haW4XDTI2MTEwMjEyNDkyMVoXDTI3MDEzMTEyNDkyMVowNTAzAhRy67yaZKRR\nyvuPiNpFVL18wHH5ZRcNMjYxMTAyMTI0OTIxWjAMMAoGA1UdFQQDCgEBoC8wLTAf\nBgNVHSMEGDAWgBTcD8gPJdccQxITze/Ilv3UIHu82jAKBgNVHRQEAwIBAjANBgkq\nhkiG9w0BAQwFAAOCAgEAQ4wyVzbO5owdZy75TJvqKrXAXdLGDSNs/MY82SOD/wpG\n8XnMAXiQputknPiES1KcjrMGSAkFp32FltTxJERc4xjhkzl0qU6kwERocpUk83W3\npfLefj3rWa8Lg7jQwzvzLOmrjE2/1XJhvSRZI8/xK3q95HUpeUdsdlbG3hWuH4S0\n7KSQrhn0tEKXddUVIr5X1D5X2aEH8E/ZE11gJtZCQmk6YrGUHuc8+1nZY47CPME2\n3wYikf460UQIegUMLmL7IKxJn9JbqhswtWiJnF2h8C7+n0b4uenwREnuC+4I2zN2\nTgcVTTBZKnMEj4ymJTaedj0x4fYi3hIds53WyAJ75ECo5HHN7EhVp6S1NR14RN0Z\n410sZCtv+LfxiOBk3IoyvGaEWb6vyHB+HjcpGNcZSb+cCFi+f34TG5tPwVLHqf4q\nrqvOO+MpW7VYNCHioL09Qjhhsi/NawfBlxoRNydqxw1IpVs9tM9oJ5NKL++oasG9\nd2PLezUqaCQT5OuomI1mYzaSEgR8j9ARBZupyIXu2iDWn9CeHRjhmnv9IYiJ1pYd\n8JOPTw041KA9sqEfyW0ZkVQD7tZjVfk9uGwJLIqA8BWbsQsN4PqI8Q6+zEveHj5S\n8k4YLKqIyVZyFHSChtPqonCDDnqVYmFXlPQuOHh1cu7Ty4J9nDUwIwA8D9MmnIc=\n-----END X509 CRL-----\n"
+        }
+      }
+    }
+  }
+}

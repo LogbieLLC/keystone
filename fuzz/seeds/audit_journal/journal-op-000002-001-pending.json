@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "operation": 2,
+  "step": 1,
+  "time": "2026-11-02T12:46:21Z",
+  "event": {
+    "pending": {
+      "kind": "setup_yubikey",
+      "subject": "CN=KEYSTONE TEST Samples Main, O=KEYSTONE TEST, C=US",
+      "planned_serials": [
+        "58e34caceba0d1bcef1498b7c65ce2c250ff5a5a"
+      ]
+    }
+  }
+}
