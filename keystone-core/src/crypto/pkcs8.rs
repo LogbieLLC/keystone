@@ -15,6 +15,14 @@
 //! Every encryption is checked by decrypting the result with the same passphrase and
 //! comparing the public key before the PEM is returned, so an unreadable key file is
 //! never written.
+//!
+//! The fuzzing entry point `fuzz_decode_private_key_info` (plaintext `PrivateKeyInfo`
+//! to key, SEC-08) is compiled only by `cargo fuzz` (`--cfg fuzzing`). Every other
+//! build, the production build included, does not have it:
+//!
+//! ```compile_fail
+//! let _ = keystone_core::crypto::pkcs8::fuzz_decode_private_key_info(&[]);
+//! ```
 #![forbid(unsafe_code)]
 
 use x509_cert::der::oid::ObjectIdentifier;
@@ -132,6 +140,16 @@ pub fn decrypt_key_pem(
     // (SEC-07); see `ffi::decrypt_pkcs8_der`.
     let key = ffi::decrypt_pkcs8_der(&der, passphrase.as_secret_bytes().expose())?;
     RsaPrivateKey::from_handle(key)
+}
+
+/// Fuzzing entry point for the `pkcs8_key_decode` target (SEC-08): decodes a
+/// plaintext `PrivateKeyInfo` exactly as [`decrypt_key_pem`] does after decryption.
+///
+/// It exists only in `cargo fuzz` builds (`--cfg fuzzing`) without the `production`
+/// feature; see the module documentation for the check that other builds lack it.
+#[cfg(all(fuzzing, not(feature = "production")))]
+pub fn fuzz_decode_private_key_info(der: &[u8]) -> Result<RsaPrivateKey, CryptoError> {
+    RsaPrivateKey::from_handle(ffi::decode_private_key_info_for_fuzzing(der)?)
 }
 
 /// PBES2 (PKCS #5 v2.0, RFC 8018).

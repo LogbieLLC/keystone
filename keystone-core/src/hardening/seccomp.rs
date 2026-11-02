@@ -21,6 +21,22 @@
 //! refused by [`super::sockets`]; a socket passed over an AF_UNIX connection
 //! (`SCM_RIGHTS`) cannot be filtered without breaking D-Bus and PC/SC, and is covered by
 //! the strace E2E run (SEC-03) and FR-01's refusal to run with an interface up.
+//!
+//! Residual risk: local services reached over AF_UNIX. The filter sees only this
+//! process's own system calls, not what a local service does on its behalf. Code
+//! running inside Keystone could ask a service on the session or system bus to start
+//! a process that has no filter or to do network I/O for it, for example:
+//! - systemd (`systemd-run --user`, D-Bus `org.freedesktop.systemd1`) starting a
+//!   transient unit;
+//! - the desktop portal (`org.freedesktop.portal.OpenURI`) opening a URL in a browser;
+//! - systemd-resolved (varlink or D-Bus) resolving names.
+//!
+//! Blocking AF_UNIX would break D-Bus, Wayland and PC/SC, so the filter cannot close
+//! this. It needs code already running inside Keystone (a malicious dependency, T-01,
+//! or an exploited parser bug, T-08). The primary control is FR-01: Keystone refuses to
+//! start while any network interface other than loopback is up, on a laptop that is
+//! air-gapped (Assumption 20), so even such a process has no network to reach.
+//! SEC-01's dependency review and SEC-08's strict parsing make the first step harder.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;

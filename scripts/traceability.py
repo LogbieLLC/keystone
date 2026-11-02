@@ -8,6 +8,12 @@ PRD must either
   * be listed in docs/traceability.toml with a category and a written reason
     (blocked, release-checklist, ci-job, not-applicable).
 
+Test code is (see `test_code`): Rust files in a crate's `tests/` folder, Rust
+`#[cfg(test)]` modules (inline, or a file declared as `#[cfg(test)] mod tests;`),
+fuzz targets, Python `test_*.py` files, and Go or shell helpers in a `tests/` folder
+that a counted Rust test names. A `Covers:` comment anywhere else (application code,
+examples, scripts, a stray file) is not counted; it is listed with --report.
+
 Exit code 0 when every requirement is accounted for, 1 otherwise. A BLOCKED item is
 reported loudly; it is never counted as passing (TEST-10).
 
@@ -76,23 +82,191 @@ def parse_covers(text: str) -> set[str]:
     return found
 
 
-def collected_covers() -> dict[str, list[str]]:
-    covers: dict[str, list[str]] = {}
+COVERS = re.compile(r"(?://|#)\s*Covers:\s*(.+)$")
+# `#[cfg(test)]` or `#[cfg(all(..., test, ...))]`: compiled only for tests.
+# (`cfg(any(test, ...))` is not: that code is also part of a normal build.)
+CFG_TEST = re.compile(r"#\[cfg\((?:test|all\([^\]]*\btest\b[^\]]*\))\)\]")
+MOD_DECL = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*([;{])")
+
+
+PLAIN = re.compile(r"[^/\"'rbc]+")
+RAW_STRING = re.compile(r'[bc]?r(#*)"')
+CHAR_LITERAL = re.compile(r"b?'(?:\\(?:u\{[0-9A-Fa-f_]*\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'")
+
+
+def blank_rust(text: str) -> str:
+    """`text` with comments, string literals and character literals replaced by
+    spaces (newlines kept), so braces and attributes can be read reliably.
+    Lifetimes and labels ('a) are code and stay."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        plain = PLAIN.match(text, i)
+        if plain:
+            out.append(plain.group())
+            i = plain.end()
+            continue
+        prev = text[i - 1] if i else " "
+        ident_before = prev.isalnum() or prev == "_"
+        raw = None if ident_before else RAW_STRING.match(text, i)
+        char = CHAR_LITERAL.match(text, i)
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+        elif text.startswith("/*", i):
+            depth, end = 1, i + 2
+            while end < n and depth:
+                if text.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif text.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+        elif raw:
+            close = '"' + raw.group(1)
+            end = text.find(close, raw.end())
+            end = n if end < 0 else end + len(close)
+        elif text[i] == '"' or (
+            not ident_before and text[i] in "bc" and text.startswith('"', i + 1)
+        ):
+            end = text.index('"', i) + 1
+            while end < n and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+            end = min(end + 1, n)
+        elif char and not (text[i] == "b" and ident_before):
+            end = char.end()
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append(re.sub(r"[^\n]", " ", text[i:end]))
+        i = end
+    return "".join(out)
+
+
+def module_dir(path: Path) -> Path:
+    """Directory of the files of the child modules declared in `path`."""
+    if path.name in {"mod.rs", "lib.rs", "main.rs"}:
+        return path.parent
+    return path.parent / path.stem
+
+
+def cfg_test_parts(path: Path) -> tuple[set[int], list[Path]]:
+    """Lines of `path` inside `#[cfg(test)] mod name { ... }` blocks, and the files of
+    `#[cfg(test)] mod name;` declarations."""
+    code = blank_rust(path.read_text(encoding="utf-8"))
+    lines = code.splitlines()
+    test_lines: set[int] = set()
+    test_files: list[Path] = []
+    pending = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if CFG_TEST.fullmatch(stripped):
+            pending = True
+            continue
+        if not pending or not stripped or stripped.startswith("#["):
+            continue
+        pending = False
+        declaration = MOD_DECL.match(stripped)
+        if not declaration:
+            continue
+        name, kind = declaration.groups()
+        if kind == ";":
+            directory = module_dir(path)
+            for candidate in (directory / f"{name}.rs", directory / name / "mod.rs"):
+                if candidate.exists():
+                    test_files.append(candidate)
+                    break
+            continue
+        # Inline module: from this line to its matching closing brace.
+        depth = 0
+        end = index
+        for end in range(index, len(lines)):
+            depth += lines[end].count("{") - lines[end].count("}")
+            if depth <= 0:
+                break
+        test_lines.update(range(index + 1, end + 2))
+    return test_lines, test_files
+
+
+def test_code() -> dict[Path, set[int] | None]:
+    """The files that hold test code. `None` means the whole file; a set lists the
+    lines (1-based) of the `#[cfg(test)]` modules in an ordinary source file.
+
+    Counted (TEST-01): Rust files in a crate's `tests/` folder, Rust `#[cfg(test)]`
+    modules (inline, or a file declared as `#[cfg(test)] mod tests;`), fuzz targets,
+    Python `test_*.py` files, and Go or shell helpers in a `tests/` folder that a
+    counted Rust test names. Nothing else: a `Covers:` comment in application code,
+    an example, a script or a stray file does not count.
+    """
+    found: dict[Path, set[int] | None] = {}
+    helpers: list[Path] = []
     for directory in SEARCH_DIRS:
         base = ROOT / directory
         if not base.exists():
             continue
         for path in sorted(base.rglob("*")):
-            if path.suffix not in SOURCE_SUFFIXES or "target" in path.parts:
+            parts = path.relative_to(ROOT).parts
+            if path.suffix not in SOURCE_SUFFIXES or "target" in parts or not path.is_file():
                 continue
-            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                match = re.search(r"(?://|#)\s*Covers:\s*(.+)$", line)
-                if not match:
-                    continue
-                for requirement in parse_covers(match.group(1)):
-                    where = f"{path.relative_to(ROOT)}:{number}"
-                    covers.setdefault(requirement, []).append(where)
+            in_tests = len(parts) > 2 and parts[1] == "tests"
+            if path.suffix == ".py":
+                if path.name.startswith("test_"):
+                    found[path] = None
+            elif path.suffix in {".go", ".sh"}:
+                if in_tests:
+                    helpers.append(path)
+            elif in_tests or parts[:2] == ("fuzz", "fuzz_targets"):
+                found[path] = None
+            elif len(parts) > 2 and parts[1] == "src":
+                queue = [path]
+                while queue:
+                    current = queue.pop()
+                    lines, files = cfg_test_parts(current)
+                    if lines and found.get(current, set()) is not None:
+                        found.setdefault(current, set()).update(lines)
+                    for child in files:
+                        found[child] = None
+                        queue.append(child)
+    rust_tests = [path for path, lines in found.items() if path.suffix == ".rs"]
+    for helper in helpers:
+        if any(helper.name in path.read_text(encoding="utf-8") for path in rust_tests):
+            found[helper] = None
+    return found
+
+
+def collected_covers() -> dict[str, list[str]]:
+    covers: dict[str, list[str]] = {}
+    for path, lines in sorted(test_code().items()):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if lines is not None and number not in lines:
+                continue
+            match = COVERS.search(line)
+            if not match:
+                continue
+            for requirement in parse_covers(match.group(1)):
+                where = f"{path.relative_to(ROOT)}:{number}"
+                covers.setdefault(requirement, []).append(where)
     return covers
+
+
+def ignored_covers() -> list[str]:
+    """`Covers:` lines outside test code (they do not count)."""
+    counted = test_code()
+    ignored: list[str] = []
+    for directory in SEARCH_DIRS:
+        base = ROOT / directory
+        if not base.exists():
+            continue
+        for path in sorted(base.rglob("*")):
+            parts = path.relative_to(ROOT).parts
+            if path.suffix not in SOURCE_SUFFIXES or "target" in parts or not path.is_file():
+                continue
+            lines = counted.get(path, set()) if path in counted else set()
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if COVERS.search(line) and lines is not None and number not in lines:
+                    ignored.append(f"{path.relative_to(ROOT)}:{number}")
+    return ignored
 
 
 def exceptions() -> dict[str, tuple[str, str]]:
@@ -136,6 +310,13 @@ def main() -> int:
         missing.append(requirement)
 
     print(f"{len(requirements)} requirements; {len(requirements) - len(missing)} accounted for.")
+    ignored = ignored_covers()
+    if ignored:
+        print(f"NOTE: {len(ignored)} `Covers:` line(s) outside test code were not counted"
+              + (":" if report else " (--report lists them)."))
+        if report:
+            for where in ignored:
+                print(f"  not test code: {where}")
     for requirement in blocked:
         print(f"BLOCKED: {requirement}: {excepted[requirement][1]}")
     for requirement in unknown:

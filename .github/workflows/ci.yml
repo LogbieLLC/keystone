@@ -9,7 +9,7 @@
 #
 # Required checks for the dev/main rulesets (TEST-06): fmt, clippy, test, gui-e2e,
 # coverage, audit, deny, vet, boundaries, plaintext-key-scan, rfc5280-lint,
-# fuzz-short (4 targets), codeql, traceability, reproducible-build.
+# fuzz-short (5 targets), codeql, traceability, reproducible-build.
 # NOT required: blocked-tests (TEST-10 report job; it fails while StarnetAuth
 # dependencies are missing, by design).
 
@@ -192,11 +192,11 @@ jobs:
         with:
           persist-credentials: false
       - run: scripts/ci-setup.sh golang-go python3-venv
-      - name: install pinned linters (ADR 0002)
+      - name: install pinned linters (ADR 0002; pkilint and its dependencies pinned by hash)
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install github.com/zmap/zlint/v3/cmd/zlint@v3.7.3
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --quiet pkilint==0.13.3
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --require-hashes -r scripts/ci/pkilint-requirements.txt
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: lint every generated certificate and CRL (FR-10 AC4, SEC-13)
@@ -212,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record]
+        target: [pem_pkcs8, cert_crl, audit_journal, issuance_record, pkcs8_key_decode]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -223,6 +223,9 @@ jobs:
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' fuzz/rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rust-src --component llvm-tools-preview
           cargo install --locked cargo-fuzz@0.13.2
+      - name: fuzz/Cargo.lock is up to date (cargo fuzz does not enforce it)
+        working-directory: fuzz
+        run: cargo metadata --locked --format-version 1 >/dev/null
       - name: short fuzz run (SEC-08, TEST-06)
         working-directory: fuzz
         run: |
@@ -249,6 +252,9 @@ jobs:
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' fuzz/rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rust-src --component llvm-tools-preview
           cargo install --locked cargo-fuzz@0.13.2
+      - name: fuzz/Cargo.lock is up to date (cargo fuzz does not enforce it)
+        working-directory: fuzz
+        run: cargo metadata --locked --format-version 1 >/dev/null
       - name: long fuzz run (SEC-08, TEST-05)
         working-directory: fuzz
         run: |
@@ -265,6 +271,8 @@ jobs:
         with:
           persist-credentials: false
       - run: scripts/ci-setup.sh
+      - name: record the installed distribution packages in the log (SEC-01, SEC-02)
+        run: dpkg-query -W
       - name: build the production binary twice and compare SHA-256 (SEC-02)
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"

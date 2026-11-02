@@ -4,8 +4,9 @@
 //!
 //! - `constrained/` and `unconstrained/`: hierarchies built directly with the
 //!   certificate and CRL builders.
-//! - `flows/`: what Keystone itself writes. Flows A, B, C (with and without name
-//!   constraints), D, Refresh CRL and E run through `keystone_core::ops` against the
+//! - `flows/`: what Keystone itself writes. Flows A, B, C (with DNS name constraints,
+//!   explicitly without, and with DNS plus IPv4 and IPv6 ranges), D, Refresh CRL, E and
+//!   then B again on a new YubiKey run through `keystone_core::ops` against the
 //!   simulated YubiKey, and every file of the primary drive and the export drive is
 //!   copied here unchanged (certificates, chains, DER CRLs, encrypted keys, audit log,
 //!   journals, issuance record).
@@ -204,10 +205,15 @@ fn write_flow_outputs(dir: &Path) {
     .expect("Flow B");
     drop(secrets);
 
-    // Flow C twice: with name constraints (the default) and explicitly without.
+    // Flow C three times: with name constraints (the default), explicitly without, and
+    // with permitted IPv4 and IPv6 ranges next to the DNS name (FR-21 AC3).
     let pin = secret(PIN);
     let constrained = NameConstraintsChoice::Constrained(
         NameConstraintsSpec::new(&["starnet"], &[] as &[&str]).expect("constraints"),
+    );
+    let ip_ranges = NameConstraintsChoice::Constrained(
+        NameConstraintsSpec::new(&["starnet"], &["10.0.0.0/8", "2001:db8::/32"])
+            .expect("constraints with IP ranges"),
     );
     let mut subs: Vec<Serial> = Vec::new();
     for (index, (label, choice)) in [
@@ -216,6 +222,7 @@ fn write_flow_outputs(dir: &Path) {
             "Samples Sub Unconstrained",
             NameConstraintsChoice::ExplicitlyUnconstrained,
         ),
+        ("Samples Sub IP Ranges", ip_ranges),
     ]
     .into_iter()
     .enumerate()
@@ -293,6 +300,35 @@ fn write_flow_outputs(dir: &Path) {
             &CancelFlag::new(),
         )
         .expect("Flow E");
+
+    // Flow B again, on a new YubiKey: the replacement main intermediate and its first
+    // CRL, issued after Flow E (the master's CRL address is reused).
+    let mut new_token = SimulatedYubiKey::new(SimulatorConfig {
+        serial: 30_000_002,
+        ..SimulatorConfig::default()
+    });
+    let request = MainIntermediateRequest::new(test_name("Samples New Main"), None);
+    let time = next(&ca, &mut now);
+    let plan = ca
+        .plan_yubikey_setup(&mut new_token, &request, time)
+        .expect("Flow B after Flow E plan");
+    let trust = new_token.attestation_trust();
+    let secrets = YubikeySecrets {
+        pin: PinEntry::New(NewPin::from_entries(&secret(PIN), &secret(PIN)).expect("PIN")),
+        new_puk: Some(NewPuk::from_entries(&secret(PUK), &secret(PUK)).expect("PUK")),
+        master_passphrase: Some(&master_entered),
+    };
+    plan.execute(
+        &ca,
+        &mut new_token,
+        &secrets,
+        &trust,
+        Some(drives.export_drive()),
+        &NoProgress,
+        &CancelFlag::new(),
+    )
+    .expect("Flow B after Flow E");
+    drop(secrets);
 
     copy_tree(&drives.ca_drive(0).join("keystone"), &dir.join("primary"));
     copy_tree(

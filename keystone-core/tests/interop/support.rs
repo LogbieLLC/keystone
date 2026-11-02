@@ -47,7 +47,7 @@ pub fn text(output: &Output) -> String {
 }
 
 /// Runs the `openssl` command line in `dir`.
-pub fn openssl(dir: &Path, args: &[&str]) -> Output {
+pub fn openssl_cli(dir: &Path, args: &[&str]) -> Output {
     Command::new("openssl")
         .args(args)
         .current_dir(dir)

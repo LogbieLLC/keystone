@@ -51,3 +51,12 @@ path = "fuzz_targets/issuance_record.rs"
 test = false
 doc = false
 bench = false
+
+# 5. The plaintext PKCS#8 PrivateKeyInfo-to-key decoder that runs after decryption,
+#    reached without a key derivation (cfg(fuzzing) entry point in keystone-core).
+[[bin]]
+name = "pkcs8_key_decode"
+path = "fuzz_targets/pkcs8_key_decode.rs"
+test = false
+doc = false
+bench = false
