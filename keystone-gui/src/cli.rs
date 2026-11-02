@@ -242,6 +242,8 @@ pub const HARDEN_FLAG: &str = "--harden";
 
 /// True when a development build was asked to install the socket filter. Read before
 /// anything else starts, so it only looks for the flag; [`parse`] checks the rest.
+/// Not part of a production build, which always hardens.
+#[cfg(not(feature = "production"))]
 pub fn wants_hardening(args: &[String], production: bool) -> bool {
     !production && args.iter().any(|arg| arg == HARDEN_FLAG)
 }

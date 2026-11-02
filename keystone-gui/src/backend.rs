@@ -7,10 +7,12 @@
 //! [`FlowOutcome`] to show (write-and-verify result per drive, SHA-256 fingerprints) or
 //! a [`BackendError`].
 //!
-//! Until the operations layer is merged, [`NotConnected`] is the only implementation:
-//! every execute function returns [`BackendError::NotConnected`] and nothing is written.
+//! [`OpsBackend`] (module `ops`) is the implementation: it runs every step through
+//! `keystone_core::ops`. Read-only questions the screens ask (the stored CRL address,
+//! the recovery screen's content, the review of "Replace a lost drive") go through
+//! the same trait.
 //!
-//! # Contract for the implementation that wires this to `ops`
+//! # Contract for the implementation
 //! - Run on the worker thread that calls it; never touch GTK.
 //! - Plans own their secrets (`ConfirmedPassphrase`, `EnteredPassphrase`, `NewPin`,
 //!   `NewPuk`, `SecretString`); drop them as soon as they are used. Never log them.
@@ -26,25 +28,24 @@
 //! - Fill [`FlowOutcome`] with every drive written and its read-back result (FR-12 AC2)
 //!   and the SHA-256 fingerprint of every certificate created (FR-20).
 #![forbid(unsafe_code)]
-// The GUI fills every plan field; only the operations-layer implementation reads them.
-// Remove this allowance when `NotConnected` is replaced by the real implementation.
-#![allow(
-    dead_code,
-    reason = "plan fields are read by the operations layer, which is not wired yet"
-)]
+
+mod ops;
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use keystone_core::clock::ConfirmedTime;
 use keystone_core::crypto::secret::SecretString;
 use keystone_core::model::{CaLevel, Fingerprint, RevocationReason, Serial, Timestamp};
+use keystone_core::ops::{RecoveryAction, RecoveryItem};
 use keystone_core::passphrase::{ConfirmedPassphrase, EnteredPassphrase};
 use keystone_core::profile::{CrlLocation, NameConstraintsChoice, ValidatedName};
-use keystone_core::store::{OperationId, RecoveryAction};
+use keystone_core::store::OperationId;
 use keystone_core::token::{DeviceInfo, NewPin, NewPuk, TokenSigner, WipeConfirmation};
+
+pub use ops::OpsBackend;
 
 use crate::worker::Progress;
 
@@ -53,7 +54,8 @@ use crate::worker::Progress;
 pub struct SharedToken(Arc<Mutex<Box<dyn TokenSigner>>>);
 
 impl SharedToken {
-    /// Wraps a token.
+    /// Wraps a token (the simulator; the real driver is not part of this build yet).
+    #[cfg(any(feature = "simulator", test))]
     pub fn new(token: Box<dyn TokenSigner>) -> Self {
         SharedToken(Arc::new(Mutex::new(token)))
     }
@@ -73,12 +75,14 @@ impl fmt::Debug for SharedToken {
     }
 }
 
-/// The folders the operator chose (FR-12 AC1: a primary and at least one backup).
+/// The folders the operator chose. Writing needs a primary and at least one backup
+/// (FR-12 AC1); a selection with a single CA drive can only open the CA to replace a
+/// lost drive (ADR 0003).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveSelection {
-    /// The primary CA drive.
-    pub primary: PathBuf,
-    /// Backup CA drives (at least one).
+    /// The primary CA drive (`None` when it is lost and only backups are connected).
+    pub primary: Option<PathBuf>,
+    /// Backup CA drives.
     pub backups: Vec<PathBuf>,
     /// The export drive or folder (carried to issuing systems).
     pub export: PathBuf,
@@ -86,8 +90,10 @@ pub struct DriveSelection {
 
 impl DriveSelection {
     /// Every CA drive, primary first.
-    pub fn ca_drives(&self) -> Vec<&std::path::Path> {
-        std::iter::once(self.primary.as_path())
+    pub fn ca_drives(&self) -> Vec<&Path> {
+        self.primary
+            .iter()
+            .map(PathBuf::as_path)
             .chain(self.backups.iter().map(PathBuf::as_path))
             .collect()
     }
@@ -104,6 +110,7 @@ pub struct ClockConfirmation {
 
 impl ClockConfirmation {
     /// A confirmation made now.
+    #[cfg(test)]
     pub fn new(confirmed: ConfirmedTime) -> Self {
         ClockConfirmation {
             confirmed,
@@ -232,8 +239,28 @@ pub struct RefreshCrlPlan {
 pub struct ReplaceYubikeyPlan {
     /// The old main intermediate to revoke.
     pub old_main_intermediate: Serial,
+    /// Why it is revoked.
+    pub reason: RevocationReason,
     /// Unlocks the master key.
     pub master_passphrase: EnteredPassphrase,
+}
+
+/// "Replace a lost drive" (ADR 0003, SEC-11): copy the CA to a new, empty drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceDrivePlan {
+    /// The new, empty drive.
+    pub new_drive: PathBuf,
+}
+
+/// What the review step of "Replace a lost drive" shows (nothing written yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveReplacementReview {
+    /// Label and value pairs, in display order (from `ops::ReplaceDrivePlan::review`).
+    pub lines: Vec<(String, String)>,
+    /// Warnings the operator must see.
+    pub warnings: Vec<String>,
+    /// The backup drive that becomes the primary, if any.
+    pub promotes: Option<String>,
 }
 
 /// FR-07 AC4: wipe the YubiKey signing slot after the typed-serial confirmation.
@@ -250,10 +277,23 @@ pub struct WipeSlotPlan {
 pub struct RecoveryPlan {
     /// The interrupted operation.
     pub operation: OperationId,
-    /// The chosen action (one the recovery report offered).
+    /// The chosen action (one `ops::Ca::recovery_items` offered).
     pub action: RecoveryAction,
-    /// For resuming YubiKey setup: the PIN, PUK or passphrase the remaining steps need.
+    /// Secrets and answers the action needs (a resumed YubiKey setup, or the master
+    /// passphrase to sign a missing first CRL).
     pub resume: Option<ResumeCredentials>,
+}
+
+/// The main intermediate's details, entered again to finish an interrupted setup that
+/// signed nothing yet (FR-22 AC7). The name must match the interrupted setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeMainIntermediate {
+    /// Name fields.
+    pub name: ValidatedName,
+    /// Validity in whole years.
+    pub validity_years: u8,
+    /// The master's CRL address, when it is not stored yet (FR-18).
+    pub master_crl: Option<CrlLocation>,
 }
 
 /// Secrets for resuming an interrupted YubiKey setup (FR-22 AC7). The operator is
@@ -266,8 +306,10 @@ pub struct ResumeCredentials {
     pub new_pin: Option<NewPin>,
     /// A new PUK, when the PUK step is still to do.
     pub new_puk: Option<NewPuk>,
-    /// Unlocks the master to sign the main intermediate.
+    /// Unlocks the master to sign the main intermediate (or a missing first CRL).
     pub master_passphrase: Option<EnteredPassphrase>,
+    /// The main intermediate's details, while it is not signed yet.
+    pub main_intermediate: Option<ResumeMainIntermediate>,
 }
 
 /// One drive's write-and-verify result (FR-12 AC1, AC2).
@@ -336,13 +378,16 @@ pub struct FlowOutcome {
 /// Why an execute step did not succeed. Never contains a secret.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BackendError {
-    /// The operations layer is not connected to this build yet.
+    /// Something this step needs is not part of this build (for example the Yubico
+    /// attestation roots of the real YubiKey driver).
     #[error(
-        "{action} is not connected yet: this build's operations layer is not wired to the GUI. Nothing was written to any drive or YubiKey."
+        "{action} is not connected yet: {reason}. Nothing was written to any drive or YubiKey."
     )]
     NotConnected {
         /// What was asked for.
         action: &'static str,
+        /// What this build lacks.
+        reason: &'static str,
     },
     /// Cancelled before any persistent change (FR-16 AC2).
     #[error(
@@ -397,6 +442,12 @@ pub trait Backend: Send + Sync + fmt::Debug {
     ) -> Result<FlowOutcome, BackendError>;
     /// FR-22 AC4, AC5, AC7.
     fn recover(&self, ctx: ExecContext, plan: RecoveryPlan) -> Result<FlowOutcome, BackendError>;
+    /// ADR 0003: "Replace a lost drive".
+    fn replace_drive(
+        &self,
+        ctx: ExecContext,
+        plan: ReplaceDrivePlan,
+    ) -> Result<FlowOutcome, BackendError>;
     /// FR-18: the CRL address already set for the CA certificate at `issuer` (a
     /// master or main intermediate), or `None` when it has not been asked yet. An
     /// error means "unknown": the GUI then asks for it.
@@ -405,18 +456,41 @@ pub trait Backend: Send + Sync + fmt::Debug {
         drives: &DriveSelection,
         issuer: Serial,
     ) -> Result<Option<CrlLocation>, BackendError>;
+    /// FR-22 AC4, AC8: the recovery screen's content, with the YubiKey column when a
+    /// YubiKey is connected. Reads only.
+    fn recovery_items(
+        &self,
+        drives: &DriveSelection,
+        token: Option<&SharedToken>,
+    ) -> Result<Vec<RecoveryItem>, BackendError>;
+    /// ADR 0003: the review of "Replace a lost drive" with `new_drive`. Reads only.
+    fn review_replace_drive(
+        &self,
+        drives: &DriveSelection,
+        new_drive: &Path,
+        clock: &ClockConfirmation,
+    ) -> Result<DriveReplacementReview, BackendError>;
 }
 
-/// The backend of this build: the operations layer is not connected yet.
+/// A backend that runs nothing (tests only): every step answers
+/// [`BackendError::NotConnected`] and nothing is written.
+#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NotConnected;
 
+#[cfg(test)]
 impl NotConnected {
+    const REASON: &'static str = "this build's operations layer is not wired to the GUI";
+
     fn refuse(action: &'static str) -> Result<FlowOutcome, BackendError> {
-        Err(BackendError::NotConnected { action })
+        Err(BackendError::NotConnected {
+            action,
+            reason: Self::REASON,
+        })
     }
 }
 
+#[cfg(test)]
 impl Backend for NotConnected {
     fn create_master(
         &self,
@@ -474,6 +548,14 @@ impl Backend for NotConnected {
         Self::refuse("Recovering the interrupted operation")
     }
 
+    fn replace_drive(
+        &self,
+        _ctx: ExecContext,
+        _plan: ReplaceDrivePlan,
+    ) -> Result<FlowOutcome, BackendError> {
+        Self::refuse("Replacing a lost drive")
+    }
+
     fn issuer_crl_location(
         &self,
         _drives: &DriveSelection,
@@ -481,6 +563,30 @@ impl Backend for NotConnected {
     ) -> Result<Option<CrlLocation>, BackendError> {
         Err(BackendError::NotConnected {
             action: "Reading the stored CRL address",
+            reason: Self::REASON,
+        })
+    }
+
+    fn recovery_items(
+        &self,
+        _drives: &DriveSelection,
+        _token: Option<&SharedToken>,
+    ) -> Result<Vec<RecoveryItem>, BackendError> {
+        Err(BackendError::NotConnected {
+            action: "Reading the interrupted operations",
+            reason: Self::REASON,
+        })
+    }
+
+    fn review_replace_drive(
+        &self,
+        _drives: &DriveSelection,
+        _new_drive: &Path,
+        _clock: &ClockConfirmation,
+    ) -> Result<DriveReplacementReview, BackendError> {
+        Err(BackendError::NotConnected {
+            action: "Reviewing the drive replacement",
+            reason: Self::REASON,
         })
     }
 }
@@ -501,7 +607,7 @@ mod tests {
     fn ctx() -> ExecContext {
         ExecContext {
             drives: DriveSelection {
-                primary: "/nonexistent/a".into(),
+                primary: Some("/nonexistent/a".into()),
                 backups: vec!["/nonexistent/b".into()],
                 export: "/nonexistent/e".into(),
             },

@@ -3,7 +3,9 @@
 #
 # Usage: keystone-gui/tests/e2e/run.sh [test_file.py ...]   (default: every test_*.py)
 #
-# 1. Builds the debug `keystone` binary (simulator build) and the `e2e_prepare` helper.
+# 1. Builds the debug `keystone` binary (simulator build), the `e2e_prepare` helper
+#    and the plaintext-key scanner (SEC-04), which every flow test runs over the whole
+#    temporary folder.
 # 2. Re-runs itself under `xvfb-run` (headless X server) and `dbus-run-session` (a
 #    private session bus, started inside the X session so the AT-SPI registry can
 #    synthesise keyboard events), with accessibility switched on.
@@ -21,9 +23,11 @@ if [[ -z "${KEYSTONE_E2E_INNER:-}" ]]; then
   for tool in xvfb-run dbus-run-session gsettings; do
     command -v "$tool" >/dev/null || { echo "E2E: missing tool: $tool" >&2; exit 2; }
   done
-  (cd "$ROOT" && cargo build --quiet -p keystone-gui --bin keystone --example e2e_prepare)
+  (cd "$ROOT" && cargo build --quiet -p keystone-gui --bin keystone --example e2e_prepare \
+    && cargo build --quiet -p keystone-testkit --example scan_plaintext_keys)
   export KEYSTONE_BIN="$ROOT/target/debug/keystone"
   export KEYSTONE_PREPARE="$ROOT/target/debug/examples/e2e_prepare"
+  export KEYSTONE_SCANNER="$ROOT/target/debug/examples/scan_plaintext_keys"
   export KEYSTONE_WORDLIST="$ROOT/keystone-core/src/passphrase/eff_large_wordlist.txt"
   export KEYSTONE_E2E_INNER=1
   exec xvfb-run -a -s "-screen 0 1280x1024x24 -nolisten tcp" \

@@ -36,10 +36,6 @@ const COMMITTED: u8 = 3;
 /// The operator cancelled before the first persistent change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("cancelled before any persistent change")]
-#[allow(
-    dead_code,
-    reason = "returned to the operations layer, which is not wired yet"
-)]
 pub struct Cancelled;
 
 /// Where a job is in its cancel life cycle.
@@ -86,10 +82,6 @@ struct Shared {
 #[derive(Debug, Clone)]
 pub struct Progress {
     shared: Arc<Shared>,
-    #[allow(
-        dead_code,
-        reason = "used by `report`, which the operations layer calls"
-    )]
     sender: mpsc::Sender<ProgressUpdate>,
 }
 
@@ -140,10 +132,6 @@ impl Progress {
 }
 
 /// The job's side. The operations layer calls these through `ExecContext::progress`.
-#[allow(
-    dead_code,
-    reason = "called by the operations layer, which is not wired yet"
-)]
 impl Progress {
     /// Reports progress. Never blocks; a closed window is ignored.
     pub fn report(&self, fraction: Option<f64>, message: impl Into<String>) {

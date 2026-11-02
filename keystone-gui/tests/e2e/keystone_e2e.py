@@ -10,6 +10,8 @@ Every file goes under $KEYSTONE_E2E_TMP (a `mktemp -d` folder, TEST-12); every
 certificate name carries "KEYSTONE TEST" (TEST-11).
 """
 
+import base64
+import hashlib
 import os
 import re
 import subprocess
@@ -54,25 +56,61 @@ def make_dirs(*names):
     return paths
 
 
-def prepare(scenario, *drives):
-    """Prepares a drive state with the e2e_prepare helper (store API only)."""
-    subprocess.run([os.environ["KEYSTONE_PREPARE"], scenario, *drives], check=True)
+def prepare(scenario, *drives, stdin=None):
+    """Prepares a drive state with the e2e_prepare helper. Returns what it printed
+    (the `master` scenario prints the synthetic master passphrase's words)."""
+    done = subprocess.run(
+        [os.environ["KEYSTONE_PREPARE"], scenario, *drives],
+        check=True,
+        input=stdin,
+        capture_output=True,
+        text=True,
+    )
+    return done.stdout
 
 
 def drive_args(primary, backup, export):
     return ["--primary", primary, "--backup", backup, "--export", export]
 
 
+def assert_no_plaintext_keys():
+    """SEC-04, SEC-08: the plaintext-key scanner finds no unencrypted private key
+    anywhere in the E2E temporary folder (every drive, export drive and log)."""
+    done = subprocess.run(
+        [os.environ["KEYSTONE_SCANNER"], TMP], capture_output=True, text=True
+    )
+    check(
+        done.returncode == 0,
+        f"plaintext-key scanner failed ({done.returncode}): {done.stdout}{done.stderr}",
+    )
+
+
+def certificate_fingerprint(path):
+    """SHA-256 of the DER certificate in a PEM file, as AB:CD:... (FR-20)."""
+    with open(path) as handle:
+        text = handle.read()
+    body = text.split("-----BEGIN CERTIFICATE-----")[1].split("-----END CERTIFICATE-----")[0]
+    digest = hashlib.sha256(base64.b64decode("".join(body.split()))).hexdigest().upper()
+    return ":".join(digest[i : i + 2] for i in range(0, len(digest), 2))
+
+
+def files_under(folder):
+    found = []
+    for base, _, files in os.walk(folder):
+        found.extend(os.path.join(base, name) for name in files)
+    return sorted(found)
+
+
 class Keystone:
     """One running Keystone process and its accessibility tree."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, wrapper=()):
         self.log_path = os.path.join(TMP, f"keystone-{time.monotonic_ns()}.log")
         self.log = open(self.log_path, "w")
         env = dict(os.environ)
         env.pop("GTK_MODULES", None)
         self.process = subprocess.Popen(
-            [os.environ["KEYSTONE_BIN"], *args],
+            [*wrapper, os.environ["KEYSTONE_BIN"], *args],
             stdout=self.log,
             stderr=subprocess.STDOUT,
             env=env,
@@ -215,6 +253,85 @@ class Keystone:
     @staticmethod
     def describe(node):
         return "nothing" if node is None else f"{node.roleName} {node.name!r}"
+
+    # -- common steps ------------------------------------------------------------
+
+    def type_into(self, name, text, role="text"):
+        """Moves the focus to the field `name` with Tab and types `text`."""
+        self.tab_to(name, role)
+        self.type(text)
+
+    def open_home(self):
+        """Drive selection (prefilled) -> start-up checks -> clock -> home."""
+        self.wait_heading("Choose the CA drives")
+        self.activate("Check drives")
+        self.wait_heading("Start-up checks")
+        self.continue_to_home()
+
+    def continue_to_home(self):
+        """From the start-up checks: Continue, confirm the time (SEC-16), home."""
+        self.wait_heading("Start-up checks")
+        self.wait_label("Start-up checks")
+        self.activate("Continue")
+        self.wait_heading("Confirm the date and time")
+        self.activate("Confirm date and time")
+        self.wait_heading("What do you want to do?")
+
+    def done_to_home(self):
+        """From a result screen: Done, the start-up checks run again, then home."""
+        self.activate("Done")
+        self.wait_heading("Start-up checks")
+        self.wait_for(
+            lambda n: n.roleName == "push button" and n.name == "Continue",
+            "Continue after the start-up checks",
+            timeout=60,
+        )
+        self.continue_to_home()
+
+    def shown_words(self):
+        words = {}
+        for label in self.labels():
+            match = re.fullmatch(r"(\d+)\. ([a-z-]+)", label)
+            if match:
+                words[int(match.group(1))] = match.group(2)
+        return words
+
+    def confirm_passphrase(self, count):
+        """FR-03: reads the words shown once, ticks, retypes every group and confirms.
+        Returns the words in order (synthetic test passphrase)."""
+        self.wait_heading("Write down your passphrase")
+        words = self.shown_words()
+        check(sorted(words) == list(range(1, count + 1)), f"words shown: {words}")
+        self.activate(f"I have written down all {count} words", role="check box")
+        self.activate("Retype the words")
+        self.wait_heading("Type the words again")
+        numbers = list(range(1, count + 1))
+        groups = [numbers[i : i + 4] for i in range(0, count, 4)]
+        for group, members in enumerate(groups, start=1):
+            self.tab_to(f"Word {members[0]}", "text")
+            for number in members:
+                self.type(words[number])
+                self.press("Return")
+            self.activate(f"Check group {group}")
+            self.wait_label(f"OK: Group {group} matches and is kept.")
+        self.activate("Confirm passphrase")
+        return [words[n] for n in numbers]
+
+    def result_fingerprints(self):
+        """Every SHA-256 fingerprint shown on a result screen (FR-20). Each is a
+        selectable label named by its "SHA-256 fingerprint" heading; its text is read."""
+        pattern = re.compile(r"^([0-9A-F]{2}:){31}[0-9A-F]{2}$")
+        found = []
+        for node in self.find_all(
+            lambda n: n.roleName == "label" and n.name == "SHA-256 fingerprint"
+        ):
+            try:
+                text = node.text
+            except Exception:  # a node without the text interface
+                continue
+            if text and pattern.match(text):
+                found.append(text)
+        return found
 
 
 def run(test):

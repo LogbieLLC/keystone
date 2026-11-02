@@ -29,6 +29,7 @@ mod home;
 mod passphrase;
 mod record;
 mod recovery;
+mod replace_drive;
 mod startup;
 mod token;
 pub mod widgets;
@@ -41,7 +42,7 @@ use std::sync::Arc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use crate::backend::{Backend, ClockConfirmation, DriveSelection, NotConnected, SharedToken};
+use crate::backend::{Backend, ClockConfirmation, DriveSelection, OpsBackend, SharedToken};
 use crate::cli::Options;
 use crate::vm::drives::DriveMode;
 use crate::vm::startup::{StartupData, StartupView};
@@ -223,7 +224,7 @@ pub fn run(options: Options) -> ExitCode {
             toasts,
             title,
             pages: RefCell::new(Vec::new()),
-            backend: Arc::new(NotConnected),
+            backend: Arc::new(OpsBackend::new(&options)),
             session: RefCell::new(Session::default()),
             options,
         });

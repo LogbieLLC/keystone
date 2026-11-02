@@ -7,14 +7,20 @@ use gtk::prelude::*;
 
 use super::widgets::{self, PageBuilder, StatusLine};
 use super::{App, startup};
-use crate::vm::drives::{DriveForm, assess, probe, validate_form};
+use crate::vm::drives::{DriveForm, assess_probes, probe, validate_form};
 use crate::vm::{Line, Status};
 use crate::worker::gtk_glue;
 
 /// Page id.
 pub const ID: &str = "drives";
 
-fn folder_row(app: &Rc<App>, container: &gtk::Box, label: &str, title: &str) -> gtk::Entry {
+/// A folder field with a "Choose … folder…" button.
+pub(super) fn folder_row(
+    app: &Rc<App>,
+    container: &gtk::Box,
+    label: &str,
+    title: &str,
+) -> gtk::Entry {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
     let entry = widgets::labelled_entry(&row, label);
     entry.set_hexpand(true);
@@ -83,7 +89,7 @@ pub fn show(app: &Rc<App>) {
         }
     };
     if let Some(selection) = &session.drives {
-        prefill(&primary, Some(&selection.primary));
+        prefill(&primary, selection.primary.as_ref());
         prefill(&backup, selection.backups.first());
         prefill(&second, selection.backups.get(1));
         prefill(&export, Some(&selection.export));
@@ -127,7 +133,7 @@ pub fn show(app: &Rc<App>) {
             move |result| {
                 button.set_sensitive(true);
                 widgets::clear(&status);
-                let (ca, export) = match result {
+                let probes = match result {
                     Ok(probes) => probes,
                     Err(failure) => {
                         status.append(
@@ -137,7 +143,7 @@ pub fn show(app: &Rc<App>) {
                         return;
                     }
                 };
-                let assessment = assess(&ca, &export);
+                let assessment = assess_probes(&probes);
                 widgets::set_status_list(&status, &assessment.lines);
                 if assessment.can_continue() {
                     {
@@ -149,7 +155,10 @@ pub fn show(app: &Rc<App>) {
                     }
                     app.set_subtitle(&format!(
                         "Primary {} · {} backup{} · export {}",
-                        selection.primary.display(),
+                        selection.primary.as_ref().map_or_else(
+                            || "not connected".to_string(),
+                            |p| p.display().to_string()
+                        ),
                         selection.backups.len(),
                         if selection.backups.len() == 1 {
                             ""

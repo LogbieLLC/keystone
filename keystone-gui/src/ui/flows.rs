@@ -150,13 +150,19 @@ fn drive_lines(app: &App) -> Vec<Line> {
     let Some(drives) = app.drives() else {
         return Vec::new();
     };
-    let mut lines = vec![Line::new(
-        Status::Info,
-        format!(
-            "Written to the primary drive {} and read back.",
-            drives.primary.display()
-        ),
-    )];
+    let mut lines: Vec<Line> = drives
+        .primary
+        .iter()
+        .map(|primary| {
+            Line::new(
+                Status::Info,
+                format!(
+                    "Written to the primary drive {} and read back.",
+                    primary.display()
+                ),
+            )
+        })
+        .collect();
     for backup in &drives.backups {
         lines.push(Line::new(
             Status::Info,
@@ -1342,7 +1348,7 @@ fn flow_e(app: &Rc<App>) {
         .filter(|c| c.effective_status(OffsetDateTime::now_utc()) == StatusFilter::Valid)
         .map(cert_label)
         .collect();
-    let s = step(
+    let mut s = step(
         app,
         "Replace lost YubiKey",
         Some(
@@ -1368,9 +1374,31 @@ fn flow_e(app: &Rc<App>) {
         ));
     }
     s.page.add(&widgets::status_list(&lines));
+    // A lost YubiKey's key may be in someone else's hands: "CA compromise" is
+    // preselected (the most conservative reason); the operator can choose another.
+    let (frame, inner) = widgets::group("Reason");
+    let reasons: Vec<&str> = RevocationReason::ALL
+        .iter()
+        .map(|r| reason_name(*r))
+        .collect();
+    let reason = widgets::labelled_dropdown(&inner, "_Revocation reason", &reasons);
+    if let Some(index) = RevocationReason::ALL
+        .iter()
+        .position(|r| *r == RevocationReason::CaCompromise)
+    {
+        reason.set_selected(u32::try_from(index).unwrap_or(0));
+    }
+    s.page.add(&frame);
+    s.page.focus_on(&s.next.clone());
     let app_ref = app.clone();
     let old_serial = old.certificate.serial;
     s.next.connect_clicked(move |_| {
+        let Some(reason) = RevocationReason::ALL
+            .get(reason.selected() as usize)
+            .copied()
+        else {
+            return;
+        };
         unlock_master(
             &app_ref,
             "flow-e-1",
@@ -1378,6 +1406,7 @@ fn flow_e(app: &Rc<App>) {
             move |app, master_passphrase| {
                 let plan = ReplaceYubikeyPlan {
                     old_main_intermediate: old_serial,
+                    reason,
                     master_passphrase,
                 };
                 exec::execute(

@@ -9,7 +9,11 @@
 //!   (FR-12 AC3); Keystone never chooses a history;
 //! - drives that are behind list the missing operations; they are copied only after the
 //!   operator confirms (FR-12 AC3);
-//! - CRLs close to nextUpdate raise a warning that opens Refresh CRL (FR-13 AC3).
+//! - CRLs close to nextUpdate raise a warning that opens Refresh CRL (FR-13 AC3);
+//! - a drive whose journal cannot be read blocks every action until it is repaired or
+//!   replaced (`RecoveryReport::unreadable`);
+//! - with fewer than the primary and one backup connected, every signing action is
+//!   disabled and only "Replace a lost drive" is offered (FR-12 AC1, ADR 0003).
 #![forbid(unsafe_code)]
 
 use keystone_core::store::{
@@ -61,6 +65,8 @@ pub struct StartupData {
     pub crls: Vec<CurrentCrl>,
     /// SEC-19 self-check result: a warning to show, or why it could not run.
     pub self_check: Option<Result<Option<String>, String>>,
+    /// FR-12 AC1: `(primaries, backups)` connected when that is not enough to write.
+    pub not_enough_drives: Option<(usize, usize)>,
 }
 
 /// Reads everything the start-up checks need. Never writes.
@@ -79,6 +85,9 @@ pub fn gather(selection: &DriveSelection, new_ca: bool) -> StartupData {
             return data;
         }
     };
+    if let Err(StoreError::NotEnoughDrives { primaries, backups }) = set.ensure_writable() {
+        data.not_enough_drives = Some((primaries, backups));
+    }
     let mut all_verified = true;
     for drive in set.drives() {
         let result = match drive.audit_log() {
@@ -149,6 +158,9 @@ pub enum Gate {
     NeedsRepair,
     /// An operation was interrupted: open the recovery screen first.
     NeedsRecovery,
+    /// Fewer than the primary and one backup are connected: only "Replace a lost
+    /// drive" can write (ADR 0003). The text says what is connected.
+    NeedsDriveReplacement(String),
     /// Every signing action is disabled; the text says why.
     Blocked(String),
 }
@@ -228,20 +240,46 @@ fn result_name(result: AuditResult) -> &'static str {
     }
 }
 
-/// One audit entry on one line: `#3 2026-11-01 10:00:00 UTC create master CN=… (success)`.
+/// One audit entry on one line: `#3 2026-11-01 10:00:00 UTC create master CN=… (success)`,
+/// with the details that say what happened: a finished operation's original action,
+/// the serials it concerns, a drive added or promoted by "Replace a lost drive".
 pub fn format_entry(entry: &AuditEntry) -> String {
-    let mut text = format!(
-        "#{} {} {}",
-        entry.seq,
-        format_utc(entry.time.get()),
+    let details = entry.details.as_ref();
+    let replaced = details.is_some_and(|d| d.drive_added.is_some());
+    let action = if replaced {
+        "replace a lost drive"
+    } else {
         action_name(entry.action)
-    );
+    };
+    let mut text = format!("#{} {} {action}", entry.seq, format_utc(entry.time.get()));
+    if let Some(original) = details.and_then(|d| d.original_action) {
+        text.push_str(&format!(" of \"{}\"", action_name(original)));
+    }
     if !entry.subject.is_empty() {
         text.push(' ');
         text.push_str(&entry.subject);
     }
     if let Some(operation) = entry.operation {
         text.push_str(&format!(", {operation}"));
+    }
+    if let Some(details) = details {
+        if let Some(drive) = details.drive_added {
+            text.push_str(&format!(", new drive {}", drive.short()));
+        }
+        if let Some(drive) = details.primary_promoted {
+            text.push_str(&format!(", drive {} promoted to primary", drive.short()));
+        }
+        if let Some(serials) = details.serials.as_ref().filter(|s| !s.is_empty()) {
+            text.push_str(&format!(
+                ", serial{} {}",
+                if serials.len() == 1 { "" } else { "s" },
+                serials
+                    .iter()
+                    .map(|serial| serial.to_hex())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
     text.push_str(&format!(" ({})", result_name(entry.result)));
     text
@@ -438,8 +476,22 @@ pub fn evaluate(data: &StartupData, production: bool, now: OffsetDateTime) -> St
             lines: compare_lines,
         });
     }
+    // Connected drives (FR-12 AC1, ADR 0003).
+    let mut too_few = None;
+    if let Some((primaries, backups)) = data.not_enough_drives {
+        let text = format!(
+            "Connected: {primaries} primary and {backups} backup drive{}. Every signing action needs the primary drive and at least one backup. If a drive is lost or broken, replace it with a new, empty drive.",
+            if backups == 1 { "" } else { "s" }
+        );
+        view.sections.push(Section {
+            title: "Connected drives".to_string(),
+            lines: vec![Line::new(Status::Blocked, text.clone())],
+        });
+        too_few = Some(text);
+    }
     // Interrupted operations (FR-22 AC4).
     let mut recovery_lines = Vec::new();
+    let mut unreadable = Vec::new();
     match &data.recovery {
         None => recovery_lines.push(Line::new(
             Status::Blocked,
@@ -453,6 +505,16 @@ pub fn evaluate(data: &StartupData, production: bool, now: OffsetDateTime) -> St
             recovery_lines.push(Line::new(Status::Ok, "No operation was interrupted."))
         }
         Some(Ok(report)) => {
+            for problem in &report.unreadable {
+                let text = format!(
+                    "{problem} Keystone offers no action for an interrupted operation until this drive is repaired or replaced."
+                );
+                recovery_lines.push(Line::new(Status::Blocked, text.clone()));
+                unreadable.push(text);
+            }
+            if report.pending.is_empty() && report.unreadable.is_empty() {
+                recovery_lines.push(Line::new(Status::Ok, "No operation was interrupted."));
+            }
             view.pending_operations = report.pending.len();
             for pending in &report.pending {
                 recovery_lines.push(Line::new(
@@ -503,6 +565,8 @@ pub fn evaluate(data: &StartupData, production: bool, now: OffsetDateTime) -> St
         Gate::Blocked(broken.join(" "))
     } else if !view.histories.is_empty() {
         Gate::Blocked(comparison_block.unwrap_or_default())
+    } else if !unreadable.is_empty() {
+        Gate::Blocked(unreadable.join(" "))
     } else if view.pending_operations > 0 {
         // A pending operation also makes a behind drive unrepairable (Damaged), so the
         // recovery screen comes first.
@@ -513,6 +577,8 @@ pub fn evaluate(data: &StartupData, production: bool, now: OffsetDateTime) -> St
         Gate::Blocked("Something on the drives cannot be verified.".to_string())
     } else if !view.repairs.is_empty() {
         Gate::NeedsRepair
+    } else if let Some(text) = too_few {
+        Gate::NeedsDriveReplacement(text)
     } else {
         Gate::Continue
     };
@@ -597,8 +663,12 @@ mod tests {
 
     fn selection(d: &Drives, indexes: &[usize]) -> DriveSelection {
         DriveSelection {
-            primary: d.roots[indexes[0]].clone(),
-            backups: indexes[1..].iter().map(|i| d.roots[*i].clone()).collect(),
+            primary: (indexes[0] == 0).then(|| d.roots[0].clone()),
+            backups: indexes
+                .iter()
+                .filter(|i| **i != 0)
+                .map(|i| d.roots[*i].clone())
+                .collect(),
             export: d.export.clone(),
         }
     }
@@ -740,6 +810,93 @@ mod tests {
             evaluate(&data, false, now()).gate,
             Gate::Blocked(_)
         ));
+    }
+
+    #[test]
+    fn adr0003_one_drive_disables_signing_and_offers_drive_replacement() {
+        // Covers: FR-12 AC1, SEC-11 (ADR 0003)
+        let d = drives(2);
+        let data = gather(&selection(&d, &[1]), false);
+        assert_eq!(data.not_enough_drives, Some((0, 1)));
+        let view = evaluate(&data, false, now());
+        let Gate::NeedsDriveReplacement(text) = &view.gate else {
+            panic!("expected drive replacement, got {:?}", view.gate);
+        };
+        assert!(
+            text.contains("Connected: 0 primary and 1 backup drive."),
+            "{text}"
+        );
+        assert!(
+            text.contains("replace it with a new, empty drive"),
+            "{text}"
+        );
+        let full = evaluate(&gather(&selection(&d, &[0, 1]), false), false, now());
+        assert_eq!(full.gate, Gate::Continue);
+    }
+
+    #[test]
+    fn unreadable_journal_blocks_and_is_named() {
+        // Covers: FR-22 AC4, SEC-22 (review finding 7)
+        let mut data = base();
+        data.recovery = Some(Ok(RecoveryReport {
+            pending: Vec::new(),
+            unreadable: vec!["The journal on backup drive bbbb cannot be read.".into()],
+        }));
+        let view = evaluate(&data, false, now());
+        let Gate::Blocked(reason) = &view.gate else {
+            panic!("expected blocked, got {:?}", view.gate);
+        };
+        assert!(reason.contains("backup drive bbbb"), "{reason}");
+        assert!(
+            view.sections
+                .iter()
+                .any(|s| s.lines.iter().any(|l| l.status == Status::Blocked
+                    && l.text.contains("until this drive is repaired or replaced")))
+        );
+    }
+
+    #[test]
+    fn audit_details_of_drive_replacement_and_recovery_are_shown() {
+        // Covers: FR-14 AC1, SEC-11 (ADR 0003), FR-22 AC3
+        use keystone_core::store::{AuditDetails, DriveId};
+        let added = DriveId::random().expect("id");
+        let promoted = DriveId::random().expect("id");
+        let mut replaced = entry(4, "");
+        replaced.action = AuditAction::DriveRepair;
+        replaced.details = Some(AuditDetails {
+            drive_added: Some(added),
+            primary_promoted: Some(promoted),
+            ..AuditDetails::default()
+        });
+        let text = format_entry(&replaced);
+        assert!(text.contains("replace a lost drive"), "{text}");
+        assert!(
+            text.contains(&format!("new drive {}", added.short())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("drive {} promoted to primary", promoted.short())),
+            "{text}"
+        );
+        let serial = keystone_core::model::Serial::from_bytes([7; 20]).expect("serial");
+        let mut finished = entry(5, "CN=KEYSTONE TEST Main");
+        finished.action = AuditAction::RecoveryFinish;
+        finished.details = Some(AuditDetails {
+            original_action: Some(AuditAction::SetupYubikey),
+            serials: Some(vec![serial]),
+            ..AuditDetails::default()
+        });
+        let text = format_entry(&finished);
+        assert!(
+            text.contains(
+                "finish interrupted operation of \"set up YubiKey and main intermediate\""
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("serial {}", serial.to_hex())),
+            "{text}"
+        );
     }
 
     #[test]
