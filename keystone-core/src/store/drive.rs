@@ -145,6 +145,23 @@ fn read_identity(keystone: &Dir) -> Result<DriveIdentity, StoreError> {
     })
 }
 
+/// Reads a file in the drive identity format (`drive.json`, or the replacement marker),
+/// or `None` when it does not exist.
+pub(crate) fn read_identity_file(
+    keystone: &Dir,
+    name: &str,
+) -> Result<Option<DriveIdentity>, StoreError> {
+    let Some(bytes) = keystone.read_if_exists(name, MAX_METADATA_BYTES)? else {
+        return Ok(None);
+    };
+    parse_drive_identity(&bytes)
+        .map(Some)
+        .map_err(|source| StoreError::Parse {
+            path: keystone.child(name),
+            source,
+        })
+}
+
 /// One opened CA drive.
 #[derive(Debug)]
 pub struct CaDrive {
@@ -586,13 +603,23 @@ pub(crate) fn write_identity(
     keystone: &Dir,
     identity: &DriveIdentity,
 ) -> Result<(), StoreError> {
+    write_identity_file(root, keystone, IDENTITY_FILE, identity)
+}
+
+/// Writes `identity` as `name` (create-only) and verifies it by read-back.
+pub(crate) fn write_identity_file(
+    root: &Path,
+    keystone: &Dir,
+    name: &str,
+    identity: &DriveIdentity,
+) -> Result<(), StoreError> {
     let bytes = to_json_file(identity);
-    keystone.write_atomic(IDENTITY_FILE, &bytes, WriteMode::CreateOnly)?;
-    let back = keystone.read_back(IDENTITY_FILE, MAX_METADATA_BYTES)?;
+    keystone.write_atomic(name, &bytes, WriteMode::CreateOnly)?;
+    let back = keystone.read_back(name, MAX_METADATA_BYTES)?;
     if back != bytes {
         return Err(StoreError::ReadBackMismatch {
             drive: root.display().to_string(),
-            path: keystone.child(IDENTITY_FILE),
+            path: keystone.child(name),
             expected: sha256(&bytes),
             actual: sha256(&back),
         });

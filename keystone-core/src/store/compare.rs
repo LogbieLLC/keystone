@@ -26,6 +26,7 @@ use super::fsio::WriteMode;
 use super::ids::OperationId;
 use super::journal::{OperationJournal, OutputFile};
 use super::paths::{AUDIT_LOG_FILE, JOURNAL_DIR};
+use super::replace::unrecorded_replacement;
 use crate::crypto::hash::sha256;
 use crate::limits::MAX_OUTPUT_FILE_BYTES;
 use crate::model::Timestamp;
@@ -187,6 +188,14 @@ impl DriveSet {
         let mut interrupted = Vec::new();
         let mut problems = Vec::new();
         for (drive, read) in self.drives().iter().zip(&reads) {
+            // A replacement drive whose addition the drives' log does not record (an
+            // interrupted Replace a lost drive, final storage review N4).
+            if let Some(problem) = reference
+                .or(read.valid())
+                .and_then(|log| unrecorded_replacement(drive, log))
+            {
+                problems.push(problem);
+            }
             if let LogRead::Valid(log) = read {
                 problems.extend(drive_problems_reported(drive, log));
                 logs.push(log.clone());

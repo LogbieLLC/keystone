@@ -9,14 +9,33 @@
 //!    which is then continued). It works with a single healthy drive, and with a CA that
 //!    has no primary or no backup left: that is the emergency it exists for. Everything
 //!    else that writes still needs a primary and at least one backup (FR-12 AC1).
-//! 2. [`DriveSet::add_drive`] copies every journal entry, every output file listed by a
-//!    completed entry, the audit log and the binary-hash record to the new drive, each
+//! 2. [`DriveSet::add_drive`] first writes the **replacement marker**
+//!    (`keystone/replacement.json`, [`REPLACEMENT_FILE`]) on the new drive: the identity
+//!    the copy will get. It then copies every journal entry, every output file listed by
+//!    a completed entry, the audit log and the binary-hash record to the new drive, each
 //!    create-only (the audit log only grows) and verified by read-back SHA-256 against
 //!    the completed entries and the source; then it verifies the whole copy again and
 //!    **writes the new drive's identity last**, so an interrupted copy never looks like a
 //!    CA drive. It then appends, on every drive, a `drive_repair` audit entry naming the
 //!    added drive and, when no primary was connected (the primary was lost), one naming
 //!    the backup promoted to primary. Both are written together, on each drive at once.
+//!
+//! # Interruptions (final storage review N4, N5)
+//! - Before the identity: the new drive is not a CA drive. Running the replacement again
+//!   continues the copy under the drive id its marker holds.
+//! - After the identity, before the audit entries: the new drive carries the marker
+//!   naming it, but no `drive_added` entry names it. [`DriveSet::compare`] reports it as
+//!   damage and [`DriveSet::begin_operation`] refuses, so nothing is ever signed with a
+//!   drive whose addition is not recorded. Running the replacement again from the other
+//!   drives ([`NewDriveState::CopiedNotRecorded`]) writes only the audit entries.
+//! - A drive that holds this CA is accepted as an interrupted replacement only with that
+//!   marker and while its addition is not recorded; any other drive of this CA (an
+//!   original backup, a drive added earlier) is refused, so the audit log never records
+//!   an existing drive as new.
+//!
+//! The identity is still written before the audit entries (not after them): an audit
+//! entry is then never written for a drive that does not exist yet, and the marker makes
+//! the one window between the two visible and resumable.
 //!
 //! Nothing is signed, nothing is overwritten (except the replace-type `audit.log`, which
 //! only grows, and `binary.sha256` on the new drive) and nothing is deleted. A drive's
@@ -27,17 +46,20 @@
 use std::path::{Path, PathBuf};
 
 use super::StoreError;
+use super::audit::AuditLog;
 use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult};
 use super::compare::{
     DriveComparison, copy_journal_entries, copy_output, drive_problems, extend_log,
 };
 use super::drive::{
     CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, IDENTITY_FORMAT, classify_drive,
-    layout_folders, same_device, write_identity,
+    layout_folders, read_identity_file, same_device, write_identity, write_identity_file,
 };
 use super::fsio::{Dir, EntryKind, WriteMode};
-use super::ids::DriveId;
-use super::paths::{AUDIT_LOG_FILE, BINARY_HASH_FILE, IDENTITY_FILE, KEYSTONE_DIR, STAGING_DIR};
+use super::ids::{CaId, DriveId};
+use super::paths::{
+    AUDIT_LOG_FILE, BINARY_HASH_FILE, IDENTITY_FILE, KEYSTONE_DIR, REPLACEMENT_FILE, STAGING_DIR,
+};
 use crate::crypto::hash::sha256;
 use crate::limits::{MAX_AUDIT_LOG_BYTES, MAX_METADATA_BYTES};
 use crate::model::Timestamp;
@@ -48,10 +70,12 @@ pub enum NewDriveState {
     /// Nothing (an empty drive).
     Empty,
     /// Part of a copy of this CA, from an interrupted earlier attempt (no identity yet):
-    /// every file on it equals the source's. The copy continues.
+    /// it carries this CA's replacement marker (or nothing yet) and every other file on it
+    /// equals the source's. The copy continues under the marker's drive id.
     PartialCopy,
-    /// A complete copy of this CA with its identity, from an attempt interrupted before
-    /// the audit entries: only the entries are written.
+    /// A complete copy of this CA with its identity and the replacement marker naming it,
+    /// from an attempt interrupted before the audit entries, whose addition is not in the
+    /// audit log yet: only the entries are written.
     CopiedNotRecorded(DriveId),
 }
 
@@ -135,20 +159,26 @@ impl DriveSet {
         let log = source.audit_log()?;
         let state = match classify_drive(target)? {
             DriveClass::Empty => NewDriveState::Empty,
-            DriveClass::DamagedKeystone(_) if is_partial_copy(target, source, &log)? => {
+            DriveClass::DamagedKeystone(_)
+                if is_partial_copy(target, source, &log, self.ca_id())? =>
+            {
                 NewDriveState::PartialCopy
             }
-            DriveClass::KeystoneCa(identity)
-                if identity.ca_id == self.ca_id()
-                    && identity.role == DriveRole::Backup
-                    && !log.entries().iter().any(|entry| {
-                        entry
-                            .details
-                            .as_ref()
-                            .is_some_and(|d| d.drive_added == Some(identity.drive_id))
-                    }) =>
-            {
+            DriveClass::KeystoneCa(identity) if identity.ca_id == self.ca_id() => {
+                // Final storage review N5: only an interrupted replacement (its marker
+                // names it, and its addition is not recorded) is continued; any other
+                // drive of this CA is an existing drive, never recorded as a new one.
                 let copy = CaDrive::open(target)?;
+                if identity.role != DriveRole::Backup
+                    || copy.replacement_marker()?.as_ref() != Some(&identity)
+                    || is_recorded(&log, identity.drive_id)
+                {
+                    return Err(StoreError::DriveSet(format!(
+                        "{} already holds this CA ({}); it is not a new drive. Connect it as one of the CA drives, and use an empty drive to replace a lost one",
+                        target.display(),
+                        copy.label()
+                    )));
+                }
                 verify_copy(&copy, source)?;
                 NewDriveState::CopiedNotRecorded(identity.drive_id)
             }
@@ -195,14 +225,28 @@ impl DriveSet {
         let drive_id = match plan.state {
             NewDriveState::CopiedNotRecorded(drive_id) => drive_id,
             NewDriveState::Empty | NewDriveState::PartialCopy => {
-                let identity = DriveIdentity {
-                    format: IDENTITY_FORMAT,
-                    ca_id: self.ca_id(),
-                    drive_id: DriveId::random()?,
-                    role: DriveRole::Backup,
-                    created: whole(time)?,
-                };
                 let keystone = Dir::open(&plan.target)?.ensure_dir(KEYSTONE_DIR)?;
+                // First the marker with the identity the copy gets (an interrupted copy
+                // continues under it), then the copy, and the identity last.
+                let identity = match read_identity_file(&keystone, REPLACEMENT_FILE)? {
+                    Some(marker) if is_replacement_of(&marker, self.ca_id()) => marker,
+                    Some(_) => {
+                        return Err(StoreError::DriveHoldsCa {
+                            root: plan.target.clone(),
+                        });
+                    }
+                    None => {
+                        let identity = DriveIdentity {
+                            format: IDENTITY_FORMAT,
+                            ca_id: self.ca_id(),
+                            drive_id: DriveId::random()?,
+                            role: DriveRole::Backup,
+                            created: whole(time)?,
+                        };
+                        write_identity_file(&plan.target, &keystone, REPLACEMENT_FILE, &identity)?;
+                        identity
+                    }
+                };
                 for name in layout_folders() {
                     keystone.ensure_dir(name)?;
                 }
@@ -343,14 +387,68 @@ fn verify_copy(copy: &CaDrive, source: &CaDrive) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// True when `log` records the addition of drive `drive_id` (a `drive_added` entry).
+fn is_recorded(log: &AuditLog, drive_id: DriveId) -> bool {
+    log.entries().iter().any(|entry| {
+        entry
+            .details
+            .as_ref()
+            .is_some_and(|details| details.drive_added == Some(drive_id))
+    })
+}
+
+/// True for a replacement marker that a replacement of a drive of `ca_id` writes.
+fn is_replacement_of(marker: &DriveIdentity, ca_id: CaId) -> bool {
+    marker.ca_id == ca_id && marker.role == DriveRole::Backup
+}
+
+impl CaDrive {
+    /// The replacement marker on this drive: the identity "Replace a lost drive" set it
+    /// up with, or `None` for a drive set up together with its CA.
+    pub(crate) fn replacement_marker(&self) -> Result<Option<DriveIdentity>, StoreError> {
+        read_identity_file(self.keystone(), REPLACEMENT_FILE)
+    }
+}
+
+/// Final storage review N4: one sentence when `drive` was set up by "Replace a lost
+/// drive" but `log` does not record its addition (the replacement was interrupted after
+/// the identity and before the audit entries), or its marker does not match it. Nothing
+/// may be signed with such a drive; running the replacement again records it.
+pub(crate) fn unrecorded_replacement(drive: &CaDrive, log: &AuditLog) -> Option<String> {
+    let marker = match drive.replacement_marker() {
+        Ok(None) => return None,
+        Ok(Some(marker)) => marker,
+        Err(error) => {
+            return Some(format!(
+                "{}: its replacement marker cannot be read: {error}",
+                drive.label()
+            ));
+        }
+    };
+    if marker != *drive.identity() {
+        return Some(format!(
+            "{}: its replacement marker does not match its drive identity",
+            drive.label()
+        ));
+    }
+    (!is_recorded(log, marker.drive_id)).then(|| {
+        format!(
+            "{} was set up by Replace a lost drive, but the replacement was interrupted before its addition was recorded in the audit log, so nothing can be signed with it yet. Connect only the other drives and run Replace a lost drive again, choosing this drive as the new drive: that records its addition and copies nothing else",
+            drive.label()
+        )
+    })
+}
+
 /// True when every file under `target`'s `keystone/` folder is part of a copy of
-/// `source`: the same bytes at the same place (the audit log a byte prefix of the
+/// `source`: this CA's replacement marker (written first; without it nothing else may be
+/// there yet), and the same bytes at the same place (the audit log a byte prefix of the
 /// source's; the binary-hash record may be older), no drive identity, no staging
 /// content, nothing else. Temporary files of cut-off writes are ignored.
 fn is_partial_copy(
     target: &Path,
     source: &CaDrive,
-    log: &super::audit::AuditLog,
+    log: &AuditLog,
+    ca_id: CaId,
 ) -> Result<bool, StoreError> {
     let top = Dir::open(target)?;
     let entries: Vec<(String, EntryKind)> = top
@@ -360,6 +458,17 @@ fn is_partial_copy(
         .collect();
     if entries != [(KEYSTONE_DIR.to_string(), EntryKind::Dir)] {
         return Ok(false);
+    }
+    let keystone = top.open_dir(KEYSTONE_DIR)?;
+    match read_identity_file(&keystone, REPLACEMENT_FILE) {
+        Ok(Some(marker)) if is_replacement_of(&marker, ca_id) => {}
+        Ok(None) => {
+            return Ok(keystone
+                .entries()?
+                .iter()
+                .all(|(name, kind)| *kind == EntryKind::File && name.starts_with('.')));
+        }
+        Ok(Some(_)) | Err(_) => return Ok(false),
     }
     let mut pending = vec![String::new()];
     while let Some(rel) = pending.pop() {
@@ -391,6 +500,7 @@ fn is_partial_copy(
                     pending.push(path);
                 }
                 EntryKind::File if rel.is_empty() && name == IDENTITY_FILE => return Ok(false),
+                EntryKind::File if rel.is_empty() && name == REPLACEMENT_FILE => {}
                 EntryKind::File if rel.is_empty() && name == AUDIT_LOG_FILE => {
                     let ours = dir.read(&name, MAX_AUDIT_LOG_BYTES)?;
                     if !log.as_bytes().starts_with(&ours) {

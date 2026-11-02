@@ -16,6 +16,8 @@
 //!     drive.json                 drive identity (DriveIdentity): CA id, drive id, role
 //!     audit.log                  hash-chained audit log, JSON Lines (audit module)
 //!     binary.sha256              SEC-19 record: "<64 hex>  keystone\n"
+//!     replacement.json           only on a drive set up by Replace a lost drive: written
+//!                                first, the identity the copy gets (replace module)
 //!     journal/
 //!       op-000001/               one folder per operation (FR-22)
 //!         001-pending.json       first entry: kind, subject, planned serials
@@ -41,9 +43,10 @@
 //! - **Atomic writes** (FR-12 AC4): write a temporary file (`.<name>.tmp-<random>`) in the
 //!   same folder, write everything, fsync it, rename it into place, fsync the folder.
 //! - **Never overwrite** (SEC-20): certificates, keys, CRLs, record updates, journal
-//!   entries and drive identities are *create-only*; the final rename uses
-//!   `RENAME_NOREPLACE`, so an existing file is never replaced. Only `audit.log` (which
-//!   only ever grows, checked against the parsed chain) and `binary.sha256` are replaced.
+//!   entries, drive identities and replacement markers are *create-only*; the final
+//!   rename uses `RENAME_NOREPLACE`, so an existing file is never replaced. Only
+//!   `audit.log` (which only ever grows, checked against the parsed chain) and
+//!   `binary.sha256` are replaced.
 //! - **Every drive, verified** (FR-12 AC1, AC2, SEC-11): every change goes to every
 //!   connected CA drive (the primary and at least one backup); each copy is then read
 //!   back from the medium (page cache dropped first) and compared by SHA-256. Any
@@ -105,7 +108,7 @@ pub use journal::{
 pub use operation::OperationHandle;
 pub use paths::{
     AUDIT_LOG_FILE, BINARY_HASH_FILE, EXPORT_DIR, IDENTITY_FILE, JOURNAL_DIR, KEYSTONE_DIR,
-    OutputDir, OutputPath, RECORD_DIR, STAGING_DIR,
+    OutputDir, OutputPath, RECORD_DIR, REPLACEMENT_FILE, STAGING_DIR,
 };
 pub use record::{
     CertStatus, CertificateRecord, IssuanceRecord, RecordChange, RecordSource, RecordUpdate,

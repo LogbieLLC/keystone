@@ -278,17 +278,23 @@ fn sec11_an_interrupted_copy_never_looks_complete_and_is_continued() {
         assert!(backup.add_drive(&plan, ts(30)).is_err(), "fault {allowed}");
         fault::disarm();
         // A drive that looks like a CA drive holds a complete, verified copy: next to the
-        // source it is in sync, or one of the two only lacks the replacement entries.
+        // source one of the two only lacks the replacement entries, or neither has them
+        // and the new drive is reported as not recorded yet, so nothing is signed with it
+        // (final storage review N4).
         if let DriveClass::KeystoneCa(_) = classify_drive(&new).expect("classify") {
             let both = DriveSet::open(&[drives.ca_drive(1), new.as_path()]).expect("open");
             match both.compare().expect("compare") {
-                DriveComparison::InSync => {}
                 DriveComparison::Behind { plans } => assert!(
                     plans.iter().all(|plan| plan
                         .steps
                         .iter()
                         .all(|step| matches!(step, crate::store::RepairStep::AuditOnly { .. }))),
                     "fault {allowed}: {plans:?}"
+                ),
+                DriveComparison::Damaged { problems } => assert!(
+                    problems.len() == 1
+                        && problems[0].contains("its addition was recorded in the audit log"),
+                    "fault {allowed}: {problems:?}"
                 ),
                 other => panic!("fault {allowed}: the copy is not complete: {other:?}"),
             }
@@ -325,4 +331,148 @@ fn sec11_an_interrupted_copy_never_looks_complete_and_is_continued() {
             "fault {allowed}: {details:?}"
         );
     }
+}
+
+/// A fresh `ca(2)` whose lost drive is replaced from the drives `sources`, interrupted
+/// right after the new drive's identity was written and before any audit entry.
+fn interrupted_after_identity(sources: &[usize]) -> (TestDrives, std::path::PathBuf) {
+    let mut probe = ca(2);
+    let new = probe.add_ca_drive();
+    let set = open_some(&probe, sources);
+    let plan = set.plan_add_drive(&new).expect("plan");
+    fault::take_count();
+    let added = set.add_drive(&plan, ts(30)).expect("add");
+    let total = fault::take_count();
+    // The last changes are the audit-log writes, one per drive of the new set.
+    let audit_writes = u32::try_from(added.drives().len()).expect("count");
+    drop(probe);
+    let mut drives = ca(2);
+    let new = drives.add_ca_drive();
+    let set = open_some(&drives, sources);
+    let plan = set.plan_add_drive(&new).expect("plan");
+    fault::fail_after(total - audit_writes);
+    assert!(set.add_drive(&plan, ts(30)).is_err());
+    fault::disarm();
+    assert!(matches!(
+        classify_drive(&new).expect("classify"),
+        DriveClass::KeystoneCa(_)
+    ));
+    (drives, new)
+}
+
+/// A refusal of a drive that already holds this CA as the "new" drive.
+fn refused_as_existing_drive(result: Result<AddDrivePlan, StoreError>) {
+    match result {
+        Err(StoreError::DriveSet(message)) => {
+            assert!(message.contains("already holds this CA"), "{message}");
+        }
+        other => panic!("expected the drive to be refused as a CA drive, got {other:?}"),
+    }
+}
+
+#[test]
+fn regression_an_existing_backup_is_never_recorded_as_a_new_drive() {
+    // Covers: SEC-11, FR-14 AC1, SEC-20
+    // Regression (final storage review N5): an original, in-sync backup offered as the
+    // "new" drive was taken for an interrupted replacement, and a false "new backup drive
+    // added" entry (plus a promotion) was written to the audit log.
+    let mut drives = ca(3);
+    let b1 = open_some(&drives, &[1]);
+    let before = b1.audit_log().expect("log");
+    refused_as_existing_drive(b1.plan_add_drive(drives.ca_drive(2)));
+    // The original primary too.
+    refused_as_existing_drive(b1.plan_add_drive(drives.ca_drive(0)));
+    assert_eq!(b1.audit_log().expect("log"), before, "nothing was recorded");
+    assert_eq!(
+        open_some(&drives, &[0, 1, 2]).compare().expect("compare"),
+        DriveComparison::InSync
+    );
+    // A drive added by an earlier, finished replacement is a CA drive, not a new drive.
+    let new = drives.add_ca_drive();
+    let pair = open_some(&drives, &[0, 1]);
+    let plan = pair.plan_add_drive(&new).expect("plan");
+    pair.add_drive(&plan, ts(30)).expect("add");
+    let pair = open_some(&drives, &[0, 1]);
+    refused_as_existing_drive(pair.plan_add_drive(&new));
+    // A complete copy is an interrupted replacement only while it carries the
+    // replacement marker naming it.
+    let (copied, copy) = interrupted_after_identity(&[0]);
+    let primary = open_some(&copied, &[0]);
+    let marker = copy.join("keystone").join(REPLACEMENT_FILE);
+    let moved = copied.root().join("marker-moved-away");
+    fs::rename(&marker, &moved).expect("move the marker away");
+    refused_as_existing_drive(primary.plan_add_drive(&copy));
+    // A keystone folder whose marker names another CA is a foreign CA's.
+    let foreign = drives.add_ca_drive();
+    fs::create_dir(foreign.join("keystone")).expect("mkdir");
+    fs::rename(&moved, foreign.join("keystone").join(REPLACEMENT_FILE)).expect("plant");
+    assert!(matches!(
+        pair.plan_add_drive(&foreign),
+        Err(StoreError::DriveHoldsCa { .. })
+    ));
+}
+
+#[test]
+fn regression_a_drive_whose_addition_is_not_recorded_is_never_used() {
+    // Covers: SEC-11, FR-14 AC1, FR-12 AC3, FR-22 AC6, SEC-22
+    // Regression (final storage review N4): interrupted after the new drive's identity
+    // and before the audit entries (the review's fault 9 of 11; the replacement marker
+    // written first adds one change), the new drive was used with the primary, signing
+    // was allowed and its addition was never audited.
+    let mut probe = TestDrives::new(2);
+    issue_master(&new_ca(&probe), 1, ts(10));
+    let new = probe.add_ca_drive();
+    let primary = open_some(&probe, &[0]);
+    let plan = primary.plan_add_drive(&new).expect("plan");
+    fault::take_count();
+    primary.add_drive(&plan, ts(30)).expect("add");
+    let total = fault::take_count();
+    assert_eq!(total, 12, "the review's 11 changes, plus the marker");
+    drop(probe);
+    let mut drives = TestDrives::new(2);
+    issue_master(&new_ca(&drives), 1, ts(10));
+    let new = drives.add_ca_drive();
+    let primary = open_some(&drives, &[0]);
+    let plan = primary.plan_add_drive(&new).expect("plan");
+    // Fault 10 of 12: the first audit write (the primary's) fails after the identity.
+    fault::fail_after(total - 2);
+    assert!(primary.add_drive(&plan, ts(30)).is_err());
+    fault::disarm();
+    let DriveClass::KeystoneCa(identity) = classify_drive(&new).expect("classify") else {
+        panic!("the new drive's identity was written");
+    };
+    let both = DriveSet::open(&[drives.ca_drive(0), new.as_path()]).expect("open");
+    both.ensure_writable().expect("a primary and a backup");
+    assert!(added_entries(&both).is_empty(), "nothing was recorded");
+    // Signing is impossible with it: compare reports it and no operation begins.
+    match both.compare().expect("compare") {
+        DriveComparison::Damaged { problems } => {
+            assert!(
+                problems.iter().any(|p| p.contains("Replace a lost drive")
+                    && p.contains(&identity.drive_id.short())),
+                "{problems:?}"
+            )
+        }
+        other => panic!("expected the unrecorded drive to be reported, got {other:?}"),
+    }
+    assert!(matches!(
+        both.begin_operation(OperationKind::Revoke, "CN=KEYSTONE TEST", &[], ts(40)),
+        Err(StoreError::Damaged(_))
+    ));
+    // Running the replacement again records it (only the audit entries are written).
+    let primary = open_some(&drives, &[0]);
+    let plan = primary.plan_add_drive(&new).expect("plan again");
+    assert_eq!(
+        plan.state,
+        NewDriveState::CopiedNotRecorded(identity.drive_id)
+    );
+    let set = primary.add_drive(&plan, ts(31)).expect("record");
+    assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+    let details = added_entries(&set);
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert_eq!(details[0].drive_added, Some(identity.drive_id));
+    set.begin_operation(OperationKind::Revoke, "CN=KEYSTONE TEST", &[], ts(40))
+        .expect("begin")
+        .cancel(ts(40))
+        .expect("cancel");
 }

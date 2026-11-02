@@ -210,10 +210,22 @@ fn sec11_a_replacement_interrupted_at_every_drive_change_finishes_when_run_again
         );
         testing::reset();
         // No partial drive ever looks complete: a drive that has its identity holds the
-        // whole verified copy (at most the replacement's audit entries differ).
+        // whole verified copy (at most the replacement's audit entries differ), and while
+        // no drive records its addition nothing can be signed with it (final storage
+        // review N4).
         if let DriveClass::KeystoneCa(_) = classify_drive(&new).unwrap() {
-            match open(&[&backup, &new]).drive_set().compare().unwrap() {
-                DriveComparison::InSync => {}
+            let both = open(&[&backup, &new]);
+            match both.drive_set().compare().unwrap() {
+                DriveComparison::Damaged { problems } => {
+                    assert!(
+                        problems.len() == 1 && problems[0].contains("Replace a lost drive again"),
+                        "change {crash_at}: {problems:?}"
+                    );
+                    assert!(
+                        !both.startup_report(test.now).unwrap().signing_allowed(),
+                        "change {crash_at}"
+                    );
+                }
                 DriveComparison::Behind { plans } => assert!(
                     plans.iter().all(|plan| plan
                         .steps
