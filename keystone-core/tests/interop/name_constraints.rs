@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use keystone_testkit::hierarchy::{HierarchyOptions, TestHierarchy};
 use keystone_testkit::keys;
-use keystone_testkit::x509::{issue_test_leaf, issue_test_leaf_with_email};
+use keystone_testkit::x509::{TestLeafNames, issue_test_leaf, issue_test_leaf_with_names};
 
 use crate::support::{Workspace, go_verify, openssl, text};
 
@@ -138,25 +138,74 @@ fn fr21_ac5_only_permitted_ip_ranges_verify() {
     assert_rejected_by_constraints(h, &["host.starnet"], &[DOC_V6]);
 }
 
-#[test]
-fn fr21_ac3_go_rejects_email_names_under_the_zero_length_exclusion() {
-    // Covers: FR-21 AC3
-    // Go (like NSS) treats the zero-length rfc822Name exclusion as "all email".
-    // OpenSSL compares it literally and does not reject on it (see profile.rs).
-    let h = dns_only();
-    let leaf = issue_test_leaf_with_email(
+/// A leaf with the permitted DNS name `host.starnet` plus the given email or URI
+/// names; it must fail with BOTH verifiers because of the name constraints.
+fn assert_email_or_uri_rejected(h: &TestHierarchy, emails: &[&str], uris: &[&str]) {
+    let leaf = issue_test_leaf_with_names(
         &h.sub.der,
         h.sub_key,
         keys::rsa2048(2),
-        &["host.starnet"],
-        &[],
-        &["ops@starnet"],
+        &TestLeafNames {
+            dns: &["host.starnet"],
+            emails,
+            uris,
+            ..TestLeafNames::default()
+        },
     );
     let v = verify_both(h, &leaf);
-    assert!(!v.go_ok, "Go accepted an email name: {}", v.go_output);
     assert!(
-        v.go_output.contains("excluded") || v.go_output.contains("constraint"),
-        "{}",
+        !v.openssl_ok,
+        "openssl accepted {emails:?} {uris:?}: {}",
+        v.openssl_output
+    );
+    assert!(
+        v.openssl_output.contains("subtree violation"),
+        "openssl must fail on the name constraints: {}",
+        v.openssl_output
+    );
+    assert!(!v.go_ok, "Go accepted {emails:?} {uris:?}: {}", v.go_output);
+    assert!(
+        v.go_output.contains("constraint"),
+        "Go must fail on the name constraints: {}",
         v.go_output
     );
+}
+
+#[test]
+fn fr21_ac3_email_names_fail_with_openssl_and_go() {
+    // Covers: FR-21 AC3, FR-21 AC5, SEC-21
+    // ADR 0001: only the reserved .keystone.invalid domain is permitted for email.
+    for h in [dns_only(), dns_and_ip()] {
+        assert_email_or_uri_rejected(h, &["ops@starnet"], &[]);
+        assert_email_or_uri_rejected(h, &["attacker@evil.example"], &[]);
+    }
+}
+
+#[test]
+fn fr21_ac3_uri_names_fail_with_openssl_and_go() {
+    // Covers: FR-21 AC3, FR-21 AC5, SEC-21
+    // ADR 0001: only the reserved .keystone.invalid domain is permitted for URIs.
+    for h in [dns_only(), dns_and_ip()] {
+        assert_email_or_uri_rejected(h, &[], &["spiffe://evil.example/workload"]);
+        assert_email_or_uri_rejected(h, &[], &["https://host.starnet/"]);
+    }
+}
+
+#[test]
+fn fr21_ac3_a_permitted_dns_leaf_still_verifies_with_both() {
+    // Covers: FR-21 AC5, FR-21 AC3
+    // The email and URI entries in permittedSubtrees do not restrict DNS names.
+    let h = dns_only();
+    let leaf = issue_test_leaf_with_names(
+        &h.sub.der,
+        h.sub_key,
+        keys::rsa2048(2),
+        &TestLeafNames {
+            dns: &["host.starnet", "a.b.starnet"],
+            ..TestLeafNames::default()
+        },
+    );
+    let v = verify_both(h, &leaf);
+    assert!(v.openssl_ok, "openssl: {}", v.openssl_output);
+    assert!(v.go_ok, "Go: {}", v.go_output);
 }

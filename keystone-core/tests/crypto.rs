@@ -4,9 +4,11 @@
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use keystone_core::crypto::hash::sha384;
+use keystone_core::crypto::pem::{LABEL_ENCRYPTED_PRIVATE_KEY, decode_one, encode};
 use keystone_core::crypto::pkcs8::{
     contains_plaintext_private_key, decrypt_key_pem, encrypt_master_key_pem, encrypt_sub_key_pem,
 };
@@ -48,25 +50,52 @@ fn fr16_cancel_before_start_produces_nothing() {
     assert!(matches!(result, Err(CryptoError::Cancelled)));
 }
 
+/// Longest time a cancel may take to stop RSA 8,192 generation. OpenSSL stops within
+/// tens of milliseconds of the request (its next prime-search callback); a full
+/// RSA 8,192 generation takes many seconds, so a cancel that did not really abort
+/// generation cannot meet this bound.
+const CANCEL_LATENCY_LIMIT: Duration = Duration::from_secs(2);
+
 #[test]
 fn fr16_cancel_during_rsa_8192_generation_stops_it() {
     // Covers: FR-16 AC2, NFR-03
     let cancel = CancelFlag::new();
     let worker_cancel = cancel.clone();
-    let started = Instant::now();
-    let worker = std::thread::spawn(move || {
-        // Cancel from inside the progress callback after a few steps, which is the
-        // same as the GUI pressing Cancel while generation runs.
-        generate_rsa(8192, &worker_cancel, &|step| {
-            if step == 3 {
-                worker_cancel.cancel();
-            }
-        })
+    let cancelled_at: Mutex<Option<Instant>> = Mutex::new(None);
+    let late_progress = AtomicU64::new(0);
+    let (result, returned_at) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Cancel from inside the progress callback after a few steps, which is
+                // the same as the GUI pressing Cancel while generation runs.
+                let result = generate_rsa(8192, &worker_cancel, &|step| {
+                    if worker_cancel.is_cancelled() {
+                        // Progress after the cancelling step: OpenSSL went on.
+                        late_progress.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if step == 3 {
+                        *cancelled_at.lock().unwrap() = Some(Instant::now());
+                        worker_cancel.cancel();
+                    }
+                });
+                (result, Instant::now())
+            })
+            .join()
+            .expect("worker thread")
     });
-    let result = worker.join().expect("worker thread");
     assert!(matches!(result, Err(CryptoError::Cancelled)), "{result:?}");
     assert!(cancel.is_cancelled());
-    assert!(started.elapsed() < Duration::from_secs(60));
+    let cancelled_at = cancelled_at.lock().unwrap().expect("cancel was requested");
+    let latency = returned_at - cancelled_at;
+    assert!(
+        latency < CANCEL_LATENCY_LIMIT,
+        "generation went on for {latency:?} after Cancel"
+    );
+    assert_eq!(
+        late_progress.load(Ordering::SeqCst),
+        0,
+        "no progress is reported after the callback asked OpenSSL to stop"
+    );
     // The next generation on this thread is not affected by the aborted one.
     let key = generate_rsa(2048, &CancelFlag::new(), &|_| {}).expect("generation after cancel");
     assert_eq!(key.bits(), 2048);
@@ -74,14 +103,40 @@ fn fr16_cancel_during_rsa_8192_generation_stops_it() {
 
 #[test]
 fn fr16_cancel_from_another_thread() {
-    // Covers: FR-16 AC2
+    // Covers: FR-16 AC2, NFR-03
     let cancel = CancelFlag::new();
     let worker_cancel = cancel.clone();
-    let worker = std::thread::spawn(move || generate_rsa(8192, &worker_cancel, &|_| {}));
-    std::thread::sleep(Duration::from_millis(200));
+    let steps = Arc::new(AtomicU64::new(0));
+    let worker_steps = Arc::clone(&steps);
+    let worker = std::thread::spawn(move || {
+        let result = generate_rsa(8192, &worker_cancel, &|step| {
+            worker_steps.store(step, Ordering::SeqCst);
+        });
+        (result, Instant::now())
+    });
+    // Wait until generation is really running, then press Cancel.
+    let waiting = Instant::now();
+    while steps.load(Ordering::SeqCst) < 2 {
+        assert!(waiting.elapsed() < Duration::from_secs(30), "no progress");
+        std::thread::yield_now();
+    }
+    let cancelled_at = Instant::now();
     cancel.cancel();
-    let result = worker.join().expect("worker thread");
+    let steps_at_cancel = steps.load(Ordering::SeqCst);
+    let (result, returned_at) = worker.join().expect("worker thread");
     assert!(matches!(result, Err(CryptoError::Cancelled)), "{result:?}");
+    let latency = returned_at - cancelled_at;
+    assert!(
+        latency < CANCEL_LATENCY_LIMIT,
+        "generation went on for {latency:?} after Cancel"
+    );
+    // At most the one step already running when Cancel was pressed reports progress.
+    assert!(
+        steps.load(Ordering::SeqCst) <= steps_at_cancel + 1,
+        "progress after Cancel: {} -> {}",
+        steps_at_cancel,
+        steps.load(Ordering::SeqCst)
+    );
 }
 
 #[test]
@@ -195,6 +250,159 @@ fn fr04_ac3_wrong_passphrase_is_a_clear_error_with_no_output() {
         decrypt_key_pem(master_pem.as_bytes(), &wrong),
         Err(CryptoError::WrongPassphrase)
     ));
+}
+
+#[test]
+fn sec07_passphrase_reaches_openssl_with_explicit_length_and_a_nul_byte_never_panics() {
+    // Covers: SEC-07, FR-04 AC3
+    // The passphrase goes from its locked buffer to PKCS8_decrypt as a pointer and an
+    // explicit length; no C-string copy is made, so a NUL byte is just another byte
+    // (the old path copied it into an unwiped CString and panicked on a NUL).
+    let key = keys::rsa2048(1);
+    let with_nul = passphrase("KEYSTONE TEST\0words");
+    let pem = encrypt_sub_key_pem(key, &with_nul).expect("encrypt and read back");
+    let back = decrypt_key_pem(pem.as_bytes(), &with_nul).expect("decrypt");
+    assert_eq!(
+        back.public_key_spki_der().unwrap(),
+        key.public_key_spki_der().unwrap()
+    );
+    // Everything after the NUL counts: the prefix is a different passphrase.
+    assert!(matches!(
+        decrypt_key_pem(pem.as_bytes(), &passphrase("KEYSTONE TEST")),
+        Err(CryptoError::WrongPassphrase)
+    ));
+    let plain = encrypt_master_key_pem(keys::rsa2048(1), &passphrase("KEYSTONE TEST words"))
+        .expect("encrypt");
+    assert!(matches!(
+        decrypt_key_pem(plain.as_bytes(), &passphrase("KEYSTONE TEST\0")),
+        Err(CryptoError::WrongPassphrase)
+    ));
+}
+
+/// Re-encrypts with `encrypt` until the byte pattern `from` occurs exactly once in
+/// the key file's AlgorithmIdentifier (the random salt and IV could contain it too),
+/// then replaces it with `to` (same length) and returns the tampered PEM.
+fn with_tampered_parameters(encrypt: &dyn Fn() -> String, from: &[u8], to: &[u8]) -> String {
+    assert_eq!(from.len(), to.len());
+    for _ in 0..8 {
+        let pem = encrypt();
+        let mut der =
+            decode_one(pem.as_bytes(), LABEL_ENCRYPTED_PRIVATE_KEY, MAX_PEM_BYTES).expect("PEM");
+        // EncryptedPrivateKeyInfo ::= SEQUENCE (4-byte header) { AlgorithmIdentifier, .. }
+        assert_eq!((der[0], der[1], der[4]), (0x30, 0x82, 0x30));
+        let algorithm_end = 6 + usize::from(der[5]);
+        let found: Vec<usize> = der[..algorithm_end]
+            .windows(from.len())
+            .enumerate()
+            .filter(|(_, window)| *window == from)
+            .map(|(at, _)| at)
+            .collect();
+        if let [at] = found[..] {
+            der[at..at + to.len()].copy_from_slice(to);
+            return encode(LABEL_ENCRYPTED_PRIVATE_KEY, &der);
+        }
+    }
+    panic!("pattern {from:02x?} not found exactly once");
+}
+
+fn assert_refused_fast(pem: &str, words: &SecretString, expected_detail: &str) {
+    let started = Instant::now();
+    let error = decrypt_key_pem(pem.as_bytes(), words).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(error, CryptoError::UnsupportedKeyEncryption(_)),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains(expected_detail), "{message}");
+    assert!(
+        message.contains("PBKDF2-HMAC-SHA256") && message.contains("scrypt"),
+        "the error says what Keystone accepts: {message}"
+    );
+    // Refused before any key derivation: the hostile file would take about 6 s.
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+}
+
+#[test]
+fn sec08_tampered_kdf_parameters_are_refused_before_decrypting() {
+    // Covers: SEC-08, FR-04 AC1, FR-04 AC3
+    // A file whose KDF cost was raised would otherwise hang decryption with no way
+    // to cancel (2^31 PBKDF2 iterations take about 25 minutes). Only the exact two
+    // parameter sets Keystone writes are accepted.
+    let key = keys::rsa2048(1);
+    let words = passphrase("KEYSTONE TEST kdf words");
+    let sub = || encrypt_sub_key_pem(key, &words).expect("encrypt");
+    let master = || encrypt_master_key_pem(key, &words).expect("encrypt");
+
+    // PBKDF2: iteration count 600,000 (0x0927C0) changed to 8,388,607 and to 600,001.
+    let hostile = with_tampered_parameters(
+        &sub,
+        &[0x02, 0x03, 0x09, 0x27, 0xC0],
+        &[0x02, 0x03, 0x7F, 0xFF, 0xFF],
+    );
+    assert_refused_fast(&hostile, &words, "8388607");
+    let off_by_one = with_tampered_parameters(
+        &sub,
+        &[0x02, 0x03, 0x09, 0x27, 0xC0],
+        &[0x02, 0x03, 0x09, 0x27, 0xC1],
+    );
+    assert_refused_fast(&off_by_one, &words, "600001");
+    // PBKDF2 PRF hmacWithSHA256 changed to hmacWithSHA512.
+    let prf = with_tampered_parameters(
+        &sub,
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x09],
+        &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x0B],
+    );
+    assert_refused_fast(&prf, &words, "PRF");
+    // AES-256-CBC changed to AES-128-CBC.
+    let aes = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01];
+    let cipher = with_tampered_parameters(
+        &master,
+        &[&aes[..], &[0x2A]].concat(),
+        &[&aes[..], &[0x02]].concat(),
+    );
+    assert_refused_fast(&cipher, &words, "cipher");
+    // scrypt: N = 2^14 changed to 2^13; r = 8 changed to 16; p = 1 changed to 2.
+    let n = with_tampered_parameters(
+        &master,
+        &[0x02, 0x02, 0x40, 0x00],
+        &[0x02, 0x02, 0x20, 0x00],
+    );
+    assert_refused_fast(&n, &words, "8192");
+    let r = with_tampered_parameters(&master, &[0x02, 0x01, 0x08], &[0x02, 0x01, 0x10]);
+    assert_refused_fast(&r, &words, "r = 16");
+    let p = with_tampered_parameters(
+        &master,
+        &[0x02, 0x01, 0x01, 0x30],
+        &[0x02, 0x01, 0x02, 0x30],
+    );
+    assert_refused_fast(&p, &words, "p = 2");
+    // The untampered files still decrypt.
+    decrypt_key_pem(sub().as_bytes(), &words).expect("Keystone's PBKDF2 parameters");
+    decrypt_key_pem(master().as_bytes(), &words).expect("Keystone's scrypt parameters");
+}
+
+#[test]
+fn sec08_malformed_encryption_structures_are_refused() {
+    // Covers: SEC-08, FR-04 AC3
+    let words = passphrase("KEYSTONE TEST kdf words");
+    let pem = encrypt_sub_key_pem(keys::rsa2048(1), &words).expect("encrypt");
+    let der = decode_one(pem.as_bytes(), LABEL_ENCRYPTED_PRIVATE_KEY, MAX_PEM_BYTES).unwrap();
+    // Truncated, trailing data, wrong outer tag, and an empty structure.
+    let mut trailing = der.clone();
+    trailing.push(0);
+    let mut wrong_tag = der.clone();
+    wrong_tag[0] = 0x31;
+    for bad in [
+        der[..der.len() - 1].to_vec(),
+        trailing,
+        wrong_tag,
+        vec![0x30, 0x00],
+    ] {
+        let error = decrypt_key_pem(encode(LABEL_ENCRYPTED_PRIVATE_KEY, &bad).as_bytes(), &words)
+            .unwrap_err();
+        assert!(matches!(error, CryptoError::Der(_)), "{error:?}");
+    }
 }
 
 #[test]

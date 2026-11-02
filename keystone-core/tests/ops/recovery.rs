@@ -8,13 +8,15 @@ use keystone_core::crypto::pkcs8::decrypt_key_pem;
 use keystone_core::model::RevocationReason;
 use keystone_core::ops::testing::{self, FaultPoint};
 use keystone_core::ops::{
-    Ca, CrlPlanKind, IssuerUnlock, NoProgress, OpsError, RecoveryAction, RecoverySecrets,
+    Blocker, Ca, CrlPlanKind, IssuerUnlock, MainIntermediateRequest, NoProgress, OpsError,
+    RecoveryAction, RecoverySecrets,
 };
 use keystone_core::store::{CertStatus, RecordSource, YubikeySetupStep};
 use keystone_core::token::{SIGNING_SLOT, TokenSigner, check_hardening_report};
 use keystone_testkit::SimulatedYubiKey;
 use keystone_testkit::TestDrives;
 use keystone_testkit::keys;
+use keystone_testkit::names::test_name;
 use keystone_testkit::simulator::{FaultKind, SimOp};
 
 use crate::support::*;
@@ -220,6 +222,25 @@ fn fr22_ac4_flow_a_without_its_first_crl_needs_the_master_passphrase_to_finish()
     );
     assert!(items[0].actions[0].description.contains("passphrase"));
     let time = confirmed(&ca, now + time::Duration::minutes(1));
+    // FR-13 AC6: the master is signed but its first CRL does not exist yet, so it
+    // cannot sign its first child: Flow B is refused (the unfinished Flow A blocks
+    // every signing action) and nothing reaches the YubiKey.
+    let before = ca.state().unwrap();
+    if let Some(master) = before.master() {
+        assert!(before.current_crl(master.serial()).is_none());
+    }
+    let (mut yubikey, controller) = token(70_000_401);
+    let flow_b_request = MainIntermediateRequest::new(test_name("R4 Main"), Some(master_crl()));
+    let refused = ca
+        .plan_yubikey_setup(&mut yubikey, &flow_b_request, time)
+        .unwrap_err();
+    assert!(
+        matches!(&refused, OpsError::Blocked(blockers)
+            if blockers.iter().any(|b| matches!(b, Blocker::PendingOperation { .. }))),
+        "{refused}"
+    );
+    assert_eq!(controller.signature_count(), 0);
+    assert_eq!(controller.reopen_count(), 0);
     let error = ca
         .run_recovery(
             items[0].operation,
@@ -240,6 +261,9 @@ fn fr22_ac4_flow_a_without_its_first_crl_needs_the_master_passphrase_to_finish()
     )
     .unwrap();
     assert_no_lost_record(&ca);
+    // Once the first CRL exists, Flow B can be planned.
+    ca.plan_yubikey_setup(&mut yubikey, &flow_b_request, time)
+        .expect("Flow B after the master's first CRL exists");
     let state = ca.state().unwrap();
     let master_cert = state.master().unwrap();
     assert_eq!(

@@ -7,11 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use openssl::hash::MessageDigest;
-use openssl::md::Md;
-use openssl::pkey::{Id, PKey, Private, Public};
-use openssl::pkey_ctx::PkeyCtx;
+use openssl::pkey::{Id, PKey, Public};
 use openssl::rsa::Padding;
-use openssl::sign::{Signer, Verifier};
+use openssl::sign::Verifier;
 
 use super::CryptoError;
 use super::ffi;
@@ -60,8 +58,12 @@ impl CancelFlag {
 /// There is no `Clone`, `Display` or serialization, and `Debug` shows only the key
 /// size, so the key cannot reach a log or file by accident (SEC-07). The only way to
 /// write it out is encrypted PKCS#8 (`crypto::pkcs8`).
+///
+/// The OpenSSL key object is owned by the FFI module and reachable only from inside
+/// `crypto` (its accessor `handle` is `pub(super)`), so no other module can
+/// call an OpenSSL function on it (SEC-04, SEC-18).
 pub struct RsaPrivateKey {
-    pkey: PKey<Private>,
+    key: ffi::PrivateKey,
 }
 
 impl fmt::Debug for RsaPrivateKey {
@@ -85,27 +87,30 @@ pub fn generate_rsa(
     if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) || !bits.is_multiple_of(1024) {
         return Err(CryptoError::UnsupportedKeySize { bits });
     }
-    let der = ffi::generate_rsa_der(bits, cancel.as_atomic(), progress)?;
-    let pkey = PKey::private_key_from_der(der.as_bytes())?;
-    drop(der);
-    let key = RsaPrivateKey { pkey };
+    let key = RsaPrivateKey {
+        key: ffi::generate_rsa_key(bits, cancel.as_atomic(), progress)?,
+    };
     key.check_rsa(Some(bits))?;
     Ok(key)
 }
 
 impl RsaPrivateKey {
-    pub(crate) fn from_pkey(pkey: PKey<Private>) -> Result<Self, CryptoError> {
-        let key = RsaPrivateKey { pkey };
+    /// Wraps a key decrypted by `crypto::pkcs8`; anything but RSA is refused.
+    pub(super) fn from_handle(key: ffi::PrivateKey) -> Result<Self, CryptoError> {
+        let key = RsaPrivateKey { key };
         key.check_rsa(None)?;
         Ok(key)
     }
 
-    pub(crate) fn pkey(&self) -> &PKey<Private> {
-        &self.pkey
+    /// The OpenSSL key, for `crypto::pkcs8` only. Deliberately `pub(super)`: an
+    /// accessor visible to the whole crate would let any module call OpenSSL on the
+    /// private key without writing `openssl::`, past the boundary check (SEC-18).
+    pub(super) fn handle(&self) -> &ffi::PrivateKey {
+        &self.key
     }
 
     fn check_rsa(&self, expected_bits: Option<u32>) -> Result<(), CryptoError> {
-        if self.pkey.id() != Id::RSA {
+        if !self.key.is_rsa() {
             return Err(CryptoError::UnsupportedKey("not an RSA key".into()));
         }
         if let Some(bits) = expected_bits
@@ -121,7 +126,7 @@ impl RsaPrivateKey {
 
     /// Modulus size in bits.
     pub fn bits(&self) -> u32 {
-        self.pkey.bits()
+        self.key.bits()
     }
 
     /// The public exponent.
@@ -131,28 +136,22 @@ impl RsaPrivateKey {
 
     /// The public key as DER `SubjectPublicKeyInfo`.
     pub fn public_key_spki_der(&self) -> Result<Vec<u8>, CryptoError> {
-        Ok(self.pkey.public_key_to_der()?)
+        self.key.public_key_der()
     }
 
     /// Signs `message` with SHA-384 and RSA PKCS#1 v1.5 (sha384WithRSAEncryption).
+    ///
+    /// PKCS#1 v1.5 is deterministic, so this equals signing the SHA-384 digest of
+    /// `message` with [`RsaPrivateKey::sign_sha384_digest`].
     pub fn sign_sha384_pkcs1(&self, message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let mut signer = Signer::new(MessageDigest::sha384(), &self.pkey)?;
-        signer.set_rsa_padding(Padding::PKCS1)?;
-        signer.update(message)?;
-        Ok(signer.sign_to_vec()?)
+        self.key.sign_sha384_digest(&super::hash::sha384(message))
     }
 
     /// Signs a precomputed SHA-384 digest with RSA PKCS#1 v1.5 (the DigestInfo for
     /// SHA-384 is added by OpenSSL). Used where only the digest crosses a boundary,
     /// as with a token.
     pub fn sign_sha384_digest(&self, digest: &[u8; SHA384_LEN]) -> Result<Vec<u8>, CryptoError> {
-        let mut ctx = PkeyCtx::new(&self.pkey)?;
-        ctx.sign_init()?;
-        ctx.set_rsa_padding(Padding::PKCS1)?;
-        ctx.set_signature_md(Md::sha384())?;
-        let mut signature = Vec::new();
-        ctx.sign_to_vec(digest, &mut signature)?;
-        Ok(signature)
+        self.key.sign_sha384_digest(digest)
     }
 }
 

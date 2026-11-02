@@ -53,6 +53,31 @@ pub enum CertError {
     /// The request does not fit the hierarchy (wrong issuer, missing choice, ...).
     #[error("{0}")]
     Request(String),
+    /// The validity was planned for another level than the certificate's (FR-10 AC3).
+    #[error(
+        "the validity was planned for a {}, not for a {}",
+        .planned.display_name(),
+        .level.display_name()
+    )]
+    ValidityPlannedForOtherLevel {
+        /// The level the validity was planned for.
+        planned: crate::model::CaLevel,
+        /// The level of the certificate being issued.
+        level: crate::model::CaLevel,
+    },
+    /// The subject name equals the issuer's name (FR-10 AC3).
+    #[error("the subject name must differ from the issuer's name")]
+    SubjectEqualsIssuer,
+    /// The certificate would start before its issuer (FR-10 AC1).
+    #[error(
+        "the certificate would start at {not_before}, before its issuer ({issuer_not_before}); check the clock"
+    )]
+    StartsBeforeIssuer {
+        /// Planned notBefore (RFC 3339).
+        not_before: String,
+        /// The issuer's notBefore (RFC 3339).
+        issuer_not_before: String,
+    },
     /// The signer's key is not the issuer's key.
     #[error("the signing key does not belong to the issuer certificate")]
     SignerKeyMismatch,

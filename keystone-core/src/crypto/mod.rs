@@ -17,7 +17,9 @@ pub mod pkcs8;
 pub mod rand;
 pub mod rsa;
 pub mod secret;
+pub mod secure_heap;
 pub mod verify;
 
 pub use error::CryptoError;
 pub use rsa::{CancelFlag, RsaPrivateKey, generate_rsa};
+pub use secure_heap::init;

@@ -15,6 +15,15 @@ pub enum CryptoError {
     /// Memory for a secret could not be allocated and locked into RAM (SEC-07).
     #[error("could not lock memory for a secret; raise the memory-lock limit (RLIMIT_MEMLOCK)")]
     LockedMemory,
+    /// OpenSSL's secure heap for private keys could not be locked into RAM (SEC-07).
+    /// No private key is generated or loaded without it.
+    #[error(
+        "could not lock {bytes} bytes of memory for private keys (OpenSSL secure heap); raise the memory-lock limit (RLIMIT_MEMLOCK) to at least 8 MiB"
+    )]
+    SecureHeapUnavailable {
+        /// Size of the secure heap.
+        bytes: usize,
+    },
     /// A secret buffer would have to grow beyond its fixed capacity.
     #[error("secret is longer than its fixed buffer allows")]
     SecretCapacity,
@@ -55,6 +64,13 @@ pub enum CryptoError {
     /// A DER structure (certificate, CRL, key) could not be parsed.
     #[error("invalid DER encoding: {0}")]
     Der(String),
+    /// An encrypted key file uses other encryption parameters than the two sets
+    /// Keystone writes (SEC-08). Refused before any key derivation runs, so a file
+    /// with a raised KDF cost cannot hang decryption.
+    #[error(
+        "the key file uses encryption parameters Keystone does not write ({0}); Keystone reads only PBES2 with scrypt (N = 16384, r = 8, p = 1) or PBKDF2-HMAC-SHA256 (600,000 iterations), each with AES-256-CBC and a 16-byte salt and IV"
+    )]
+    UnsupportedKeyEncryption(String),
     /// A private key file is not encrypted. Keystone refuses plaintext keys (SEC-04).
     #[error("the key file is not encrypted; Keystone accepts only encrypted PKCS#8 keys")]
     NotEncrypted,

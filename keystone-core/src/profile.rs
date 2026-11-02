@@ -716,19 +716,30 @@ impl fmt::Display for IpRange {
     }
 }
 
+/// The only domain permitted for email (rfc822Name) and URI names in a
+/// sub-intermediate's name constraints (FR-21 AC3, ADR 0001).
+///
+/// `.invalid` is reserved by RFC 2606 and RFC 6761 and can never be a real host or
+/// mail domain, so permitting only names under it blocks every real email address
+/// and URI. The leading dot means "any name under this domain" for both forms
+/// (RFC 5280 section 4.2.1.10).
+pub const RESERVED_CONSTRAINT_DOMAIN: &str = ".keystone.invalid";
+
 /// Validated name constraints for a sub-intermediate (FR-21).
 ///
-/// Encoded as a critical extension with:
-/// - permittedSubtrees: every DNS name, and every IP range entered;
-/// - excludedSubtrees: 0.0.0.0/0 when no IPv4 range was entered, ::/0 when no IPv6
-///   range was entered, a zero-length rfc822Name (all email) and a zero-length
-///   URI (all URIs).
+/// Encoded as a critical extension with (ADR 0001):
+/// - permittedSubtrees: every DNS name and every IP range entered, then an
+///   rfc822Name and a uniformResourceIdentifier of [`RESERVED_CONSTRAINT_DOMAIN`];
+/// - excludedSubtrees: 0.0.0.0/0 when no IPv4 range was entered and ::/0 when no
+///   IPv6 range was entered.
 ///
-/// Interoperability note: Go's crypto/x509 and NSS treat a zero-length email or
-/// URI constraint as matching every name, so they reject any email or URI name
-/// under this sub-intermediate. OpenSSL (checked with 3.0) compares the empty
-/// base literally, so it does not reject email or URI names because of these two
-/// entries. The DNS and IP constraints are enforced by both.
+/// Why email and URI names are blocked through permittedSubtrees: a zero-length
+/// rfc822Name or URI in excludedSubtrees is read as "all names" by Go and NSS but
+/// compared literally by OpenSSL, which then excludes nothing. Permitting only the
+/// reserved `.invalid` domain is enforced the same way by OpenSSL and Go: a leaf with
+/// any real email address or URI fails verification with both (tested in
+/// `tests/interop/name_constraints.rs`). Permitting a name form does not restrict
+/// the other forms, so DNS names and IP addresses keep their own rules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameConstraintsSpec {
     permitted_dns: Vec<DnsConstraint>,
@@ -785,7 +796,8 @@ impl NameConstraintsSpec {
     }
 
     /// One line per permitted entry and exclusion, for the review step, the
-    /// issuance record and the audit log (FR-21 AC6).
+    /// issuance record and the audit log (FR-21 AC6). The lines state exactly what
+    /// the extension contains (ADR 0001).
     pub fn summary_lines(&self) -> Vec<String> {
         let mut lines: Vec<String> = self
             .permitted_dns
@@ -803,8 +815,12 @@ impl NameConstraintsSpec {
         if self.excludes_all_ipv6() {
             lines.push("excluded IP: ::/0 (all IPv6)".to_owned());
         }
-        lines.push("excluded: all email addresses".to_owned());
-        lines.push("excluded: all URIs".to_owned());
+        lines.push(format!(
+            "email addresses: none allowed (only the reserved {RESERVED_CONSTRAINT_DOMAIN} domain is permitted)"
+        ));
+        lines.push(format!(
+            "URIs: none allowed (only the reserved {RESERVED_CONSTRAINT_DOMAIN} domain is permitted)"
+        ));
         lines
     }
 }
@@ -1154,5 +1170,36 @@ mod tests {
         assert!(!with_v4.excludes_all_ipv4());
         assert!(with_v4.excludes_all_ipv6());
         assert!(NAME_CONSTRAINTS_OFF_WARNING.contains("any name"));
+    }
+
+    #[test]
+    fn fr21_ac6_summary_states_exactly_what_is_written() {
+        // Covers: FR-21 AC6, FR-21 AC3
+        // ADR 0001: the summary describes the extension as written, line by line.
+        let empty: [&str; 0] = [];
+        let dns_only = NameConstraintsSpec::new(&["starnet"], &empty).unwrap();
+        assert_eq!(
+            dns_only.summary_lines(),
+            [
+                "permitted DNS: starnet",
+                "excluded IP: 0.0.0.0/0 (all IPv4)",
+                "excluded IP: ::/0 (all IPv6)",
+                "email addresses: none allowed (only the reserved .keystone.invalid domain is permitted)",
+                "URIs: none allowed (only the reserved .keystone.invalid domain is permitted)",
+            ]
+        );
+        let with_v6 = NameConstraintsSpec::new(&["starnet"], &["2001:db8::/32"]).unwrap();
+        assert_eq!(
+            with_v6.summary_lines(),
+            [
+                "permitted DNS: starnet",
+                "permitted IP: 2001:db8::/32",
+                "excluded IP: 0.0.0.0/0 (all IPv4)",
+                "email addresses: none allowed (only the reserved .keystone.invalid domain is permitted)",
+                "URIs: none allowed (only the reserved .keystone.invalid domain is permitted)",
+            ]
+        );
+        assert_eq!(RESERVED_CONSTRAINT_DOMAIN, ".keystone.invalid");
+        assert!(RESERVED_CONSTRAINT_DOMAIN.ends_with(".invalid"));
     }
 }

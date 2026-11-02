@@ -28,7 +28,7 @@ use crate::crypto::verify::{certificate_der_to_pem, verify_certificate_signature
 use crate::model::{CaLevel, Serial};
 use crate::profile::{
     CertValidity, CrlLocation, NameConstraintsChoice, NameConstraintsSpec, PUBLIC_EXPONENT,
-    ValidatedName, level_profile,
+    RESERVED_CONSTRAINT_DOMAIN, ValidatedName, level_profile,
 };
 
 /// Most attempts to find an unused random serial before giving up.
@@ -37,8 +37,16 @@ pub const MAX_SERIAL_ATTEMPTS: usize = 32;
 /// A serial number that was checked against every known history (FR-10 AC2).
 ///
 /// Created by [`plan_serial`], which asks the caller's hook whether a candidate was
-/// ever seen, or by [`PlannedSerial::from_reserved`] when resuming an operation
-/// whose journal entry already reserved the serial (FR-22 AC1).
+/// ever seen, or, inside this crate only, by `PlannedSerial::from_reserved` when the
+/// operations layer resumes an operation whose journal entry already reserved the
+/// serial (FR-22 AC1). Code outside keystone-core cannot make one from an arbitrary
+/// serial, so it cannot sign without the uniqueness check:
+///
+/// ```compile_fail
+/// use keystone_core::cert::PlannedSerial;
+/// let serial = keystone_core::crypto::rand::random_serial().unwrap();
+/// let _unchecked = PlannedSerial::from_reserved(serial);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedSerial(Serial);
 
@@ -49,8 +57,9 @@ impl PlannedSerial {
     }
 
     /// A serial that a pending journal entry already reserved for this same
-    /// operation (recovery after a restart). Do not use for new operations.
-    pub fn from_reserved(serial: Serial) -> Self {
+    /// operation (recovery after a restart, `ops`), or one the `ops` test seam
+    /// checked against every known serial itself. Never for new operations.
+    pub(crate) fn from_reserved(serial: Serial) -> Self {
         PlannedSerial(serial)
     }
 }
@@ -130,9 +139,10 @@ fn check_request(
         return Err(CertError::WrongExponent(key.public_exponent));
     }
     if request.validity.level() != request.level {
-        return Err(CertError::Request(
-            "the validity was planned for a different level".into(),
-        ));
+        return Err(CertError::ValidityPlannedForOtherLevel {
+            planned: request.validity.level(),
+            level: request.level,
+        });
     }
     match (request.level.issuer_level(), issuer) {
         (None, None) => {
@@ -151,9 +161,7 @@ fn check_request(
                 )));
             }
             if issuer.subject_der == subject_der {
-                return Err(CertError::Request(
-                    "the subject name must differ from the issuer's name".into(),
-                ));
+                return Err(CertError::SubjectEqualsIssuer);
             }
             if request.validity.not_after() > issuer.not_after {
                 return Err(CertError::Profile(
@@ -165,9 +173,10 @@ fn check_request(
                 ));
             }
             if request.validity.not_before() < issuer.not_before {
-                return Err(CertError::Request(
-                    "the certificate would start before its issuer; check the clock".into(),
-                ));
+                return Err(CertError::StartsBeforeIssuer {
+                    not_before: crate::profile::rfc3339(request.validity.not_before()),
+                    issuer_not_before: crate::profile::rfc3339(issuer.not_before),
+                });
             }
             if issuer.subject_key_id.is_none() {
                 return Err(CertError::Request(
@@ -218,7 +227,11 @@ fn ip_name(bytes: Vec<u8>) -> Result<GeneralName, CertError> {
     ))
 }
 
-/// The nameConstraints value for a sub-intermediate (FR-21 AC2, AC3).
+/// The nameConstraints value for a sub-intermediate (FR-21 AC2, AC3, ADR 0001).
+///
+/// Email and URI names are blocked by permitting only the reserved
+/// [`RESERVED_CONSTRAINT_DOMAIN`] for both forms; no zero-length entry is written,
+/// because OpenSSL does not treat one as "all names" (see [`NameConstraintsSpec`]).
 fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints, CertError> {
     let mut permitted = Vec::new();
     for name in spec.permitted_dns() {
@@ -227,6 +240,12 @@ fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints,
     for range in spec.permitted_ip() {
         permitted.push(subtree(ip_name(range.constraint_bytes())?));
     }
+    permitted.push(subtree(GeneralName::Rfc822Name(ia5(
+        RESERVED_CONSTRAINT_DOMAIN,
+    )?)));
+    permitted.push(subtree(GeneralName::UniformResourceIdentifier(ia5(
+        RESERVED_CONSTRAINT_DOMAIN,
+    )?)));
     let mut excluded = Vec::new();
     if spec.excludes_all_ipv4() {
         excluded.push(subtree(ip_name(vec![0; 8])?));
@@ -234,11 +253,11 @@ fn name_constraints_value(spec: &NameConstraintsSpec) -> Result<NameConstraints,
     if spec.excludes_all_ipv6() {
         excluded.push(subtree(ip_name(vec![0; 32])?));
     }
-    excluded.push(subtree(GeneralName::Rfc822Name(ia5("")?)));
-    excluded.push(subtree(GeneralName::UniformResourceIdentifier(ia5("")?)));
     Ok(NameConstraints {
         permitted_subtrees: Some(permitted),
-        excluded_subtrees: Some(excluded),
+        // GeneralSubtrees has SIZE (1..MAX): with ranges entered for both IPv4 and
+        // IPv6 nothing is excluded, and the field is left out.
+        excluded_subtrees: (!excluded.is_empty()).then_some(excluded),
     })
 }
 
@@ -385,3 +404,6 @@ impl CertificateInfo {
         self.subject_der.clone()
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -226,17 +226,59 @@ pub fn issue_test_leaf_with_email(
     ips: &[IpAddr],
     emails: &[&str],
 ) -> Vec<u8> {
+    issue_test_leaf_with_names(
+        issuer_cert_der,
+        issuer_key,
+        leaf_key,
+        &TestLeafNames {
+            dns: dns_names,
+            ips,
+            emails,
+            uris: &[],
+        },
+    )
+}
+
+/// The subject alternative names of a test leaf, by name form.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TestLeafNames<'a> {
+    /// dNSName entries.
+    pub dns: &'a [&'a str],
+    /// iPAddress entries.
+    pub ips: &'a [IpAddr],
+    /// rfc822Name (email) entries.
+    pub emails: &'a [&'a str],
+    /// uniformResourceIdentifier entries.
+    pub uris: &'a [&'a str],
+}
+
+/// Like [`issue_test_leaf`], with every subject alternative name form a name
+/// constraint can cover: DNS, IP, email (rfc822Name) and URI.
+pub fn issue_test_leaf_with_names(
+    issuer_cert_der: &[u8],
+    issuer_key: &RsaPrivateKey,
+    leaf_key: &RsaPrivateKey,
+    names: &TestLeafNames<'_>,
+) -> Vec<u8> {
     let issuer = parse_certificate_der(issuer_cert_der).expect("issuer certificate");
     let spki = leaf_key.public_key_spki_der().expect("leaf key");
-    let mut names: Vec<GeneralName> = dns_names
+    let mut general_names: Vec<GeneralName> = names
+        .dns
         .iter()
         .map(|name| GeneralName::DnsName(Ia5String::new(name).expect("dns name")))
         .collect();
-    names.extend(ips.iter().map(|ip| GeneralName::from(*ip)));
-    names.extend(
-        emails
+    general_names.extend(names.ips.iter().map(|ip| GeneralName::from(*ip)));
+    general_names.extend(
+        names
+            .emails
             .iter()
             .map(|email| GeneralName::Rfc822Name(Ia5String::new(email).expect("email"))),
+    );
+    general_names.extend(
+        names
+            .uris
+            .iter()
+            .map(|uri| GeneralName::UniformResourceIdentifier(Ia5String::new(uri).expect("uri"))),
     );
     let now = OffsetDateTime::now_utc();
     let extensions = vec![
@@ -267,7 +309,7 @@ pub fn issue_test_leaf_with_email(
         extension(
             SubjectAltName::OID,
             false,
-            SubjectAltName(names).to_der().expect("san"),
+            SubjectAltName(general_names).to_der().expect("san"),
         ),
         extension(
             SubjectKeyIdentifier::OID,

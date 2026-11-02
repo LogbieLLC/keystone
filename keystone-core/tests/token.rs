@@ -1,23 +1,32 @@
 //! YubiKey rules through the `TokenSigner` trait, run against the simulator
 //! (NFR-08): detection, hardening, slot protection, attestation, signing.
+//!
+//! What the FR-07 AC5 tests here show: every rule of `verify_piv_attestation`
+//! (chain, signature by this device's F9, key, serial, policies, firmware) against
+//! the simulator's own attestation hierarchy. They do not show verification against
+//! Yubico's embedded roots and intermediates or genuine Yubico certificates (the real
+//! driver and the hardware E2E, NFR-09), nor that setup stops on a failure: that is
+//! shown by the operation tests in tests/ops.
 #![forbid(unsafe_code)]
 
 use std::time::Duration;
 
+use keystone_core::cert::parse_certificate_der;
 use keystone_core::crypto::hash::sha384;
 use keystone_core::crypto::rsa::{inspect_rsa_spki, verify_sha384_pkcs1};
 use keystone_core::crypto::secret::SecretString;
 use keystone_core::token::{
-    AttestationExpectation, AttestationTrust, DEFAULT_PIN, DEFAULT_PUK, FirmwareVersion, KeyOrigin,
-    NewPin, NewPuk, PinPolicy, SIGNING_SLOT, SlotAttestation, TokenError, TokenSigner, TouchPolicy,
-    WipeConfirmation, check_firmware, check_hardening_report, ensure_hardened, ensure_slot_empty,
-    verify_piv_attestation,
+    AttestationExpectation, AttestationTrust, DEFAULT_PIN, DEFAULT_PUK, DeviceInfo,
+    FirmwareVersion, KeyOrigin, NewPin, NewPuk, PinPolicy, SIGNING_SLOT, SlotAttestation,
+    TokenError, TokenSigner, TouchPolicy, WipeConfirmation, check_firmware, check_hardening_report,
+    ensure_hardened, ensure_slot_empty, verify_piv_attestation,
 };
 use keystone_testkit::simulator::{
-    FaultKind, SimOp, SlotPreset, TouchBehaviour, attestation_root_der, harden,
+    FaultKind, SLOT_ATTESTATION_CN, SimOp, SlotPreset, TouchBehaviour, attestation_root_der,
+    attestation_root_issuer, harden, slot_attestation_extensions,
 };
 use keystone_testkit::x509::{
-    TestCertSpec, build_test_certificate, cn_name_der, test_ca_extensions,
+    TestCertSpec, TestIssuer, build_test_certificate, cn_name_der, test_ca_extensions,
 };
 use keystone_testkit::{SimulatedYubiKey, SimulatorConfig};
 use time::OffsetDateTime;
@@ -153,6 +162,36 @@ fn fr06_ac3_silent_partial_management_key_write_is_caught_on_reopen() {
         check_hardening_report(&report),
         Err(TokenError::HardeningNotConfirmed(_))
     ));
+}
+
+#[test]
+fn fr06_ac3_a_stale_stored_management_key_is_caught_on_reopen() {
+    // Covers: FR-06 AC3, NFR-08
+    // Dependencies doc, YubiKey item 5: the PIN-protected copy must be the key the
+    // device now authenticates with. Here the new AES-256 key is active and the
+    // "PIN-protected" flag is set, but the stored copy is still the old key.
+    let mut token = sim(10_000_024);
+    token
+        .controller()
+        .fail_next(SimOp::SetManagementKey, 1, FaultKind::StaleStoredCopy);
+    harden(&mut token, PIN, PUK).expect("the setter reports success");
+    // The status flags alone look hardened ...
+    let status = token.credential_status().unwrap();
+    ensure_hardened(&status).expect("flags look right");
+    assert!(status.management_key_pin_protected);
+    // ... but authenticating with the stored copy through a fresh handle fails.
+    let report = token.reopen_and_verify_hardening(&s(PIN)).unwrap();
+    assert!(!report.management_key_authenticated);
+    assert!(matches!(
+        check_hardening_report(&report),
+        Err(TokenError::HardeningNotConfirmed(_))
+    ));
+    // Every operation that needs the management key fails the same way.
+    assert!(matches!(
+        token.generate_signing_key(&s(PIN)),
+        Err(TokenError::HardeningNotConfirmed(_))
+    ));
+    assert!(token.slot_status(SIGNING_SLOT).unwrap().is_empty());
 }
 
 #[test]
@@ -333,7 +372,10 @@ fn fr07_ac5_other_devices_f9_or_untrusted_root_fails() {
         slot_certificate_der: attestation.slot_certificate_der.clone(),
         f9_certificate_der: other.f9_certificate_der,
     };
-    assert!(verify(&mut token, &spki, &mixed).is_err());
+    assert!(matches!(
+        verify(&mut token, &spki, &mixed),
+        Err(TokenError::Attestation(_))
+    ));
     // Trusting a different self-signed root, or the F9 certificate itself.
     let device = token.device_info().unwrap();
     let other_key = keystone_testkit::keys::rsa2048(3);
@@ -364,6 +406,146 @@ fn fr07_ac5_other_devices_f9_or_untrusted_root_fails() {
         );
         assert!(matches!(result, Err(TokenError::Attestation(_))));
     }
+}
+
+#[test]
+fn fr07_ac5_f9_certificates_share_one_subject_and_bind_by_signature() {
+    // Covers: FR-07 AC5, SEC-23, NFR-08
+    // Real Yubico F9 certificates are believed to share one subject, so the
+    // simulator gives every device the same one. A slot attestation from another
+    // YubiKey, presented with this device's F9 certificate, has a matching issuer
+    // name but must still fail, because its signature is not this F9's.
+    let (mut token, spki, attestation) = attested(10_000_025);
+    let (_, other_spki, other) = attested(10_000_026);
+    let this_f9 = parse_certificate_der(&attestation.f9_certificate_der).unwrap();
+    let other_f9 = parse_certificate_der(&other.f9_certificate_der).unwrap();
+    assert_eq!(this_f9.subject_der, other_f9.subject_der, "one F9 subject");
+    assert_ne!(this_f9.spki_der, other_f9.spki_der, "one F9 key per device");
+    let other_slot = parse_certificate_der(&other.slot_certificate_der).unwrap();
+    assert_eq!(other_slot.issuer_der, this_f9.subject_der);
+    // Another device's slot certificate with this device's F9 (and the attested key
+    // of either device): refused.
+    let swapped = SlotAttestation {
+        slot_certificate_der: other.slot_certificate_der.clone(),
+        f9_certificate_der: attestation.f9_certificate_der.clone(),
+    };
+    for key in [&spki, &other_spki] {
+        let error = verify(&mut token, key, &swapped).unwrap_err();
+        assert!(
+            matches!(&error, TokenError::Attestation(reason)
+                if reason.contains("does not verify") || reason.contains("not signed by this device's F9")),
+            "{error}"
+        );
+    }
+    // Even when the other device's F9 is also offered as a trusted intermediate, so
+    // that a chain exists, the slot certificate is not signed by this F9.
+    let trust = AttestationTrust::new(
+        vec![attestation_root_der()],
+        vec![other.f9_certificate_der.clone()],
+    )
+    .unwrap();
+    let device = token.device_info().unwrap();
+    let result = verify_piv_attestation(
+        &trust,
+        &swapped,
+        &AttestationExpectation {
+            device: &device,
+            public_key_der: &other_spki,
+        },
+        OffsetDateTime::now_utc(),
+    );
+    assert!(
+        matches!(result, Err(TokenError::Attestation(_))),
+        "{result:?}"
+    );
+    // This device's own attestation verifies.
+    verify(&mut token, &spki, &attestation).expect("own attestation");
+}
+
+#[test]
+fn fr07_ac5_the_slot_certificate_must_be_signed_by_this_devices_f9() {
+    // Covers: FR-07 AC5, SEC-23
+    // A slot certificate with everything else right (key, serial, policies,
+    // firmware) that chains to the trusted root through another CA, here a trusted
+    // intermediate, is refused: it must be signed directly by the F9 certificate the
+    // device presented.
+    let (mut token, spki, genuine) = attested(10_000_022);
+    let device = token.device_info().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let intermediate_key = keystone_testkit::keys::rsa2048(4);
+    let intermediate_spki = intermediate_key.public_key_spki_der().unwrap();
+    let intermediate_name = cn_name_der("KEYSTONE TEST Attestation Intermediate");
+    let intermediate = build_test_certificate(&TestCertSpec {
+        subject_der: intermediate_name.clone(),
+        subject_public_key_der: intermediate_spki.clone(),
+        issuer: Some(attestation_root_issuer()),
+        self_key: None,
+        not_before: now - time::Duration::days(1),
+        not_after: now + time::Duration::days(365),
+        extensions: test_ca_extensions(&intermediate_spki, None),
+    });
+    let slot = build_test_certificate(&TestCertSpec {
+        subject_der: cn_name_der(SLOT_ATTESTATION_CN),
+        subject_public_key_der: spki.clone(),
+        issuer: Some(TestIssuer {
+            name_der: &intermediate_name,
+            key: intermediate_key,
+        }),
+        self_key: None,
+        not_before: now - time::Duration::days(1),
+        not_after: now + time::Duration::days(365),
+        extensions: slot_attestation_extensions(
+            device.firmware,
+            device.serial,
+            PinPolicy::Always,
+            TouchPolicy::Always,
+        ),
+    });
+    let trust = AttestationTrust::new(vec![attestation_root_der()], vec![intermediate]).unwrap();
+    let expectation = AttestationExpectation {
+        device: &device,
+        public_key_der: &spki,
+    };
+    let forged = SlotAttestation {
+        slot_certificate_der: slot,
+        f9_certificate_der: genuine.f9_certificate_der.clone(),
+    };
+    let error = verify_piv_attestation(&trust, &forged, &expectation, now).unwrap_err();
+    assert!(
+        matches!(&error, TokenError::Attestation(reason)
+            if reason.contains("not signed by this device's F9 certificate")),
+        "{error}"
+    );
+    // Control: the genuine attestation verifies with the same trust material.
+    verify_piv_attestation(&trust, &genuine, &expectation, now).expect("genuine attestation");
+}
+
+#[test]
+fn fr07_ac5_the_attested_firmware_must_be_this_devices() {
+    // Covers: FR-07 AC5, FR-05 AC3, SEC-23
+    let (mut token, spki, attestation) = attested(10_000_023);
+    let device = token.device_info().unwrap();
+    assert_eq!(device.firmware, FirmwareVersion::new(5, 7, 4));
+    // The device reported 5.7.5 before setup, but the attestation says 5.7.4.
+    let reported = DeviceInfo {
+        serial: device.serial,
+        firmware: FirmwareVersion::new(5, 7, 5),
+    };
+    let error = verify_piv_attestation(
+        &token.attestation_trust(),
+        &attestation,
+        &AttestationExpectation {
+            device: &reported,
+            public_key_der: &spki,
+        },
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, TokenError::Attestation(reason)
+            if reason.contains("attested firmware 5.7.4 is not this YubiKey's firmware 5.7.5")),
+        "{error}"
+    );
 }
 
 #[test]
