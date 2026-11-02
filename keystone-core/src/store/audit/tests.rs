@@ -222,15 +222,137 @@ fn regression_an_edited_link_names_the_entry_that_holds_it() {
             n - 1
         );
     }
-    // The last entry's link has no later entry to tell the two cases apart: the earlier
-    // entry is named, since it may be the changed one (the cross-drive comparison and
-    // the journal heads catch the rest).
+    // The last entry has no later entry to tell the two cases apart. The log alone says
+    // so honestly: entry 5 or the link in entry 6 (final storage review, finding 16; it
+    // used to claim that the possibly unchanged entry 5 was the first bad entry). A
+    // drive's journal heads decide when they can (next test).
+    let ambiguous = (5, AuditProblem::EntryOrLinkChanged { link_entry: 6 });
     let mut text = lines(&log);
     let old = log.entries()[5].prev.to_hex();
     text[5] = text[5].replace(&old, &Sha256Digest([9; 32]).to_hex());
+    assert_eq!(first_bad(&join(&text)), ambiguous, "link of the last entry");
+    let message = parse_audit_log(&join(&text)).expect_err("bad").to_string();
+    assert!(
+        message.contains("entry 5 or the link in entry 6 is the first bad entry"),
+        "{message}"
+    );
+    let mut text = lines(&log);
+    text[4] = text[4].replace("KEYSTONE TEST", "KEYSTONE TEST X");
+    assert_eq!(first_bad(&join(&text)), ambiguous, "content of entry 5");
+}
+
+/// Edits line `n` (1-based) of a drive's audit log.
+fn edit_line(drive: &std::path::Path, n: usize, edit: impl Fn(&str) -> String) {
+    let path = drive.join("keystone/audit.log");
+    let text = fs::read_to_string(&path).expect("read");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[n - 1] = edit(&lines[n - 1]);
+    fs::write(&path, join(&lines)).expect("write");
+}
+
+/// The first bad entry a drive's own audit-log check names.
+fn drive_first_bad(drive: &std::path::Path) -> (u64, AuditProblem) {
+    let opened = CaDrive::open(drive).expect("open");
+    match opened.audit_log() {
+        Err(StoreError::Parse {
+            source: ParseError::Audit { entry, problem },
+            ..
+        }) => {
+            // The view the comparison uses names the same entry.
+            let problem_text = opened.read_audit_log().problem().expect("problem");
+            assert!(
+                problem_text.contains(&problem.to_string()),
+                "{problem_text}"
+            );
+            (entry, problem)
+        }
+        other => panic!("expected an audit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn regression_the_journal_heads_name_the_changed_one_of_the_last_two_entries() {
+    // Covers: FR-14 AC3, SEC-09, SEC-22
+    // Regression (final storage review, finding 16): when the last entry's link did not
+    // match, the entry before it was named even when the link had been edited. Each
+    // finished operation's journal records its last audit entry's SHA-256, which tells
+    // the two cases apart whenever it covers one of the two entries.
+    let relink = |line: &str| {
+        let pos = line.find("\"prev\":\"").expect("prev") + 8;
+        let mut bytes = line.as_bytes().to_vec();
+        bytes[pos] = if bytes[pos] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(bytes).expect("utf8")
+    };
+    let rename = |line: &str| line.replace("KEYSTONE TEST", "KEYSTONE TEST X");
+    // Operations 1 and 2 wrote entries 1 and 2; both journals record their entry.
+    let two_operations = || {
+        let drives = TestDrives::new(2);
+        let set = new_ca(&drives);
+        issue_master(&set, 1, ts(10));
+        crate::store::testutil::issue(
+            &set,
+            crate::store::journal::OperationKind::SetupYubikey,
+            crate::store::testutil::cert(
+                serial(2),
+                crate::model::CaLevel::MainIntermediate,
+                serial(1),
+            ),
+            ts(20),
+        );
+        drives
+    };
+    let drives = two_operations();
+    edit_line(drives.ca_drive(1), 2, relink);
     assert_eq!(
-        first_bad(&join(&text)),
-        (5, AuditProblem::HashMismatch { next_entry: 6 })
+        drive_first_bad(drives.ca_drive(1)),
+        (2, AuditProblem::LinkChanged)
+    );
+    let drives = two_operations();
+    edit_line(drives.ca_drive(1), 1, rename);
+    assert_eq!(
+        drive_first_bad(drives.ca_drive(1)),
+        (1, AuditProblem::HashMismatch { next_entry: 2 })
+    );
+    // Entry 2 belongs to no operation; entry 3 is operation 2's, and its journal still
+    // matches entry 3: so entry 2 was changed.
+    let with_export = || {
+        let drives = TestDrives::new(2);
+        let set = new_ca(&drives);
+        issue_master(&set, 1, ts(10));
+        set.append_audit(
+            &[AuditDraft::new(
+                AuditAction::Export,
+                "CN=KEYSTONE TEST",
+                AuditResult::Success,
+            )],
+            ts(15),
+        )
+        .expect("export entry");
+        crate::store::testutil::issue(
+            &set,
+            crate::store::journal::OperationKind::SetupYubikey,
+            crate::store::testutil::cert(
+                serial(2),
+                crate::model::CaLevel::MainIntermediate,
+                serial(1),
+            ),
+            ts(20),
+        );
+        drives
+    };
+    let drives = with_export();
+    edit_line(drives.ca_drive(0), 2, rename);
+    assert_eq!(
+        drive_first_bad(drives.ca_drive(0)),
+        (2, AuditProblem::HashMismatch { next_entry: 3 })
+    );
+    // Entry 3's own bytes changed (its link): no head covers entry 2, so both remain
+    // possible and both are named.
+    let drives = with_export();
+    edit_line(drives.ca_drive(0), 3, relink);
+    assert_eq!(
+        drive_first_bad(drives.ca_drive(0)),
+        (2, AuditProblem::EntryOrLinkChanged { link_entry: 3 })
     );
 }
 

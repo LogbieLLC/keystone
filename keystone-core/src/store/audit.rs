@@ -23,9 +23,13 @@
 //! # Verification (FR-14 AC3)
 //! [`parse_audit_log`] checks every line and names the **first bad entry**: the first
 //! entry that is cut off, malformed, not canonical, out of sequence, or whose SHA-256
-//! does not match the hash stored in the entry after it. A change to the *last* entry is
-//! not visible in the chain of one drive; it is caught by the cross-drive comparison
-//! (FR-12 AC3) and by the audit-log head recorded in each finished journal entry.
+//! does not match the hash stored in the entry after it. When entry *n* does not link to
+//! entry *n-1*, entry *n+1* tells which of the two was changed; for the last entry there
+//! is none, so the log alone names both ([`AuditProblem::EntryOrLinkChanged`]) and a
+//! drive's journal heads decide when they can ([`CaDrive::audit_log`]). A change to the
+//! *last* entry that keeps its link is not visible in the chain of one drive; it is
+//! caught by the cross-drive comparison (FR-12 AC3) and by the audit-log head recorded
+//! in each finished journal entry.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -352,12 +356,23 @@ pub enum AuditProblem {
         /// The entry holding the link.
         next_entry: u64,
     },
-    /// This entry's link to the previous entry was changed: the previous entry still
-    /// verifies, and the next entry's link no longer matches this one.
-    #[error(
-        "its link to the previous entry was changed (the previous entry still verifies and the next entry no longer links to this one)"
-    )]
+    /// This entry's link to the previous entry was changed: the previous entry is intact
+    /// (the entry after this one no longer links to it, or the previous entry matches
+    /// the audit head its operation's journal recorded).
+    #[error("its link to the previous entry was changed (the previous entry is intact)")]
     LinkChanged,
+    /// This entry's SHA-256 does not match the link stored in entry `link_entry`, and no
+    /// later entry shows which of the two was changed (`link_entry` is the last entry,
+    /// or the entry after it cannot be read). Either this entry or the link in entry
+    /// `link_entry` was changed (FR-14 AC3). A drive's journal heads can tell them
+    /// apart; [`CaDrive::audit_log`] then names the changed one.
+    #[error(
+        "either this entry or the link in entry {link_entry} was changed: its SHA-256 does not match that link, and no later entry shows which of the two"
+    )]
+    EntryOrLinkChanged {
+        /// The entry holding the link.
+        link_entry: u64,
+    },
 }
 
 /// A parsed and verified audit log.
@@ -429,7 +444,9 @@ pub fn parse_audit_log(bytes: &[u8]) -> Result<AuditLog, ParseError> {
             Some(previous) if entry.prev != *previous => {
                 // Entry n-1 verified against its own predecessor. If entry n+1 still
                 // links to entry n, entry n is unchanged and n-1 was edited; if it does
-                // not, entry n itself (its link) was edited (FR-14 AC3).
+                // not, entry n itself (its link) was edited (FR-14 AC3). With no
+                // readable entry n+1 (n is the last entry) the log alone cannot tell
+                // the two apart, and says so (review finding 16).
                 let next_links_here = rest[newline + 1..]
                     .split(|b| *b == b'\n')
                     .next()
@@ -437,9 +454,13 @@ pub fn parse_audit_log(bytes: &[u8]) -> Result<AuditLog, ParseError> {
                     .map(|next| next.prev == sha256(line));
                 return Err(match next_links_here {
                     Some(false) => audit_err(number, AuditProblem::LinkChanged),
-                    _ => audit_err(
+                    Some(true) => audit_err(
                         number - 1,
                         AuditProblem::HashMismatch { next_entry: number },
+                    ),
+                    None => audit_err(
+                        number - 1,
+                        AuditProblem::EntryOrLinkChanged { link_entry: number },
                     ),
                 });
             }
@@ -593,10 +614,62 @@ impl CaDrive {
     /// Reads and verifies this drive's audit log (FR-14 AC3).
     pub fn audit_log(&self) -> Result<AuditLog, StoreError> {
         let bytes = self.keystone().read(AUDIT_LOG_FILE, MAX_AUDIT_LOG_BYTES)?;
-        parse_audit_log(&bytes).map_err(|source| StoreError::Parse {
-            path: self.keystone().child(AUDIT_LOG_FILE),
-            source,
-        })
+        self.parse_audit_bytes(&bytes)
+            .map_err(|source| StoreError::Parse {
+                path: self.keystone().child(AUDIT_LOG_FILE),
+                source,
+            })
+    }
+
+    /// [`parse_audit_log`] of this drive's log, where the audit heads this drive's
+    /// journals recorded resolve an [`AuditProblem::EntryOrLinkChanged`] when one of them
+    /// decides it (review finding 16): a head on the earlier entry shows whether that
+    /// entry is intact (then the link in the later entry was changed) or not; a head on
+    /// the later entry that still matches shows that the earlier entry was changed.
+    /// Otherwise the problem is kept as it is: either of the two was changed. Only the
+    /// naming changes; a log that does not verify is never accepted.
+    fn parse_audit_bytes(&self, bytes: &[u8]) -> Result<AuditLog, ParseError> {
+        let error = match parse_audit_log(bytes) {
+            Ok(log) => return Ok(log),
+            Err(error) => error,
+        };
+        let ParseError::Audit {
+            entry,
+            problem: AuditProblem::EntryOrLinkChanged { link_entry },
+        } = error
+        else {
+            return Err(error);
+        };
+        let Ok(journals) = self.journal() else {
+            return Err(error);
+        };
+        let hash_of = |seq: u64| {
+            let index = usize::try_from(seq.checked_sub(1)?).ok()?;
+            bytes.split(|b| *b == b'\n').nth(index).map(sha256)
+        };
+        let heads: Vec<AuditHead> = journals
+            .values()
+            .filter_map(|journal| journal.audit_head())
+            .collect();
+        let changed = |problem| Err(audit_err(entry, problem));
+        if let Some(head) = heads.iter().find(|head| head.seq == entry) {
+            return if hash_of(entry) == Some(head.sha256) {
+                Err(audit_err(link_entry, AuditProblem::LinkChanged))
+            } else {
+                changed(AuditProblem::HashMismatch {
+                    next_entry: link_entry,
+                })
+            };
+        }
+        if heads
+            .iter()
+            .any(|head| head.seq == link_entry && hash_of(link_entry) == Some(head.sha256))
+        {
+            return changed(AuditProblem::HashMismatch {
+                next_entry: link_entry,
+            });
+        }
+        Err(error)
     }
 
     /// Reads this drive's audit log without failing: a verified log, a missing file, or
@@ -609,7 +682,7 @@ impl CaDrive {
             .read_if_exists(AUDIT_LOG_FILE, MAX_AUDIT_LOG_BYTES)
         {
             Ok(None) => LogRead::Missing,
-            Ok(Some(bytes)) => match parse_audit_log(&bytes) {
+            Ok(Some(bytes)) => match self.parse_audit_bytes(&bytes) {
                 Ok(log) => LogRead::Valid(log),
                 Err(source) => LogRead::Unverified {
                     problem: StoreError::Parse {

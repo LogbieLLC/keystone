@@ -137,8 +137,9 @@ pub enum ParseError {
     #[error("invalid content: {0}")]
     Invalid(String),
     /// The audit log is broken. `entry` is the 1-based number of the first bad entry
-    /// (FR-14 AC3).
-    #[error("audit log entry {entry} is the first bad entry: {problem}")]
+    /// (FR-14 AC3); for [`AuditProblem::EntryOrLinkChanged`] it is the earlier of the two
+    /// entries one of which was changed.
+    #[error("{}", audit_message(*entry, problem))]
     Audit {
         /// 1-based number (line) of the first bad entry.
         entry: u64,
@@ -150,6 +151,17 @@ pub enum ParseError {
 impl ParseError {
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         ParseError::Invalid(message.into())
+    }
+}
+
+/// The text of [`ParseError::Audit`]: it names the first bad entry, or both candidates
+/// when the log cannot tell which of two was changed (review finding 16).
+fn audit_message(entry: u64, problem: &AuditProblem) -> String {
+    match problem {
+        AuditProblem::EntryOrLinkChanged { link_entry } => format!(
+            "audit log entry {entry} or the link in entry {link_entry} is the first bad entry: {problem}"
+        ),
+        _ => format!("audit log entry {entry} is the first bad entry: {problem}"),
     }
 }
 
