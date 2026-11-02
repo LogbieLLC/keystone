@@ -139,9 +139,10 @@ fn check_request(
         return Err(CertError::WrongExponent(key.public_exponent));
     }
     if request.validity.level() != request.level {
-        return Err(CertError::Request(
-            "the validity was planned for a different level".into(),
-        ));
+        return Err(CertError::ValidityPlannedForOtherLevel {
+            planned: request.validity.level(),
+            level: request.level,
+        });
     }
     match (request.level.issuer_level(), issuer) {
         (None, None) => {
@@ -160,9 +161,7 @@ fn check_request(
                 )));
             }
             if issuer.subject_der == subject_der {
-                return Err(CertError::Request(
-                    "the subject name must differ from the issuer's name".into(),
-                ));
+                return Err(CertError::SubjectEqualsIssuer);
             }
             if request.validity.not_after() > issuer.not_after {
                 return Err(CertError::Profile(
@@ -174,9 +173,10 @@ fn check_request(
                 ));
             }
             if request.validity.not_before() < issuer.not_before {
-                return Err(CertError::Request(
-                    "the certificate would start before its issuer; check the clock".into(),
-                ));
+                return Err(CertError::StartsBeforeIssuer {
+                    not_before: crate::profile::rfc3339(request.validity.not_before()),
+                    issuer_not_before: crate::profile::rfc3339(issuer.not_before),
+                });
             }
             if issuer.subject_key_id.is_none() {
                 return Err(CertError::Request(

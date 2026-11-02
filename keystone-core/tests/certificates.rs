@@ -13,14 +13,17 @@ use keystone_core::crypto::pkcs8::contains_plaintext_private_key;
 use keystone_core::crypto::verify::{VerifyOptions, certificates_pem_to_der, verify_chain};
 use keystone_core::model::{CaLevel, Serial};
 use keystone_core::profile::{
-    CrlLocation, CrlUrl, NameConstraintsChoice, NameConstraintsSpec, ProfileError, ValidatedName,
-    plan_validity,
+    CertValidity, CrlLocation, CrlUrl, NameConstraintsChoice, NameConstraintsSpec, ProfileError,
+    ValidatedName, plan_validity,
 };
-use keystone_core::token::TokenSigner;
-use keystone_testkit::hierarchy::{HierarchyOptions, MAIN_CRL_URL, MASTER_CRL_URL, TestHierarchy};
+use keystone_core::token::{TokenCaSigner, TokenSigner};
+use keystone_testkit::hierarchy::{
+    HierarchyOptions, MAIN_CRL_URL, MASTER_CRL_URL, TestHierarchy, test_pin,
+};
 use keystone_testkit::keys;
 use keystone_testkit::names::{assert_test_cn, test_name, test_name_cn_only};
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const OID_BASIC_CONSTRAINTS: &str = "2.5.29.19";
 const OID_KEY_USAGE: &str = "2.5.29.15";
@@ -353,24 +356,172 @@ fn fr10_ac3_structure_cannot_be_changed() {
         issue_ca_certificate(&request, &mut main_signer),
         Err(CertError::SignerKeyMismatch)
     ));
+    // The checks below use a signer that really holds the issuer's (main
+    // intermediate's) key, so only the rule under test can refuse the request.
+    let mut token = h.token.reopen();
+    let pin = test_pin();
+    let mut token_signer = TokenCaSigner::new(&mut token, &pin);
     // A validity planned for another level is refused.
     let mut request = sub_request(h, &name, &sub_spki, Some(&crl), Some(&nc));
     request.validity = plan_validity(
+        CaLevel::MainIntermediate,
+        1,
+        OffsetDateTime::now_utc(),
+        Some(h.main.info.not_after),
+    )
+    .unwrap();
+    assert!(matches!(
+        issue_ca_certificate(&request, &mut token_signer),
+        Err(CertError::ValidityPlannedForOtherLevel {
+            planned: CaLevel::MainIntermediate,
+            level: CaLevel::SubIntermediate,
+        })
+    ));
+    // The child's name must differ from its issuer's.
+    let same = ValidatedName::new(&test_name("A Main")).unwrap();
+    let request = sub_request(h, &same, &sub_spki, Some(&crl), Some(&nc));
+    assert!(matches!(
+        issue_ca_certificate(&request, &mut token_signer),
+        Err(CertError::SubjectEqualsIssuer)
+    ));
+    // With a valid request the same signer succeeds, so the refusals above came
+    // from the rules, not from the signer.
+    let request = sub_request(h, &name, &sub_spki, Some(&crl), Some(&nc));
+    issue_ca_certificate(&request, &mut token_signer).expect("valid sub-intermediate");
+    assert!(!main_spki.is_empty());
+}
+
+/// A main-intermediate request under the hierarchy's master with `validity`.
+fn main_request<'a>(
+    h: &'a TestHierarchy,
+    name: &'a ValidatedName,
+    spki: &'a [u8],
+    validity: CertValidity,
+    crl: &'a CrlLocation,
+) -> CaCertificateRequest<'a> {
+    CaCertificateRequest {
+        level: CaLevel::MainIntermediate,
+        subject: name,
+        subject_public_key_der: spki,
+        validity,
+        serial: fresh_serial(),
+        issuer: Issuer::Certificate(&h.master.der),
+        issuer_crl: Some(crl),
+        name_constraints: None,
+    }
+}
+
+#[test]
+fn fr10_ac3_a_validity_planned_for_another_level_is_refused_at_issuance() {
+    // Covers: FR-10 AC3
+    let h = hierarchy();
+    let name = ValidatedName::new(&test_name("Level Check Main")).unwrap();
+    let spki = keys::rsa4096(4).public_key_spki_der().unwrap();
+    let crl = CrlLocation::ExplicitlyNone;
+    let mut master_signer = SoftwareSigner::new(h.master_key);
+    // A sub-intermediate's validity (within its own bounds, inside the master's) on a
+    // main intermediate request.
+    let sub_validity = plan_validity(
+        CaLevel::SubIntermediate,
+        10,
+        OffsetDateTime::now_utc(),
+        Some(h.master.info.not_after),
+    )
+    .unwrap();
+    let request = main_request(h, &name, &spki, sub_validity, &crl);
+    let error = issue_ca_certificate(&request, &mut master_signer).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CertError::ValidityPlannedForOtherLevel {
+                planned: CaLevel::SubIntermediate,
+                level: CaLevel::MainIntermediate,
+            }
+        ),
+        "{error:?}"
+    );
+    // The same request with its own level's validity is signed.
+    let main_validity = plan_validity(
         CaLevel::MainIntermediate,
         10,
         OffsetDateTime::now_utc(),
         Some(h.master.info.not_after),
     )
     .unwrap();
-    assert!(issue_ca_certificate(&request, &mut SoftwareSigner::new(keys::rsa4096(4))).is_err());
-    // The child's name must differ from its issuer's.
-    let same = ValidatedName::new(&test_name("A Main")).unwrap();
-    let request = sub_request(h, &same, &sub_spki, Some(&crl), Some(&nc));
-    assert!(matches!(
-        issue_ca_certificate(&request, &mut SoftwareSigner::new(keys::rsa4096(4))),
-        Err(CertError::Request(_)) | Err(CertError::SignerKeyMismatch)
-    ));
-    assert!(!main_spki.is_empty());
+    let request = main_request(h, &name, &spki, main_validity, &crl);
+    issue_ca_certificate(&request, &mut master_signer).expect("valid main intermediate");
+}
+
+#[test]
+fn fr10_ac3_the_subject_must_differ_from_the_issuer() {
+    // Covers: FR-10 AC3
+    let h = hierarchy();
+    let same_as_master = ValidatedName::new(&test_name("A Master")).unwrap();
+    let spki = keys::rsa4096(4).public_key_spki_der().unwrap();
+    let crl = CrlLocation::ExplicitlyNone;
+    let validity = plan_validity(
+        CaLevel::MainIntermediate,
+        10,
+        OffsetDateTime::now_utc(),
+        Some(h.master.info.not_after),
+    )
+    .unwrap();
+    let request = main_request(h, &same_as_master, &spki, validity, &crl);
+    let error = issue_ca_certificate(&request, &mut SoftwareSigner::new(h.master_key)).unwrap_err();
+    assert!(matches!(error, CertError::SubjectEqualsIssuer), "{error:?}");
+}
+
+#[test]
+fn fr10_ac1_issuance_refuses_a_child_that_ends_after_its_issuer() {
+    // Covers: FR-10 AC1
+    // plan_validity refuses this before anything is signed; the issuance check is the
+    // second line of defence for a validity planned against the wrong end date.
+    let h = hierarchy();
+    let name = ValidatedName::new(&test_name("Outliving Main")).unwrap();
+    let spki = keys::rsa4096(4).public_key_spki_der().unwrap();
+    let crl = CrlLocation::ExplicitlyNone;
+    let start = h.master.info.not_after - time::Duration::days(365);
+    let too_long = plan_validity(
+        CaLevel::MainIntermediate,
+        10,
+        start,
+        Some(h.master.info.not_after + time::Duration::days(365 * 20)),
+    )
+    .unwrap();
+    assert!(too_long.not_after() > h.master.info.not_after);
+    let request = main_request(h, &name, &spki, too_long, &crl);
+    let error = issue_ca_certificate(&request, &mut SoftwareSigner::new(h.master_key)).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CertError::Profile(ProfileError::OutlivesIssuer { issuer_not_after, .. })
+                if *issuer_not_after == h.master.info.not_after.format(&Rfc3339).unwrap()
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn fr10_ac1_a_child_cannot_start_before_its_issuer() {
+    // Covers: FR-10 AC1
+    let h = hierarchy();
+    let name = ValidatedName::new(&test_name("Early Main")).unwrap();
+    let spki = keys::rsa4096(4).public_key_spki_der().unwrap();
+    let crl = CrlLocation::ExplicitlyNone;
+    let early = plan_validity(
+        CaLevel::MainIntermediate,
+        10,
+        h.master.info.not_before - time::Duration::days(1),
+        Some(h.master.info.not_after),
+    )
+    .unwrap();
+    let request = main_request(h, &name, &spki, early, &crl);
+    let error = issue_ca_certificate(&request, &mut SoftwareSigner::new(h.master_key)).unwrap_err();
+    assert!(
+        matches!(&error, CertError::StartsBeforeIssuer { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("check the clock"), "{error}");
 }
 
 #[test]
