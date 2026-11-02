@@ -6,7 +6,11 @@ use super::CryptoError;
 use crate::model::{SERIAL_LEN, Serial};
 
 /// Fills `buffer` with secure random bytes.
+///
+/// OpenSSL's random generator keeps its seed material in the secure heap, so the
+/// heap is set up first (`crypto::secure_heap`, SEC-07).
 pub fn fill(buffer: &mut [u8]) -> Result<(), CryptoError> {
+    super::secure_heap::init()?;
     openssl::rand::rand_priv_bytes(buffer).map_err(|_| CryptoError::Random)
 }
 

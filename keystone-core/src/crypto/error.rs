@@ -15,6 +15,15 @@ pub enum CryptoError {
     /// Memory for a secret could not be allocated and locked into RAM (SEC-07).
     #[error("could not lock memory for a secret; raise the memory-lock limit (RLIMIT_MEMLOCK)")]
     LockedMemory,
+    /// OpenSSL's secure heap for private keys could not be locked into RAM (SEC-07).
+    /// No private key is generated or loaded without it.
+    #[error(
+        "could not lock {bytes} bytes of memory for private keys (OpenSSL secure heap); raise the memory-lock limit (RLIMIT_MEMLOCK) to at least 8 MiB"
+    )]
+    SecureHeapUnavailable {
+        /// Size of the secure heap.
+        bytes: usize,
+    },
     /// A secret buffer would have to grow beyond its fixed capacity.
     #[error("secret is longer than its fixed buffer allows")]
     SecretCapacity,

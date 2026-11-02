@@ -5,6 +5,8 @@
 //! Contents:
 //! - `LockedRegion`: page-aligned memory that is locked into RAM (never swapped),
 //!   excluded from core dumps, and wiped before it is freed (SEC-07).
+//! - `init_secure_heap`: OpenSSL's secure heap, so that the private numbers of every
+//!   RSA key live in locked, no-dump memory too (SEC-07).
 //! - `PrivateKey`: the only owner of a private key (`EVP_PKEY`) in Keystone. The
 //!   key never leaves this module as an OpenSSL object, as DER or as PEM; callers
 //!   can only sign with it, read its public key, or encrypt it (SEC-04, SEC-07).
@@ -29,6 +31,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::{CStr, c_char, c_int, c_long, c_ulong, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use openssl_sys as sys;
@@ -86,6 +89,84 @@ unsafe extern "C" {
     ) -> *mut sys::PKCS8_PRIV_KEY_INFO;
     fn X509_STORE_add_crl(store: *mut sys::X509_STORE, crl: *mut sys::X509_CRL) -> c_int;
     fn X509_STORE_CTX_set_time(ctx: *mut sys::X509_STORE_CTX, flags: c_ulong, t: c_long);
+    fn CRYPTO_secure_malloc_init(size: usize, minsize: usize) -> c_int;
+    fn CRYPTO_secure_malloc_done() -> c_int;
+    fn CRYPTO_secure_malloc_initialized() -> c_int;
+    fn CRYPTO_secure_used() -> usize;
+}
+
+// ---------------------------------------------------------------------------
+// OpenSSL's secure heap for private keys (SEC-07)
+// ---------------------------------------------------------------------------
+
+/// Size of OpenSSL's secure heap: 1 MiB. A power of two, as OpenSSL requires.
+///
+/// OpenSSL allocates the private numbers of every RSA key (d, p, q, dP, dQ, qInv;
+/// `BN_secure_new`) and the temporaries of key generation and private-key operations
+/// (`BN_CTX_secure_new`) from this heap once it exists. The pages are locked into RAM
+/// (`mlock2`), excluded from core dumps (`MADV_DONTDUMP`), guarded by inaccessible
+/// pages, and every block is cleared when freed. An RSA 8,192 key uses about 4 KiB of
+/// it; 1 MiB leaves room for the master, a sub-intermediate and generation
+/// temporaries, and together with the `LockedRegion`s of the passphrases and PINs
+/// stays far below Ubuntu's default 8 MiB `RLIMIT_MEMLOCK`.
+pub(crate) const SECURE_HEAP_BYTES: usize = 1 << 20;
+/// Smallest block OpenSSL hands out from the secure heap (a power of two).
+pub(crate) const SECURE_HEAP_MIN_ALLOCATION: usize = 32;
+
+const _: () = assert!(
+    SECURE_HEAP_BYTES.is_power_of_two()
+        && SECURE_HEAP_MIN_ALLOCATION.is_power_of_two()
+        && SECURE_HEAP_MIN_ALLOCATION < SECURE_HEAP_BYTES
+);
+
+/// Outcome of the one initialisation per process: `true` when the heap is locked.
+static SECURE_HEAP_LOCKED: OnceLock<bool> = OnceLock::new();
+
+/// Creates OpenSSL's secure heap once per process (later calls return the first
+/// result). Fails unless the whole heap is locked into RAM and excluded from core
+/// dumps: a heap that is merely allocated would look protected without being so,
+/// so it is released again and every private-key operation then fails with
+/// [`CryptoError::SecureHeapUnavailable`].
+pub(crate) fn init_secure_heap() -> Result<(), CryptoError> {
+    let locked = *SECURE_HEAP_LOCKED.get_or_init(|| {
+        // SAFETY: plain call with constant power-of-two arguments (checked above); the
+        // `OnceLock` makes this the only initialisation in the process.
+        let rc =
+            unsafe { CRYPTO_secure_malloc_init(SECURE_HEAP_BYTES, SECURE_HEAP_MIN_ALLOCATION) };
+        if rc == 2 {
+            // 2 = the heap exists but mlock (RLIMIT_MEMLOCK), a guard page or
+            // MADV_DONTDUMP failed. Release it so no key is ever placed there.
+            // SAFETY: plain call; OpenSSL frees the heap only if nothing is allocated.
+            unsafe { CRYPTO_secure_malloc_done() };
+        }
+        if rc != 1 {
+            // SAFETY: clears this thread's error queue.
+            unsafe { sys::ERR_clear_error() };
+        }
+        rc == 1
+    });
+    if locked {
+        Ok(())
+    } else {
+        Err(CryptoError::SecureHeapUnavailable {
+            bytes: SECURE_HEAP_BYTES,
+        })
+    }
+}
+
+/// Whether OpenSSL's secure heap exists, and how many bytes of it are in use.
+pub(crate) fn secure_heap_usage() -> (bool, usize) {
+    // SAFETY: plain query of a flag.
+    let initialized = unsafe { CRYPTO_secure_malloc_initialized() } == 1;
+    if !initialized {
+        // OpenSSL 3.0's CRYPTO_secure_used takes the heap's lock without checking that
+        // it exists, so it must not be called before the heap is set up.
+        return (false, 0);
+    }
+    // SAFETY: the heap and its lock exist (checked above) and are never torn down after
+    // a successful setup (`init_secure_heap` releases only a heap that failed).
+    let used = unsafe { CRYPTO_secure_used() };
+    (initialized, used)
 }
 
 /// Collects and clears OpenSSL's thread-local error queue.
@@ -368,6 +449,8 @@ fn generate_with_state(bits: u32, state: &KeygenState<'_>) -> Result<PrivateKey,
     if cancel.load(Ordering::SeqCst) {
         return Err(CryptoError::Cancelled);
     }
+    // The private numbers and generation temporaries go into the locked heap.
+    init_secure_heap()?;
     // SAFETY: plain constructor; a null result is handled by `checked`.
     let ctx = PkeyCtxGuard::checked(
         unsafe { sys::EVP_PKEY_CTX_new_id(sys::EVP_PKEY_RSA, ptr::null_mut()) },
@@ -530,6 +613,8 @@ pub(crate) fn encrypt_pkcs8_der(
 /// A malformed structure is [`CryptoError::Der`]; a failed decryption (wrong
 /// passphrase or damaged ciphertext) is [`CryptoError::WrongPassphrase`].
 pub(crate) fn decrypt_pkcs8_der(der: &[u8], passphrase: &[u8]) -> Result<PrivateKey, CryptoError> {
+    // The decrypted private numbers go into the locked heap.
+    init_secure_heap()?;
     let der_len = c_len(der.len(), "key file")?;
     let pass_len = c_len(passphrase.len(), "passphrase")?;
     let start = der.as_ptr();
