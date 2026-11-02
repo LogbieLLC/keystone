@@ -291,7 +291,7 @@ impl Ca {
         review.line(
             "Revoked entries",
             format!(
-                "{} (now {})",
+                "{} on the new CRL ({} on the current one)",
                 current.info.revoked.len() + usize::from(kind != CrlPlanKind::Refresh),
                 current.info.revoked.len()
             ),

@@ -286,3 +286,95 @@ impl OpsError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn fr16_ac1_every_operation_type_can_move_to_a_worker_thread() {
+        // Covers: FR-16 AC1, NFR-03
+        assert_send::<Ca>();
+        assert_send::<CreateMasterPlan>();
+        assert_send::<CreateMasterOutcome>();
+        assert_send::<YubikeySetupPlan>();
+        assert_send::<YubikeySecrets<'static>>();
+        assert_send::<MainIntermediateOutcome>();
+        assert_send::<SubIntermediatePlan>();
+        assert_send::<SubIntermediateOutcome>();
+        assert_send::<CrlPlan>();
+        assert_send::<IssuerUnlock<'static>>();
+        assert_send::<CrlOutcome>();
+        assert_send::<RecoveryItem>();
+        assert_send::<RecoverySecrets<'static>>();
+        assert_send::<StartupReport>();
+        assert_send::<OpsError>();
+        assert_send::<CancelFlag>();
+        assert_send::<&'static dyn ProgressSink>();
+    }
+
+    #[test]
+    fn errors_name_their_operation_and_cause_without_secrets() {
+        let cause = OpsError::NotReady("wrong PIN".into());
+        let stopped = OpsError::Stopped {
+            operation: OperationId(7),
+            reserved_serials: Vec::new(),
+            cause: Box::new(cause),
+        };
+        assert_eq!(stopped.operation(), Some(OperationId(7)));
+        assert!(matches!(stopped.root_cause(), OpsError::NotReady(_)));
+        assert!(
+            stopped.to_string().contains("operation 7") && stopped.to_string().contains("none")
+        );
+        let interrupted = OpsError::Interrupted {
+            operation: OperationId(8),
+            cause: Box::new(stopped),
+        };
+        assert!(matches!(interrupted.root_cause(), OpsError::NotReady(_)));
+        assert!(interrupted.to_string().contains("recovery screen"));
+        assert_eq!(OpsError::CancelRequested.operation(), None);
+        let serial = Serial::from_hex(&format!("{:040x}", 5)).unwrap();
+        let cancelled = OpsError::Cancelled {
+            operation: OperationId(9),
+            reserved_serials: vec![serial],
+        };
+        assert!(cancelled.to_string().contains(&serial.to_hex()));
+        assert_eq!(cancelled.operation(), Some(OperationId(9)));
+        let blocked = OpsError::Blocked(vec![Blocker::StateUnreadable("x".into())]);
+        assert!(blocked.to_string().starts_with("signing is blocked: x"));
+    }
+
+    #[test]
+    fn progress_steps_have_labels_and_no_progress_ignores_reports() {
+        for step in [
+            Step::PreparingDrives,
+            Step::Journaling,
+            Step::GeneratingKey,
+            Step::EncryptingKey,
+            Step::StagingKey,
+            Step::UnlockingMaster,
+            Step::ChangingPin,
+            Step::ChangingPuk,
+            Step::SettingManagementKey,
+            Step::VerifyingHardening,
+            Step::GeneratingKeyOnYubiKey,
+            Step::VerifyingAttestation,
+            Step::SigningCertificate,
+            Step::WritingCertificateToYubiKey,
+            Step::SigningCrl,
+            Step::StagingOutputs,
+            Step::MovingIntoPlace,
+            Step::WritingAuditLog,
+            Step::Completing,
+            Step::Exporting,
+            Step::Cancelling,
+            Step::Done,
+        ] {
+            assert!(!step.label().is_empty());
+            assert_eq!(step.to_string(), step.label());
+        }
+        NoProgress.report(Progress::TouchYubiKey);
+    }
+}

@@ -410,3 +410,23 @@ fn flow_b_on_a_yubikey_that_was_already_hardened_asks_for_its_current_pin() {
     );
     assert_consistent(&test.ca);
 }
+
+#[test]
+fn fr06_ac3_a_management_key_not_stored_pin_protected_stops_setup_before_key_generation() {
+    // Covers: FR-06 AC3, SEC-06
+    let mut test = new_ca("B9");
+    let (mut token, controller) = token(20_000_011);
+    controller.fail_next(
+        keystone_testkit::simulator::SimOp::SetManagementKey,
+        1,
+        keystone_testkit::simulator::FaultKind::SilentPartialWrite,
+    );
+    let error = run_flow_b(&mut test, &mut token, "B9", false).unwrap_err();
+    assert!(matches!(error, OpsError::Interrupted { .. }), "{error}");
+    assert!(
+        error.to_string().contains("could not be confirmed"),
+        "{error}"
+    );
+    assert!(token.slot_status(SIGNING_SLOT).unwrap().is_empty());
+    assert!(test.ca.state().unwrap().main_intermediates().is_empty());
+}

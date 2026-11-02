@@ -12,6 +12,13 @@
 //! - an interrupted YubiKey setup becomes [`RecoveryAction::ResumeYubikeySetup`], or
 //!   [`RecoveryAction::CompleteSetupWithExistingKey`] when the connected YubiKey holds a
 //!   key without a certificate (FR-22 AC5): it is never offered to replace the key.
+//!
+//! Known limit (store rule, raised with the maintainer): the store offers "abandon" only
+//! when nothing irreversible was journaled, and a journaled YubiKey step counts as
+//! irreversible. A YubiKey setup interrupted after such a step can therefore only be
+//! resumed with the same YubiKey; if that YubiKey is lost, or its attestation fails even
+//! after an explicit wipe, the operation stays pending. PRD FR-22 AC4 would allow
+//! abandoning it, because no signed output exists.
 #![forbid(unsafe_code)]
 
 use crate::cert::{SoftwareSigner, parse_certificate_pem};
