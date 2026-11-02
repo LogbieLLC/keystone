@@ -21,7 +21,7 @@
 //!         001-pending.json       first entry: kind, subject, planned serials
 //!         002-signed.json        a certificate or CRL was signed (FR-22 AC3)
 //!         003-staged.json        every output file and its SHA-256, after staging
-//!         004-completed.json     written last: output hashes + audit-log head
+//!         004-completed.json     written last: output hashes + its own last audit entry
 //!       op-000002/
 //!         001-pending.json
 //!         002-yubikey-step.json  YubiKey setup, one entry per step (FR-22 AC7)
@@ -64,7 +64,8 @@
 //! 4. outputs moved into place (create-only) and verified;
 //! 5. the operation's audit entries appended on every drive;
 //! 6. the `completed` entry, written last, listing every output file's SHA-256 and the
-//!    audit-log head.
+//!    operation's own last audit entry (entries of no operation written later, such as a
+//!    clock correction, never change it).
 #![forbid(unsafe_code)]
 
 pub mod audit;
@@ -80,6 +81,7 @@ pub mod operation;
 mod paths;
 pub mod record;
 pub mod recovery;
+pub mod replace;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -92,8 +94,8 @@ pub use audit::{
 pub use binhash::parse_binary_hash_record;
 pub use compare::{DriveComparison, DriveHistory, RepairPlan, RepairStep};
 pub use drive::{
-    CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, ExportDrive, classify_drive,
-    parse_drive_identity,
+    CaDrive, DriveClass, DriveIdentity, DriveRole, DriveSet, ExportDrive, SetupProgress,
+    UnfinishedSetup, classify_drive, parse_drive_identity, unfinished_setup,
 };
 pub use ids::{CaId, DriveId, OperationId};
 pub use journal::{
@@ -112,6 +114,7 @@ pub use record::{
 pub use recovery::{
     DriveOperationView, FileState, OutputState, PendingOperation, RecoveryAction, RecoveryReport,
 };
+pub use replace::{AddDrivePlan, NewDriveState};
 
 use crate::crypto::CryptoError;
 use crate::model::{Serial, Sha256Digest};
@@ -232,6 +235,11 @@ pub enum StoreError {
     /// The drives differ; they must be compared and repaired first (FR-12 AC3).
     #[error("the CA drives do not hold the same history; compare and repair them first ({0})")]
     OutOfSync(String),
+    /// Something on the drives cannot be verified (a completed output missing or changed,
+    /// or a journal's audit head missing from the log): the same problems
+    /// [`DriveComparison::Damaged`] lists. Nothing can be signed until it is resolved.
+    #[error("the CA drives cannot be verified, so nothing can be signed: {}", .0.join("; "))]
+    Damaged(Vec<String>),
     /// An operation is pending; recovery must run first (FR-22 AC4).
     #[error("operation {0} was interrupted; finish or abandon it on the recovery screen first")]
     PendingOperation(OperationId),

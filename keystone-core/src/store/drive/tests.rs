@@ -228,6 +228,149 @@ fn sec20_drive_set_never_overwrites_create_only_files() {
     }
 }
 
+/// Every file under `root` with its content.
+fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(dir).expect("list") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                out.push((path.clone(), fs::read(&path).expect("read")));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn regression_an_interrupted_ca_setup_is_recognised_and_finished() {
+    // Covers: SEC-20, FR-12 AC1, FR-22 AC6
+    // Regression (review finding 11): an interruption while new drives were set up left
+    // them classified as damaged, refused for ever, and only removable by hand.
+    let probe = TestDrives::new(2);
+    let backups = [probe.ca_drive(1)];
+    crate::store::fault::take_count();
+    DriveSet::create(probe.ca_drive(0), &backups, ts(0)).expect("create");
+    let total = crate::store::fault::take_count();
+    assert_eq!(total, 4, "audit log and identity on each drive");
+    for allowed in 0..total {
+        let drives = TestDrives::new(2);
+        let (primary, backup) = (drives.ca_drive(0), drives.ca_drive(1));
+        crate::store::fault::fail_after(allowed);
+        assert!(DriveSet::create(primary, &[backup], ts(0)).is_err());
+        crate::store::fault::disarm();
+        // Not a CA that can be opened, and a new CA is still refused over it...
+        assert!(
+            DriveSet::open(&[primary, backup]).is_err(),
+            "fault {allowed}"
+        );
+        assert!(matches!(
+            DriveSet::create(primary, &[backup], ts(1)),
+            Err(StoreError::DriveHoldsCa { .. })
+        ));
+        // ...but it is recognised as an unfinished setup and finished without touching
+        // anything already written.
+        let setup = unfinished_setup(primary, &[backup])
+            .expect("inspect")
+            .unwrap_or_else(|| panic!("fault {allowed}: not recognised"));
+        assert_eq!(setup.drives.len(), 2);
+        let before: Vec<_> = snapshot(primary)
+            .into_iter()
+            .chain(snapshot(backup))
+            .collect();
+        let set = DriveSet::finish_setup(primary, &[backup], ts(1)).expect("finish");
+        assert!(set.ensure_writable().is_ok());
+        assert_eq!(
+            set.compare().expect("compare"),
+            crate::store::DriveComparison::InSync
+        );
+        let after: Vec<_> = snapshot(primary)
+            .into_iter()
+            .chain(snapshot(backup))
+            .collect();
+        for (path, content) in &before {
+            if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
+            assert!(
+                after.contains(&(path.clone(), content.clone())),
+                "fault {allowed}: {} was changed or deleted",
+                path.display()
+            );
+        }
+        if let Some(ca) = setup.ca_id {
+            assert_eq!(set.ca_id(), ca, "the CA started before is kept");
+        }
+        // Finished: nothing left to finish.
+        assert!(
+            unfinished_setup(primary, &[backup])
+                .expect("inspect")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn sec20_an_unfinished_setup_is_never_combined_with_another_ca_or_a_used_drive() {
+    // Covers: SEC-20
+    let started = |label: u8| {
+        let drives = TestDrives::new(2);
+        crate::store::fault::fail_after(2);
+        assert!(DriveSet::create(drives.ca_drive(0), &[drives.ca_drive(1)], ts(0)).is_err());
+        crate::store::fault::disarm();
+        let _ = label;
+        drives
+    };
+    // Two primaries of two different unfinished setups.
+    let one = started(1);
+    let two = started(2);
+    // Primary of setup one as primary, primary of setup two as backup: different CAs (and
+    // the wrong role).
+    assert!(matches!(
+        unfinished_setup(one.ca_drive(0), &[two.ca_drive(1)]),
+        Ok(Some(_))
+    ));
+    assert!(unfinished_setup(one.ca_drive(0), &[two.ca_drive(0)]).is_err());
+    // A drive set up as primary chosen as a backup.
+    let fresh = TestDrives::new(1);
+    let error = unfinished_setup(fresh.ca_drive(0), &[one.ca_drive(0)]).expect_err("role");
+    assert!(error.to_string().contains("primary"), "{error}");
+    // A drive of a CA in use is never part of an unfinished setup.
+    let used = TestDrives::new(2);
+    let set = new_ca(&used);
+    crate::store::testutil::issue_master(&set, 1, ts(5));
+    assert_eq!(
+        unfinished_setup(one.ca_drive(0), &[used.ca_drive(1)]).expect("inspect"),
+        None
+    );
+    assert!(DriveSet::finish_setup(one.ca_drive(0), &[used.ca_drive(1)], ts(6)).is_err());
+    // Other content on a started drive: not an unfinished setup, never touched.
+    let other = started(3);
+    fs::write(other.ca_drive(1).join("keystone/notes.txt"), b"x").expect("write");
+    assert_eq!(
+        unfinished_setup(other.ca_drive(0), &[other.ca_drive(1)]).expect("inspect"),
+        None
+    );
+    assert!(DriveSet::finish_setup(other.ca_drive(0), &[other.ca_drive(1)], ts(6)).is_err());
+    assert_eq!(
+        fs::read(other.ca_drive(1).join("keystone/notes.txt")).expect("kept"),
+        b"x"
+    );
+    // Plain empty drives are not an unfinished setup (a normal new CA).
+    let empty = TestDrives::new(2);
+    assert_eq!(
+        unfinished_setup(empty.ca_drive(0), &[empty.ca_drive(1)]).expect("inspect"),
+        None
+    );
+}
+
 #[test]
 fn identity_parser_is_strict() {
     // Covers: SEC-08

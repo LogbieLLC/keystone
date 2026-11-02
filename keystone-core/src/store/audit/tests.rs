@@ -111,12 +111,57 @@ fn fr14_ac3_a_changed_entry_is_named_as_the_first_bad_entry() {
     assert_eq!(problem, AuditProblem::HashMismatch { next_entry: 4 });
     let message = parse_audit_log(&join(&text)).expect_err("bad").to_string();
     assert!(message.contains("entry 3"), "{message}");
-    // Changing a hash link breaks the chain at the same place.
+    // Changing the hash link stored in entry 4 changes entry 4, not entry 3: entry 3
+    // still verifies, and entry 5's link no longer matches entry 4. Entry 4 is named.
     let mut text = lines(&log);
     let wrong = Sha256Digest([7; 32]).to_hex();
     let old = log.entries()[3].prev.to_hex();
     text[3] = text[3].replace(&old, &wrong);
-    assert_eq!(first_bad(&join(&text)).0, 3);
+    assert_eq!(first_bad(&join(&text)), (4, AuditProblem::LinkChanged));
+    let message = parse_audit_log(&join(&text)).expect_err("bad").to_string();
+    assert!(message.contains("entry 4"), "{message}");
+}
+
+#[test]
+fn regression_an_edited_link_names_the_entry_that_holds_it() {
+    // Covers: FR-14 AC3, SEC-09
+    // Regression (review finding 16): editing the `prev` of entry n named the unchanged
+    // entry n-1 as the first bad entry.
+    let log = log_of(6);
+    for n in 2..=5usize {
+        let mut text = lines(&log);
+        let old = log.entries()[n - 1].prev.to_hex();
+        text[n - 1] = text[n - 1].replace(&old, &Sha256Digest([9; 32]).to_hex());
+        assert_eq!(
+            first_bad(&join(&text)),
+            (n as u64, AuditProblem::LinkChanged),
+            "link of entry {n}"
+        );
+        // A changed entry (not its link) is still named itself.
+        let mut text = lines(&log);
+        text[n - 2] = text[n - 2].replace("KEYSTONE TEST", "KEYSTONE TEST X");
+        assert_eq!(
+            first_bad(&join(&text)),
+            (
+                (n - 1) as u64,
+                AuditProblem::HashMismatch {
+                    next_entry: n as u64
+                }
+            ),
+            "content of entry {}",
+            n - 1
+        );
+    }
+    // The last entry's link has no later entry to tell the two cases apart: the earlier
+    // entry is named, since it may be the changed one (the cross-drive comparison and
+    // the journal heads catch the rest).
+    let mut text = lines(&log);
+    let old = log.entries()[5].prev.to_hex();
+    text[5] = text[5].replace(&old, &Sha256Digest([9; 32]).to_hex());
+    assert_eq!(
+        first_bad(&join(&text)),
+        (5, AuditProblem::HashMismatch { next_entry: 6 })
+    );
 }
 
 #[test]

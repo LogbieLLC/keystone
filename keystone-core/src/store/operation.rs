@@ -13,9 +13,10 @@
 
 use std::collections::BTreeSet;
 
-use super::audit::{AuditDraft, AuditResult};
+use super::audit::{AuditAction, AuditDetails, AuditDraft, AuditResult};
+use super::compare::drive_problems;
 use super::drive::{DriveSet, to_json_file};
-use super::fsio::WriteMode;
+use super::fsio::{EntryKind, WriteMode};
 use super::ids::{MAX_OPERATION_ID, OperationId};
 use super::journal::{
     AuditHead, JOURNAL_FORMAT, JournalEntry, JournalEvent, MAX_OUTPUTS, MAX_STEP, OperationKind,
@@ -65,10 +66,21 @@ fn whole_seconds(time: Timestamp) -> Result<Timestamp, StoreError> {
 type RawJournals = Vec<(OperationId, Vec<Vec<u8>>)>;
 
 impl DriveSet {
-    /// Checks that every drive holds the same audit log and the same journals, and that
-    /// no operation is pending. Returns the shared audit-log head.
+    /// Checks that every drive holds the same audit log and the same journals, that no
+    /// operation is pending, and that nothing is damaged: every completed output is
+    /// present with its SHA-256 and every journal's audit head is in the log (the checks
+    /// of [`DriveSet::compare`], so a new operation is refused whenever `compare` would
+    /// report damage). Returns the shared audit-log head.
     pub(crate) fn ensure_in_sync(&self) -> Result<AuditHead, StoreError> {
-        let head = self.audit_log()?.head();
+        let log = self.audit_log()?;
+        let head = log.head();
+        let mut problems = Vec::new();
+        for drive in self.drives() {
+            problems.extend(drive_problems(drive, &log)?);
+        }
+        if !problems.is_empty() {
+            return Err(StoreError::Damaged(problems));
+        }
         let mut first: Option<(String, RawJournals)> = None;
         for drive in self.drives() {
             let journal = drive.journal()?;
@@ -268,16 +280,41 @@ impl DriveSet {
     /// Copies outputs of a completed operation to the export drive (create-only,
     /// read-back verified), but only after [`DriveSet::export_ready`] passed (FR-22 AC2).
     /// `files` pairs each output with its name on the export drive.
+    ///
+    /// - The only key that may leave the CA drives is a sub-intermediate's encrypted key
+    ///   (FR-09 AC1); the master's key is never exported (review finding 15).
+    /// - A file already on the export drive with the same content is kept (a retried
+    ///   export); a different file of that name is never overwritten.
+    /// - Every export appends one `export` audit entry (no operation) naming the
+    ///   operation and every file, after the files are written and verified.
+    ///
+    /// Returns each export name with its SHA-256.
     pub fn export_outputs(
         &self,
         id: OperationId,
         export: &ExportDrive,
         files: &[(OutputPath, String)],
+        time: Timestamp,
     ) -> Result<Vec<(String, Sha256Digest)>, StoreError> {
+        self.ensure_writable()?;
         let (outputs, verified) = self.export_ready(id)?;
         let source = &self.drives()[verified[0]];
-        let mut written = Vec::new();
+        let journal = source
+            .operation_journal(id)?
+            .ok_or_else(|| StoreError::Unsafe(format!("{id} has no journal")))?;
+        let mut contents = Vec::new();
         for (path, export_name) in files {
+            if path.dir() == OutputDir::Keys
+                && journal.kind() != OperationKind::CreateSubIntermediate
+            {
+                return Err(StoreError::Unsafe(format!(
+                    "{path} is the {} key of {id}; only a sub-intermediate's encrypted key is ever exported, never the master's",
+                    match journal.kind() {
+                        OperationKind::CreateMaster => "master",
+                        _ => "issuer",
+                    }
+                )));
+            }
             let output = outputs
                 .iter()
                 .find(|o| o.path == *path)
@@ -289,8 +326,38 @@ impl DriveSet {
                     StoreError::Unsafe(format!("{path} changed on {}", source.label()))
                 })?;
             check_no_plaintext_key(path, &data)?;
-            written.push((export_name.clone(), export.write_file(export_name, &data)?));
+            match export.read_existing(export_name)? {
+                Some(existing) if sha256(&existing) == output.sha256 => {}
+                Some(_) => {
+                    return Err(StoreError::AlreadyExists {
+                        path: export.path_of(export_name),
+                    });
+                }
+                None => {}
+            }
+            contents.push((export_name, data, output.sha256));
         }
+        let mut written = Vec::new();
+        for (export_name, data, digest) in contents {
+            if export.read_existing(export_name)?.is_none() {
+                export.write_file(export_name, &data)?;
+            }
+            written.push((export_name.clone(), digest));
+        }
+        let mut draft =
+            AuditDraft::new(AuditAction::Export, journal.subject(), AuditResult::Success);
+        draft.details = Some(AuditDetails {
+            note: Some(format!(
+                "{id}: {} written to the export drive",
+                written
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            ..AuditDetails::default()
+        });
+        self.append_audit(&[draft], time)?;
         Ok(written)
     }
 }
@@ -627,7 +694,7 @@ impl OperationHandle<'_> {
         if !self.audited {
             return Err(self.state_error("write the audit entry before completing"));
         }
-        let audit = self.set.audit_log()?.head();
+        let audit = self.own_audit_head()?;
         let outputs = self.outputs.clone();
         self.write_entry(
             JournalEvent::Completed {
@@ -648,14 +715,20 @@ impl OperationHandle<'_> {
                 "the operation made a persistent change and can no longer be cancelled",
             ));
         }
+        // Every file in this operation's staging folder goes, not only the outputs this
+        // handle staged: a resumed handle knows none until staging is sealed, and an
+        // interrupted earlier attempt may have left a copy (or a temporary file) on some
+        // drives only (FR-16 AC2: no output left behind; review finding 9).
         let staging = format!("{STAGING_DIR}/{}", self.id.stem());
         for drive in self.set.drives() {
-            for output in &self.outputs {
-                if let Some(dir) =
-                    drive.dir_at(&format!("{staging}/{}", output.path.dir().name()), false)?
-                    && dir.kind(output.path.name())?.is_some()
-                {
-                    dir.remove_file(output.path.name())?;
+            for dir_name in OutputDir::ALL.map(OutputDir::name) {
+                let Some(dir) = drive.dir_at(&format!("{staging}/{dir_name}"), false)? else {
+                    continue;
+                };
+                for (name, kind) in dir.entries()? {
+                    if kind == EntryKind::File {
+                        dir.remove_file(&name)?;
+                    }
                 }
             }
             remove_empty_staging(drive, &staging)?;
@@ -667,8 +740,19 @@ impl OperationHandle<'_> {
         );
         draft.serial = self.planned.first().copied();
         self.append_audit(&[draft], time)?;
-        let audit = self.set.audit_log()?.head();
+        let audit = self.own_audit_head()?;
         self.write_entry(JournalEvent::Cancelled { audit }, time)
+    }
+
+    /// This operation's own last audit entry (number and SHA-256), which its final
+    /// journal entry records. Entries of no operation appended later (a clock
+    /// correction, a binary-hash record, a drive repair, an export) never change it, so
+    /// a behind drive stays repairable (review finding 6).
+    fn own_audit_head(&self) -> Result<AuditHead, StoreError> {
+        self.set
+            .audit_log()?
+            .operation_head(self.id)
+            .ok_or_else(|| self.state_error("the operation has no audit entry"))
     }
 }
 

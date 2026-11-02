@@ -15,7 +15,8 @@ use keystone_core::crypto::CancelFlag;
 use keystone_core::model::RevocationReason;
 use keystone_core::ops::testing::{self, FaultPoint};
 use keystone_core::ops::{
-    Ca, ExportStatus, IssuerUnlock, NoProgress, OpsError, RecoveryAction, RecoverySecrets,
+    Ca, ExportStatus, IssuerUnlock, NoProgress, OpsError, Progress, RecoveryAction,
+    RecoverySecrets, Step,
 };
 use keystone_core::store::OperationState;
 use keystone_testkit::{SimulatedYubiKey, TestDrives};
@@ -184,11 +185,75 @@ fn fr22_ac6_ac7_flow_b_recovers_from_an_interruption_at_every_step() {
 }
 
 #[test]
+fn fr22_ac6_flow_a_interrupted_while_setting_up_the_drives_finishes_the_setup() {
+    // Covers: FR-22 AC6, SEC-20, FR-12 AC1
+    // Review finding 11: setting up the empty drives writes two files per drive (audit
+    // log, then the drive identity last). An interruption there left drives that were
+    // refused for ever. Flow A now recognises them and finishes setting them up; nothing
+    // already written is overwritten.
+    const DRIVE_SETUP_CHANGES: u32 = 4;
+    let now = base_time();
+    let (passphrase, _) = master_passphrase();
+    for crash_at in 0..DRIVE_SETUP_CHANGES {
+        let drives = TestDrives::new(2);
+        testing::crash_on_drive_change(crash_at);
+        let error = run_flow_a(&drives, "F7", now, &passphrase, None).unwrap_err();
+        assert!(
+            matches!(error.root_cause(), OpsError::Store(_)),
+            "change {crash_at}: {error}"
+        );
+        testing::reset();
+        let roots: Vec<&Path> = drives.ca_drives().iter().map(PathBuf::as_path).collect();
+        assert!(
+            Ca::open(&roots).is_err(),
+            "a partial drive never opens as a CA"
+        );
+        let identity = drives.ca_drive(0).join("keystone/drive.json");
+        let before = std::fs::read(&identity).ok();
+        // Flow A again on the same drives: the review offers to finish the setup.
+        let backups: Vec<&Path> = roots[1..].to_vec();
+        let request = keystone_core::ops::CreateMasterRequest::new(
+            roots[0],
+            &backups,
+            keystone_testkit::names::test_name("F7 Master"),
+        );
+        let later = now + time::Duration::minutes(1);
+        let plan = keystone_core::ops::plan_create_master(request, confirmed_new(later))
+            .unwrap_or_else(|e| panic!("change {crash_at}: {e}"));
+        assert!(matches!(
+            plan.drive_setup(),
+            keystone_core::ops::DriveSetup::FinishInterruptedSetup { .. }
+        ));
+        assert!(
+            plan.review()
+                .value("Drives")
+                .is_some_and(|v| v.starts_with("Finish setting up these drives")),
+            "{:?}",
+            plan.review()
+        );
+        testing::supply_generated_key(keystone_testkit::keys::master(0));
+        let outcome = plan
+            .execute(&passphrase, None, &NoProgress, &CancelFlag::new())
+            .unwrap_or_else(|e| panic!("change {crash_at}: {e}"));
+        assert_no_lost_record(&outcome.ca);
+        assert!(outcome.ca.state().unwrap().master().is_some());
+        if let Some(before) = before {
+            assert_eq!(
+                std::fs::read(&identity).unwrap(),
+                before,
+                "never overwritten"
+            );
+        }
+    }
+}
+
+#[test]
 fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup() {
     // Covers: FR-22 AC6, FR-13 AC6, SEC-20
     // Setting up the empty drives writes two files per drive (audit log, then the drive
-    // identity last). An interruption there leaves a drive that is classified as
-    // damaged and is never reused automatically (SEC-20); the sweep starts after it.
+    // identity last); interruptions there are covered by
+    // fr22_ac6_flow_a_interrupted_while_setting_up_the_drives_finishes_the_setup. This
+    // sweep covers every change after the drive setup.
     const DRIVE_SETUP_CHANGES: u32 = 4;
     let now = base_time();
     let (passphrase, words) = master_passphrase();
@@ -239,6 +304,75 @@ fn fr22_ac6_flow_a_recovers_from_an_interruption_at_every_step_after_drive_setup
     }
 }
 
+/// Flow C cancelled right after its encrypted key was staged; the cancel itself fails
+/// at drive change `fail_at` (counted from the start of the cancel), like a pulled
+/// drive. Returns the operation's error.
+fn cancel_flow_c_failing_at(
+    test: &mut TestCa,
+    token: &mut SimulatedYubiKey,
+    fail_at: Option<u32>,
+) -> OpsError {
+    let (plan, passphrase, _) = plan_flow_c(test, "FC").unwrap();
+    testing::supply_generated_key(keystone_testkit::keys::rsa4096(5));
+    let cancel = CancelFlag::new();
+    let flag = cancel.clone();
+    let progress = move |report: Progress| {
+        if let Progress::Step { step, .. } = report {
+            match step {
+                Step::StagingKey => flag.cancel(),
+                Step::Cancelling => {
+                    testing::drive_change_count();
+                    if let Some(allowed) = fail_at {
+                        testing::fail_drive_change(allowed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    plan.execute(
+        &test.ca,
+        token,
+        &s(PIN),
+        &passphrase,
+        None,
+        &progress,
+        &cancel,
+    )
+    .unwrap_err()
+}
+
+#[test]
+fn fr22_ac6_a_cancel_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-16 AC2, FR-22 AC4, SEC-22
+    // Review findings 1 and 2: an interrupted cancel must never corrupt the journals or
+    // block the CA; recovery after a restart reaches a consistent state.
+    let (base, token, _) = ca_with_main("FC", 80_000_007);
+    let mut probe = clone_ca(&base);
+    let mut probe_token = token.reopen();
+    let error = cancel_flow_c_failing_at(&mut probe, &mut probe_token, None);
+    assert!(matches!(error, OpsError::Cancelled { .. }), "{error}");
+    let total = testing::drive_change_count();
+    assert!(total >= 6, "a cancel makes {total} drive changes");
+    assert_no_lost_record(&probe.ca);
+    for fail_at in 0..total {
+        let mut test = clone_ca(&base);
+        let mut token = token.reopen();
+        let error = cancel_flow_c_failing_at(&mut test, &mut token, Some(fail_at));
+        assert!(
+            matches!(error, OpsError::Interrupted { .. }),
+            "change {fail_at}: {error}"
+        );
+        test.reopen();
+        let taken = recover_all(&mut test, None, "FC");
+        assert_eq!(taken.len(), 1, "change {fail_at}: {taken:?}");
+        assert_no_lost_record(&test.ca);
+        // The CA signs again afterwards.
+        run_flow_c(&mut test, &mut token, "FC after", 4, false)
+            .unwrap_or_else(|e| panic!("change {fail_at}: {e}"));
+    }
+}
+
 #[test]
 fn fr22_ac2_an_export_interrupted_after_completion_is_retried() {
     // Covers: FR-22 AC2, FR-09 AC1
@@ -254,4 +388,79 @@ fn fr22_ac2_an_export_interrupted_after_completion_is_retried() {
         .export_operation(outcome.operation, test.export(), time)
         .unwrap();
     assert_eq!(files.len(), 3);
+}
+
+/// Takes, until nothing is pending, the first offered action that needs no YubiKey.
+fn recover_without_yubikey(test: &mut TestCa, context: &str) {
+    for _ in 0..3 {
+        let items = test.ca.recovery_items(None).unwrap();
+        let Some(item) = items.first() else { return };
+        assert!(item.actions.len() <= 2, "{context}: {item:?}");
+        let action = item
+            .actions
+            .iter()
+            .map(|choice| choice.action.clone())
+            .find(|action| {
+                !matches!(
+                    action,
+                    RecoveryAction::ResumeYubikeySetup { .. }
+                        | RecoveryAction::CompleteSetupWithExistingKey
+                )
+            })
+            .unwrap_or_else(|| panic!("{context}: only YubiKey actions: {item:?}"));
+        test.now += time::Duration::minutes(1);
+        let time = confirmed(&test.ca, test.now);
+        let master = test.master_entered();
+        test.ca
+            .run_recovery(
+                item.operation,
+                &action,
+                &RecoverySecrets {
+                    master_passphrase: Some(&master),
+                },
+                time,
+            )
+            .unwrap_or_else(|e| panic!("{context}: {e}"));
+    }
+}
+
+#[test]
+fn fr22_ac6_every_interrupted_state_has_an_action_that_needs_no_lost_yubikey() {
+    // Covers: FR-22 AC4, FR-22 AC6, FR-15 AC1, SEC-22
+    // Review finding 5 through the operations layer: Flows B and C are interrupted at
+    // every drive change, and recovery then runs with the YubiKey gone (lost). Every
+    // interrupted state must offer an action that needs no YubiKey, and taking it must
+    // leave a consistent CA with no lost record.
+    let base = new_ca("F8");
+    let mut with_main = clone_ca(&base);
+    let (mut main_token, _) = token(80_200_000);
+    run_flow_b(&mut with_main, &mut main_token, "F8", false).unwrap();
+    let flow_b: &Run = &|test, token| run_flow_b(test, token, "F8", false).map(|_| ());
+    let flow_c: &Run = &|test, token| run_flow_c(test, token, "F8", 5, false).map(|_| ());
+    for (label, start, run, fresh) in [
+        ("Flow B", &base, flow_b, true),
+        ("Flow C", &with_main, flow_c, false),
+    ] {
+        let token_for = |n: u32| -> SimulatedYubiKey {
+            if fresh {
+                token(80_210_000 + n).0
+            } else {
+                main_token.reopen()
+            }
+        };
+        let mut probe = clone_ca(start);
+        let mut probe_token = token_for(0);
+        testing::drive_change_count();
+        run(&mut probe, &mut probe_token).expect("clean run");
+        let total = testing::drive_change_count();
+        for crash_at in 0..total {
+            let mut test = clone_ca(start);
+            let mut token = token_for(crash_at + 1);
+            testing::crash_on_drive_change(crash_at);
+            run(&mut test, &mut token).expect_err("the crash stops the operation");
+            test.reopen();
+            recover_without_yubikey(&mut test, &format!("{label} change {crash_at}"));
+            assert_no_lost_record(&test.ca);
+        }
+    }
 }

@@ -329,6 +329,42 @@ fn fr03_ac1_entered_passphrase_accepts_only_list_words() {
 }
 
 #[test]
+fn fr03_ac1_every_word_of_the_list_is_drawn_with_equal_probability() {
+    // Covers: FR-03 AC1, SEC-05
+    // A chi-square goodness-of-fit test over all 7,776 words. 7,776 master passphrases of
+    // 20 words give 155,520 draws, 20 expected per word. With 7,775 degrees of freedom
+    // the statistic of a uniform source lies in 6,934 .. 8,680 except with probability
+    // below 1e-11 on each side (Wilson-Hilferty, z = 7), so the generous bounds below
+    // never fail for a correct implementation. A biased draw (part of the list unused, a
+    // byte reduced modulo 7,776, a skewed index) lands far outside, and a source that is
+    // too even (a counter) lands below the lower bound.
+    const PASSPHRASES: usize = WORDLIST_LEN;
+    const WORDS_EACH: usize = 20;
+    let mut counts = vec![0u32; WORDLIST_LEN];
+    for _ in 0..PASSPHRASES {
+        let passphrase = NewPassphrase::generate_master(WORDS_EACH).expect("generate");
+        for word in words_of(&passphrase) {
+            let index = index_of(word).expect("a list word");
+            counts[usize::from(index)] += 1;
+        }
+    }
+    let draws = (PASSPHRASES * WORDS_EACH) as f64;
+    let expected = draws / WORDLIST_LEN as f64;
+    let chi_square: f64 = counts
+        .iter()
+        .map(|count| {
+            let difference = f64::from(*count) - expected;
+            difference * difference / expected
+        })
+        .sum();
+    assert!(
+        (6_900.0..8_700.0).contains(&chi_square),
+        "chi-square {chi_square:.1} over {} words",
+        WORDLIST_LEN
+    );
+}
+
+#[test]
 fn errors_never_contain_the_passphrase() {
     // Covers: SEC-07, FR-03 AC3
     let (mut session, list) = ready_session(10);

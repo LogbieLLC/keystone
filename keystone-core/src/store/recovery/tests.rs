@@ -239,11 +239,17 @@ fn fr22_ac7_interrupted_yubikey_setup_offers_resume() {
     drop(op);
     let set = open_all(&drives);
     let pending = only_pending(&set);
+    // Resume first (FR-22 AC5, AC7). Nothing was signed, so abandoning is safe too
+    // (FR-22 AC4); the operations layer offers it only while the setup's YubiKey is
+    // not connected (review finding 10).
     assert_eq!(
         pending.actions,
-        vec![RecoveryAction::ResumeYubikeySetup {
-            next_step: Some(YubikeySetupStep::KeyGenerated)
-        }]
+        vec![
+            RecoveryAction::ResumeYubikeySetup {
+                next_step: Some(YubikeySetupStep::KeyGenerated)
+            },
+            RecoveryAction::Abandon
+        ]
     );
     assert_eq!(pending.drives[0].yubikey_steps.len(), 3);
     assert_eq!(pending.drives[1].yubikey_steps.len(), 2);
@@ -255,6 +261,79 @@ fn fr22_ac7_interrupted_yubikey_setup_offers_resume() {
     set.sync_operation_journal(id).expect("sync");
     let resumed = set.resume_operation(id).expect("resume");
     assert_eq!(resumed.completed_yubikey_steps().expect("steps").len(), 3);
+}
+
+#[test]
+fn fr22_ac4_a_yubikey_setup_with_steps_but_nothing_signed_can_be_abandoned() {
+    // Covers: FR-22 AC4, FR-22 AC7, FR-10 AC2
+    // Review finding 10 and the ops open point: a setup whose YubiKey is lost after a
+    // journaled step stayed pending for ever. Nothing was signed, so FR-22 AC4 allows
+    // abandoning it; its serial stays reserved. After a signature it is never abandoned.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::SetupYubikey,
+            "CN=KEYSTONE TEST main",
+            &[serial(2)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    for step in [
+        YubikeySetupStep::PinChanged,
+        YubikeySetupStep::PukChanged,
+        YubikeySetupStep::ManagementKeySet,
+        YubikeySetupStep::KeyGenerated,
+    ] {
+        op.record_yubikey_step(step, 77, ts(5)).expect("step");
+    }
+    drop(op);
+    let set = open_all(&drives);
+    let pending = only_pending(&set);
+    assert!(pending.actions.contains(&RecoveryAction::Abandon));
+    set.abandon_operation(id, ts(6)).expect("abandon");
+    assert_recovered(&drives, "abandoned YubiKey setup");
+    assert!(
+        open_all(&drives)
+            .known_serials()
+            .expect("serials")
+            .contains(&serial(2))
+    );
+
+    // Signed: never abandoned, only resumed.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    crate::store::testutil::issue_master(&set, 1, ts(1));
+    let mut op = set
+        .begin_operation(
+            OperationKind::SetupYubikey,
+            "CN=KEYSTONE TEST main",
+            &[serial(2)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.record_yubikey_step(YubikeySetupStep::KeyGenerated, 77, ts(5))
+        .expect("step");
+    op.record_signed(
+        SignedObject::Certificate {
+            record: Box::new(cert(serial(2), CaLevel::MainIntermediate, serial(1))),
+            pem: cert_pem(serial(2)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    drop(op);
+    let set = open_all(&drives);
+    let pending = only_pending(&set);
+    assert_eq!(
+        pending.actions,
+        vec![RecoveryAction::ResumeYubikeySetup {
+            next_step: Some(YubikeySetupStep::PinChanged)
+        }]
+    );
+    assert!(set.abandon_operation(id, ts(6)).is_err());
 }
 
 /// Simulates the operations layer finishing an operation whose signature is journaled
@@ -360,5 +439,488 @@ fn fr22_ac6_an_operation_interrupted_at_every_step_recovers_without_losing_a_rec
                 "fault {allowed}"
             );
         }
+    }
+}
+
+#[test]
+fn regression_the_recovery_finish_entry_keeps_the_action_names_and_every_serial() {
+    // Covers: FR-14 AC1, FR-21 AC6, FR-22 AC4
+    // Regression (review finding 8): the entry written when recovery finished an
+    // operation lost its original action, the permitted names and every serial but the
+    // first certificate's.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    crate::store::testutil::issue_master(&set, 1, ts(1));
+    // A sub-intermediate with name constraints, staged and sealed, then interrupted.
+    let sub = cert(serial(3), CaLevel::SubIntermediate, serial(1));
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateSubIntermediate,
+            &sub.subject.display(),
+            &[serial(3)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.record_signed(
+        SignedObject::Certificate {
+            record: Box::new(sub.clone()),
+            pem: cert_pem(serial(3)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    let update = RecordUpdate::new(
+        id,
+        vec![RecordChange::Issued {
+            certificate: Box::new(sub.clone()),
+        }],
+    );
+    op.stage(
+        OutputPath::new(OutputDir::Certs, "sub.crt").expect("path"),
+        cert_pem(serial(3)).as_bytes(),
+    )
+    .expect("stage");
+    op.stage(update.output_path(), &update.to_bytes())
+        .expect("stage");
+    op.seal_staging(ts(5)).expect("seal");
+    drop(op);
+    let set = open_all(&drives);
+    set.finish_operation(id, 0, ts(6)).expect("finish");
+    let log = set.audit_log().expect("log");
+    let entry = log.entries().last().expect("entry");
+    assert_eq!(entry.action, AuditAction::RecoveryFinish);
+    assert_eq!(entry.operation, Some(id));
+    assert_eq!(entry.serial, Some(serial(3)));
+    assert_eq!(entry.fingerprint, Some(sub.fingerprint));
+    assert_eq!(entry.result, AuditResult::Success);
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(
+        details.original_action,
+        Some(AuditAction::CreateSubIntermediate)
+    );
+    assert_eq!(details.issuer_serial, Some(serial(1)));
+    assert_eq!(details.name_constraints, Some(true));
+    assert_eq!(details.permitted_dns, Some(vec!["starnet".to_string()]));
+    assert_eq!(details.serials, Some(vec![serial(3)]));
+
+    // A revocation that also marks two children: every serial and the reason are kept.
+    let main = cert(serial(4), CaLevel::MainIntermediate, serial(1));
+    let child_a = cert(serial(5), CaLevel::SubIntermediate, serial(4));
+    let child_b = cert(serial(6), CaLevel::SubIntermediate, serial(4));
+    for record in [main, child_a, child_b] {
+        let kind = if record.level == CaLevel::MainIntermediate {
+            OperationKind::SetupYubikey
+        } else {
+            OperationKind::CreateSubIntermediate
+        };
+        crate::store::testutil::issue(&set, kind, record, ts(7));
+    }
+    let mut op = set
+        .begin_operation(
+            OperationKind::ReplaceYubikey,
+            "CN=KEYSTONE TEST main",
+            &[],
+            ts(8),
+        )
+        .expect("begin");
+    let id = op.id();
+    let update = RecordUpdate::new(
+        id,
+        vec![
+            RecordChange::Revoked {
+                serial: serial(4),
+                date: ts(8),
+                reason: crate::model::RevocationReason::KeyCompromise,
+            },
+            RecordChange::RevokedByAncestor {
+                serial: serial(5),
+                ancestor: serial(4),
+                date: ts(8),
+            },
+            RecordChange::RevokedByAncestor {
+                serial: serial(6),
+                ancestor: serial(4),
+                date: ts(8),
+            },
+        ],
+    );
+    op.stage(update.output_path(), &update.to_bytes())
+        .expect("stage");
+    op.seal_staging(ts(8)).expect("seal");
+    drop(op);
+    let set = open_all(&drives);
+    set.finish_operation(id, 0, ts(9)).expect("finish");
+    let log = set.audit_log().expect("log");
+    let entry = log.entries().last().expect("entry");
+    assert_eq!(entry.action, AuditAction::RecoveryFinish);
+    assert_eq!(entry.serial, Some(serial(4)));
+    let details = entry.details.as_ref().expect("details");
+    assert_eq!(details.original_action, Some(AuditAction::ReplaceYubikey));
+    assert_eq!(
+        details.revocation_reason,
+        Some(crate::model::RevocationReason::KeyCompromise)
+    );
+    assert_eq!(details.serials, Some(vec![serial(4), serial(5), serial(6)]));
+    assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+}
+
+/// Every drive's journals parse, no operation is pending, the drives agree and a new
+/// operation can begin.
+fn assert_recovered(drives: &TestDrives, context: &str) {
+    let set = open_all(drives);
+    for drive in set.drives() {
+        let journals = drive
+            .journal()
+            .unwrap_or_else(|e| panic!("{context}: journal of {}: {e}", drive.label()));
+        for (operation, journal) in journals {
+            assert_ne!(
+                journal.state(),
+                OperationState::Pending,
+                "{context}: {operation} on {}",
+                drive.label()
+            );
+        }
+    }
+    assert!(
+        set.recovery_report().expect("report").is_clean(),
+        "{context}"
+    );
+    assert_eq!(
+        set.compare().expect("compare"),
+        DriveComparison::InSync,
+        "{context}"
+    );
+    set.ensure_in_sync()
+        .unwrap_or_else(|e| panic!("{context}: {e}"));
+    let next = set
+        .begin_operation(
+            OperationKind::Revoke,
+            "CN=KEYSTONE TEST next",
+            &[serial(200)],
+            ts(100),
+        )
+        .unwrap_or_else(|e| panic!("{context}: a new operation is refused: {e}"));
+    next.cancel(ts(100)).expect("cancel the probe operation");
+}
+
+/// Takes the first offered action of every interrupted operation (at most `rounds`
+/// times), as the recovery screen does after each restart.
+fn recover_with_first_actions(drives: &TestDrives, rounds: usize, context: &str) {
+    for round in 0..rounds {
+        let set = open_all(drives);
+        let report = set
+            .recovery_report()
+            .unwrap_or_else(|e| panic!("{context}: round {round}: {e}"));
+        if report.is_clean() {
+            return;
+        }
+        let time = ts(50 + round as i64);
+        for pending in report.pending {
+            let result = match pending.actions.first() {
+                Some(RecoveryAction::FinishFrom { drive_index, .. }) => {
+                    set.finish_operation(pending.operation, *drive_index, time)
+                }
+                Some(RecoveryAction::Abandon) => set.abandon_operation(pending.operation, time),
+                other => panic!(
+                    "{context}: round {round}: no usable action {other:?}: {:?}",
+                    pending.blocked_reason
+                ),
+            };
+            result.unwrap_or_else(|e| panic!("{context}: round {round}: {e}"));
+        }
+    }
+}
+
+fn begin_master(set: &DriveSet) -> crate::store::OperationHandle<'_> {
+    set.begin_operation(
+        OperationKind::CreateMaster,
+        "CN=KEYSTONE TEST",
+        &[serial(1)],
+        ts(5),
+    )
+    .expect("begin")
+}
+
+#[test]
+fn regression_abandon_after_an_interrupted_cancel_never_corrupts_the_journals() {
+    // Covers: FR-22 AC4, FR-22 AC6, FR-16 AC2, SEC-22
+    // Regression (review finding 1): the cancelled entry reached only the primary; the
+    // recovery screen then offered Abandon, which wrote a second final entry and made
+    // both drives' journals unreadable for good.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let op = begin_master(&set);
+    // cancel: audit primary, audit backup, cancelled primary, cancelled backup.
+    fault::fail_after(3);
+    assert!(op.cancel(ts(6)).is_err());
+    fault::disarm();
+    let set = open_all(&drives);
+    let pending = only_pending(&set);
+    assert_eq!(pending.drives[0].state, Some(OperationState::Cancelled));
+    assert_eq!(pending.drives[1].state, Some(OperationState::Pending));
+    assert!(
+        !pending.actions.contains(&RecoveryAction::Abandon),
+        "{:?}",
+        pending.actions
+    );
+    assert!(
+        set.abandon_operation(OperationId(1), ts(7)).is_err(),
+        "abandon must be refused once a final entry exists"
+    );
+    assert!(
+        matches!(
+            pending.actions.as_slice(),
+            [RecoveryAction::FinishFrom { drive_index: 0, .. }]
+        ),
+        "{:?}",
+        pending.actions
+    );
+    set.finish_operation(OperationId(1), 0, ts(7))
+        .expect("finish from the drive holding the cancelled entry");
+    for drive in open_all(&drives).drives() {
+        let journal = drive
+            .operation_journal(OperationId(1))
+            .expect("readable")
+            .expect("journal");
+        assert_eq!(journal.state(), OperationState::Cancelled);
+    }
+    assert_recovered(&drives, "after finishing the cancel");
+}
+
+#[test]
+fn regression_an_abandon_interrupted_between_the_audit_writes_does_not_deadlock() {
+    // Covers: FR-22 AC4, FR-12 AC3, SEC-22
+    // Regression (review finding 2): the abandon's audit entry reached only the primary;
+    // compare() then reported damage and Abandon failed with "compare and repair first".
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    drop(begin_master(&set));
+    let set = open_all(&drives);
+    // abandon: audit primary, audit backup, ... -> fail the backup's audit write.
+    fault::fail_after(1);
+    assert!(set.abandon_operation(OperationId(1), ts(6)).is_err());
+    fault::disarm();
+    let set = open_all(&drives);
+    assert_eq!(
+        only_pending(&set).actions,
+        vec![RecoveryAction::Abandon],
+        "abandon is offered again"
+    );
+    set.abandon_operation(OperationId(1), ts(7))
+        .expect("abandon again");
+    let log = open_all(&drives).audit_log().expect("same log everywhere");
+    let abandons = log
+        .entries()
+        .iter()
+        .filter(|e| e.action == AuditAction::RecoveryAbandon)
+        .count();
+    assert_eq!(abandons, 1, "the first abandon entry is reused");
+    assert_recovered(&drives, "after abandoning again");
+}
+
+#[test]
+fn regression_a_cancel_interrupted_between_the_audit_writes_does_not_deadlock() {
+    // Covers: FR-16 AC2, FR-22 AC4, SEC-22
+    // Regression (review finding 2): the cancel's audit entry reached only the primary.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let op = begin_master(&set);
+    fault::fail_after(1);
+    assert!(op.cancel(ts(6)).is_err());
+    fault::disarm();
+    let context = "cancel interrupted after the primary's audit";
+    recover_with_first_actions(&drives, 3, context);
+    assert_recovered(&drives, context);
+}
+
+#[test]
+fn fr22_ac6_cancel_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-16 AC2, FR-22 AC4, SEC-22
+    fn staged(set: &DriveSet) -> crate::store::OperationHandle<'_> {
+        let mut op = begin_master(set);
+        op.stage(
+            OutputPath::new(OutputDir::Keys, "k.key").expect("path"),
+            encrypted_key_pem(serial(1)).as_bytes(),
+        )
+        .expect("stage");
+        op
+    }
+    let probe = TestDrives::new(2);
+    let set = new_ca(&probe);
+    let op = staged(&set);
+    fault::take_count();
+    op.cancel(ts(6)).expect("clean cancel");
+    let total = fault::take_count();
+    assert!(total >= 6, "{total}");
+    for allowed in 0..total {
+        let drives = TestDrives::new(2);
+        let set = new_ca(&drives);
+        let op = staged(&set);
+        fault::fail_after(allowed);
+        assert!(op.cancel(ts(6)).is_err(), "fault {allowed}");
+        fault::disarm();
+        let context = format!("cancel fault {allowed}");
+        recover_with_first_actions(&drives, 3, &context);
+        assert_recovered(&drives, &context);
+        assert!(
+            open_all(&drives)
+                .known_serials()
+                .expect("serials")
+                .contains(&serial(1))
+        );
+    }
+}
+
+#[test]
+fn fr22_ac6_abandon_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-22 AC4, SEC-22
+    let probe = TestDrives::new(2);
+    drop(begin_master(&new_ca(&probe)));
+    let set = open_all(&probe);
+    fault::take_count();
+    set.abandon_operation(OperationId(1), ts(6))
+        .expect("clean abandon");
+    let total = fault::take_count();
+    assert!(total >= 4, "{total}");
+    for allowed in 0..total {
+        let drives = TestDrives::new(2);
+        drop(begin_master(&new_ca(&drives)));
+        let set = open_all(&drives);
+        fault::fail_after(allowed);
+        assert!(
+            set.abandon_operation(OperationId(1), ts(6)).is_err(),
+            "fault {allowed}"
+        );
+        fault::disarm();
+        let context = format!("abandon fault {allowed}");
+        recover_with_first_actions(&drives, 3, &context);
+        assert_recovered(&drives, &context);
+    }
+}
+
+/// An operation signed, staged and sealed, then interrupted before moving into place.
+fn sealed_master(drives: &TestDrives) {
+    let set = new_ca(drives);
+    let mut op = begin_master(&set);
+    let id = op.id();
+    op.record_signed(
+        SignedObject::Certificate {
+            record: Box::new(master_record()),
+            pem: cert_pem(serial(1)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    for (path, data) in master_outputs(id) {
+        op.stage(path, &data).expect("stage");
+    }
+    op.seal_staging(ts(5)).expect("seal");
+}
+
+#[test]
+fn fr22_ac6_finish_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-22 AC4, FR-22 AC3, SEC-22
+    let probe = TestDrives::new(2);
+    sealed_master(&probe);
+    let set = open_all(&probe);
+    fault::take_count();
+    set.finish_operation(OperationId(1), 0, ts(6))
+        .expect("clean finish");
+    let total = fault::take_count();
+    assert!(total >= 8, "{total}");
+    for allowed in 0..total {
+        let drives = TestDrives::new(2);
+        sealed_master(&drives);
+        let set = open_all(&drives);
+        fault::fail_after(allowed);
+        assert!(
+            set.finish_operation(OperationId(1), 0, ts(6)).is_err(),
+            "fault {allowed}"
+        );
+        fault::disarm();
+        let context = format!("finish fault {allowed}");
+        recover_with_first_actions(&drives, 3, &context);
+        assert_recovered(&drives, &context);
+        let record = open_all(&drives).issuance_record().expect("record");
+        assert_eq!(
+            record.get(serial(1)).expect("kept").source,
+            RecordSource::RecordFile,
+            "{context}"
+        );
+    }
+}
+
+/// A YubiKey setup whose PIN step is on both drives and whose next two steps reached
+/// the primary only (as after two interrupted journal writes).
+fn setup_ahead_on_primary(drives: &TestDrives) {
+    let set = new_ca(drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::SetupYubikey,
+            "CN=KEYSTONE TEST main",
+            &[serial(2)],
+            ts(5),
+        )
+        .expect("begin");
+    op.record_yubikey_step(YubikeySetupStep::PinChanged, 77, ts(5))
+        .expect("pin");
+    let rel = format!("{JOURNAL_DIR}/{}", op.id().stem());
+    drop(op);
+    for (step, kind) in [
+        (3u32, YubikeySetupStep::PukChanged),
+        (4, YubikeySetupStep::ManagementKeySet),
+    ] {
+        let entry = JournalEntry {
+            format: JOURNAL_FORMAT,
+            operation: OperationId(1),
+            step,
+            time: ts(5),
+            event: JournalEvent::YubikeyStep {
+                step: kind,
+                device_serial: 77,
+            },
+        };
+        set.drives()[0]
+            .write_one_verified(
+                &rel,
+                &entry.file_name(),
+                &to_json_file(&entry),
+                WriteMode::CreateOnly,
+            )
+            .expect("write");
+    }
+}
+
+#[test]
+fn fr22_ac6_journal_sync_interrupted_at_every_drive_change_recovers() {
+    // Covers: FR-22 AC6, FR-22 AC7, SEC-22
+    let probe = TestDrives::new(2);
+    setup_ahead_on_primary(&probe);
+    let set = open_all(&probe);
+    fault::take_count();
+    set.sync_operation_journal(OperationId(1)).expect("sync");
+    assert_eq!(fault::take_count(), 2);
+    for allowed in 0..2 {
+        let drives = TestDrives::new(2);
+        setup_ahead_on_primary(&drives);
+        let set = open_all(&drives);
+        fault::fail_after(allowed);
+        assert!(set.sync_operation_journal(OperationId(1)).is_err());
+        fault::disarm();
+        let set = open_all(&drives);
+        let pending = only_pending(&set);
+        assert!(pending.blocked_reason.is_none(), "{pending:?}");
+        assert_eq!(
+            pending.actions.first(),
+            Some(&RecoveryAction::ResumeYubikeySetup {
+                next_step: Some(YubikeySetupStep::KeyGenerated)
+            }),
+            "sync fault {allowed}"
+        );
+        set.sync_operation_journal(OperationId(1))
+            .expect("sync again");
+        let resumed = set.resume_operation(OperationId(1)).expect("resume");
+        assert_eq!(resumed.completed_yubikey_steps().expect("steps").len(), 3);
     }
 }

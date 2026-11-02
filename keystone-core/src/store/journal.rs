@@ -11,7 +11,7 @@
 //! | `yubikey-step` | after each YubiKey setup step (PIN, PUK, management key, key, cert)   |
 //! | `signed`       | right after a certificate or CRL is signed (FR-22 AC3)                |
 //! | `staged`       | after every output is staged and verified: paths, SHA-256, sizes      |
-//! | `completed`    | last: SHA-256 of every output file and the audit-log head             |
+//! | `completed`    | last: SHA-256 of every output file and its own last audit entry       |
 //! | `cancelled`    | FR-16 cancel before any persistent change; the serial stays reserved  |
 //! | `abandoned`    | FR-22 AC4: no signed output exists anywhere; the serial stays reserved|
 //!
@@ -98,7 +98,8 @@ pub struct OutputFile {
     pub size: u64,
 }
 
-/// The audit log's newest entry when an operation finished.
+/// An operation's own last audit entry, recorded by its final journal entry. Entries of
+/// no operation appended later never change it (a behind drive stays repairable).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditHead {
@@ -175,17 +176,17 @@ pub enum JournalEvent {
     Completed {
         /// The outputs (the same list as `staged`).
         outputs: Vec<OutputFile>,
-        /// Audit-log head after this operation's audit entries.
+        /// This operation's own last audit entry.
         audit: AuditHead,
     },
     /// Cancelled before any persistent change (FR-16).
     Cancelled {
-        /// Audit-log head after the cancel entry.
+        /// This operation's own last audit entry (the cancel entry).
         audit: AuditHead,
     },
     /// Abandoned on the recovery screen (FR-22 AC4).
     Abandoned {
-        /// Audit-log head after the abandon entry.
+        /// This operation's own last audit entry (the abandon entry).
         audit: AuditHead,
     },
 }

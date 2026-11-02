@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::audit::{AuditAction, AuditLog};
 use super::fsio::{Dir, EntryKind, WriteMode};
 use super::ids::{CaId, DriveId};
 use super::paths::{
@@ -150,6 +151,10 @@ pub struct CaDrive {
     root: PathBuf,
     keystone: Dir,
     identity: DriveIdentity,
+    /// The role the drive has now: the identity's role, unless the audit log records a
+    /// later promotion of a backup to primary (Replace a lost drive). `drive.json` is
+    /// create-only and never rewritten, so a promotion lives in the audit log.
+    role: DriveRole,
 }
 
 impl CaDrive {
@@ -159,6 +164,7 @@ impl CaDrive {
             DriveClass::KeystoneCa(identity) => Ok(CaDrive {
                 root: root.to_path_buf(),
                 keystone: Dir::open(root)?.open_dir(KEYSTONE_DIR)?,
+                role: identity.role,
                 identity,
             }),
             DriveClass::DamagedKeystone(reason) => Err(StoreError::NotACaDrive {
@@ -172,9 +178,27 @@ impl CaDrive {
         }
     }
 
-    /// The drive's identity.
+    /// The drive's identity, as stored in its `drive.json`.
     pub fn identity(&self) -> &DriveIdentity {
         &self.identity
+    }
+
+    /// The drive's role now: the identity's role, or primary/backup as the latest
+    /// audited promotion in the connected drives' most complete audit log says
+    /// ([`DriveSet::open`]). Use this, not `identity().role`, for what the drive is.
+    pub fn role(&self) -> DriveRole {
+        self.role
+    }
+
+    /// A drive being set up by "Replace a lost drive": its folder exists, its identity
+    /// is only in memory until it is written last.
+    pub(crate) fn provisional(root: &Path, keystone: Dir, identity: DriveIdentity) -> CaDrive {
+        CaDrive {
+            root: root.to_path_buf(),
+            keystone,
+            role: identity.role,
+            identity,
+        }
     }
 
     /// The drive's mount point.
@@ -184,7 +208,7 @@ impl CaDrive {
 
     /// A short label for the operator: `primary drive 1a2b3c4d (/media/usb1)`.
     pub fn label(&self) -> String {
-        let role = match self.identity.role {
+        let role = match self.role {
             DriveRole::Primary => "primary",
             DriveRole::Backup => "backup",
         };
@@ -261,6 +285,23 @@ impl CaDrive {
             None => Ok(None),
         }
     }
+}
+
+/// The drive the latest audited promotion made the primary, read from the most complete
+/// verified audit log among `drives` (Replace a lost drive).
+fn promoted_primary(drives: &[CaDrive]) -> Option<DriveId> {
+    drives
+        .iter()
+        .filter_map(|drive| drive.read_audit_log().valid().cloned())
+        .max_by_key(AuditLog::len)?
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| {
+            (entry.action == AuditAction::DriveRepair)
+                .then(|| entry.details.as_ref()?.primary_promoted)
+                .flatten()
+        })
 }
 
 /// A file written to every drive of a set but not yet read back (FR-12 AC2).
@@ -363,9 +404,20 @@ impl DriveSet {
                 "the drives belong to different CAs".to_string(),
             ));
         }
+        // A backup promoted to primary (Replace a lost drive) is the only primary; every
+        // other drive, including a former primary found again, is a backup.
+        if let Some(primary) = promoted_primary(&drives) {
+            for drive in &mut drives {
+                drive.role = if drive.identity.drive_id == primary {
+                    DriveRole::Primary
+                } else {
+                    DriveRole::Backup
+                };
+            }
+        }
         if drives
             .iter()
-            .filter(|drive| drive.identity.role == DriveRole::Primary)
+            .filter(|drive| drive.role == DriveRole::Primary)
             .count()
             > 1
         {
@@ -373,7 +425,7 @@ impl DriveSet {
                 "more than one drive is marked as the primary".to_string(),
             ));
         }
-        drives.sort_by_key(|drive| (drive.identity.role, drive.identity.drive_id));
+        drives.sort_by_key(|drive| (drive.role, drive.identity.drive_id));
         Ok(DriveSet { drives })
     }
 
@@ -392,7 +444,7 @@ impl DriveSet {
         let primaries = self
             .drives
             .iter()
-            .filter(|drive| drive.identity.role == DriveRole::Primary)
+            .filter(|drive| drive.role == DriveRole::Primary)
             .count();
         let backups = self.drives.len() - primaries;
         if primaries == 1 && backups >= 1 {
@@ -460,17 +512,29 @@ impl DriveSet {
     }
 }
 
+/// The folders `init_drive` creates inside `keystone/`.
+pub(crate) fn layout_folders() -> impl Iterator<Item = &'static str> {
+    [JOURNAL_DIR, STAGING_DIR]
+        .into_iter()
+        .chain(OutputDir::ALL.iter().map(|dir| dir.name()))
+}
+
 /// Creates the layout on one empty drive. `drive.json` is written last, so a drive
 /// interrupted during setup is classified as damaged, never as a valid empty CA.
 fn init_drive(root: &Path, identity: &DriveIdentity) -> Result<(), StoreError> {
     let keystone = Dir::open(root)?.create_dir(KEYSTONE_DIR)?;
-    for name in [JOURNAL_DIR, STAGING_DIR]
-        .into_iter()
-        .chain(OutputDir::ALL.iter().map(|dir| dir.name()))
-    {
+    for name in layout_folders() {
         keystone.create_dir(name)?;
     }
     keystone.write_atomic(AUDIT_LOG_FILE, b"", WriteMode::CreateOnly)?;
+    write_identity(root, &keystone, identity)
+}
+
+pub(crate) fn write_identity(
+    root: &Path,
+    keystone: &Dir,
+    identity: &DriveIdentity,
+) -> Result<(), StoreError> {
     let bytes = to_json_file(identity);
     keystone.write_atomic(IDENTITY_FILE, &bytes, WriteMode::CreateOnly)?;
     let back = keystone.read_back(IDENTITY_FILE, MAX_METADATA_BYTES)?;
@@ -483,6 +547,194 @@ fn init_drive(root: &Path, identity: &DriveIdentity) -> Result<(), StoreError> {
         });
     }
     Ok(())
+}
+
+/// What one drive holds of an interrupted [`DriveSet::create`] (review finding 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupProgress {
+    /// Nothing: the setup never reached this drive.
+    Empty,
+    /// Only the layout of an interrupted setup: `keystone/` with empty layout folders, at
+    /// most an empty `audit.log`, and the drive identity if setup got that far. Nothing
+    /// else (no journal entry, record, key, certificate or CRL).
+    Started {
+        /// The drive identity, when it was written.
+        identity: Option<DriveIdentity>,
+    },
+}
+
+/// An unfinished CA setup: drives an interrupted [`DriveSet::create`] left behind
+/// (review finding 11). [`DriveSet::finish_setup`] completes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnfinishedSetup {
+    /// The CA the interrupted setup created, when a drive identity was written.
+    pub ca_id: Option<CaId>,
+    /// Each drive as chosen (primary first) with what it holds.
+    pub drives: Vec<(PathBuf, DriveRole, SetupProgress)>,
+}
+
+/// What an interrupted setup left on `root`, or `None` when the drive holds anything
+/// else (then it is a CA, damaged, or not empty, and never touched).
+fn setup_progress(root: &Path) -> Result<Option<SetupProgress>, StoreError> {
+    let top = Dir::open(root)?;
+    let entries: Vec<(String, EntryKind)> = top
+        .entries()?
+        .into_iter()
+        .filter(|(name, kind)| !(name == "lost+found" && *kind == EntryKind::Dir))
+        .collect();
+    if entries.is_empty() {
+        return Ok(Some(SetupProgress::Empty));
+    }
+    if entries.len() != 1 || entries[0] != (KEYSTONE_DIR.to_string(), EntryKind::Dir) {
+        return Ok(None);
+    }
+    let keystone = top.open_dir(KEYSTONE_DIR)?;
+    let mut identity = None;
+    for (name, kind) in keystone.entries()? {
+        if name.starts_with('.') && kind == EntryKind::File {
+            // A temporary file of a write the interruption cut off.
+            continue;
+        }
+        if layout_folders().any(|folder| folder == name) {
+            if kind != EntryKind::Dir || !keystone.open_dir(&name)?.entries()?.is_empty() {
+                return Ok(None);
+            }
+        } else if name == AUDIT_LOG_FILE {
+            if kind != EntryKind::File || !keystone.read(&name, 0).is_ok_and(|b| b.is_empty()) {
+                return Ok(None);
+            }
+        } else if name == IDENTITY_FILE {
+            match read_identity(&keystone) {
+                Ok(found) => identity = Some(found),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok(Some(SetupProgress::Started { identity }))
+}
+
+/// Review finding 11: recognises drives that an interrupted [`DriveSet::create`] left
+/// behind. `Some` when every chosen drive is empty or holds only such a layout, at least
+/// one holds a layout, at least one has no drive identity yet, and every identity found
+/// names the same CA and the role chosen for that drive. `None` when the drives are
+/// something else (all empty, a finished CA, or anything with other content: the
+/// normal checks then apply). A different CA, or a drive chosen in the wrong role, is
+/// refused (SEC-20).
+pub fn unfinished_setup(
+    primary: &Path,
+    backups: &[&Path],
+) -> Result<Option<UnfinishedSetup>, StoreError> {
+    let mut drives = Vec::new();
+    let mut seen = BTreeSet::new();
+    let chosen = std::iter::once((primary, DriveRole::Primary))
+        .chain(backups.iter().map(|root| (*root, DriveRole::Backup)));
+    for (root, role) in chosen {
+        if !seen.insert(Dir::open(root)?.identity()?) {
+            return Err(StoreError::DriveSet(format!(
+                "{} was given twice",
+                root.display()
+            )));
+        }
+        let Some(progress) = setup_progress(root)? else {
+            return Ok(None);
+        };
+        drives.push((root.to_path_buf(), role, progress));
+    }
+    let identities: Vec<(&PathBuf, DriveRole, &DriveIdentity)> = drives
+        .iter()
+        .filter_map(|(root, role, progress)| match progress {
+            SetupProgress::Started {
+                identity: Some(identity),
+            } => Some((root, *role, identity)),
+            _ => None,
+        })
+        .collect();
+    let ca_id = identities.first().map(|(_, _, identity)| identity.ca_id);
+    for (root, role, identity) in &identities {
+        if Some(identity.ca_id) != ca_id {
+            return Err(StoreError::DriveSet(format!(
+                "{} was set up for a different CA; drives of two CAs are never combined",
+                root.display()
+            )));
+        }
+        if identity.role != *role {
+            return Err(StoreError::DriveSet(format!(
+                "{} was set up as a {} drive; choose it in that role to finish the setup",
+                root.display(),
+                match identity.role {
+                    DriveRole::Primary => "primary",
+                    DriveRole::Backup => "backup",
+                }
+            )));
+        }
+    }
+    let started = drives
+        .iter()
+        .any(|(_, _, progress)| matches!(progress, SetupProgress::Started { .. }));
+    if !started || identities.len() == drives.len() {
+        return Ok(None);
+    }
+    Ok(Some(UnfinishedSetup { ca_id, drives }))
+}
+
+impl DriveSet {
+    /// Review finding 11: "Finish setting up these drives" after an interrupted
+    /// [`DriveSet::create`]. Re-checks [`unfinished_setup`], then completes each drive's
+    /// layout: missing folders, a missing empty `audit.log` and, last, a missing drive
+    /// identity (with the CA id an earlier identity already holds, or a new one). Nothing
+    /// that exists is overwritten or deleted.
+    pub fn finish_setup(
+        primary: &Path,
+        backups: &[&Path],
+        created: Timestamp,
+    ) -> Result<DriveSet, StoreError> {
+        if backups.is_empty() {
+            return Err(StoreError::NotEnoughDrives {
+                primaries: 1,
+                backups: 0,
+            });
+        }
+        check_timestamp(created, "created").map_err(|e| StoreError::Unsafe(e.to_string()))?;
+        let setup = unfinished_setup(primary, backups)?.ok_or_else(|| {
+            StoreError::Unsafe(
+                "these drives do not hold an unfinished CA setup; nothing was changed".into(),
+            )
+        })?;
+        let ca_id = match setup.ca_id {
+            Some(ca_id) => ca_id,
+            None => CaId::random()?,
+        };
+        for (root, role, progress) in &setup.drives {
+            let keystone = match progress {
+                SetupProgress::Empty => Dir::open(root)?.create_dir(KEYSTONE_DIR)?,
+                SetupProgress::Started { .. } => Dir::open(root)?.open_dir(KEYSTONE_DIR)?,
+            };
+            for name in layout_folders() {
+                keystone.ensure_dir(name)?;
+            }
+            if keystone.kind(AUDIT_LOG_FILE)?.is_none() {
+                keystone.write_atomic(AUDIT_LOG_FILE, b"", WriteMode::CreateOnly)?;
+            }
+            if keystone.kind(IDENTITY_FILE)?.is_none() {
+                let identity = DriveIdentity {
+                    format: IDENTITY_FORMAT,
+                    ca_id,
+                    drive_id: DriveId::random()?,
+                    role: *role,
+                    created,
+                };
+                write_identity(root, &keystone, &identity)?;
+            }
+        }
+        let all: Vec<&Path> = setup
+            .drives
+            .iter()
+            .map(|(root, _, _)| root.as_path())
+            .collect();
+        DriveSet::open(&all)
+    }
 }
 
 /// The export drive or folder: files carried by hand to issuing systems (FR-09, FR-22 AC2).
@@ -548,6 +800,16 @@ impl ExportDrive {
     /// Reads an exported file.
     pub fn read_file(&self, name: &str, limit: usize) -> Result<Vec<u8>, StoreError> {
         self.dir.read(name, limit)
+    }
+
+    /// Reads an exported file of at most the output-file limit, or `None` if missing.
+    pub(crate) fn read_existing(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        if !is_valid_name(name) {
+            return Err(StoreError::Unsafe(format!(
+                "invalid export file name {name:?}"
+            )));
+        }
+        self.dir.read_if_exists(name, MAX_OUTPUT_FILE_BYTES)
     }
 }
 

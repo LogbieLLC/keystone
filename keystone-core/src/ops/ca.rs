@@ -12,9 +12,8 @@ use crate::clock::{
 use crate::crl::{CrlFreshness, crl_freshness};
 use crate::model::{Fingerprint, Serial, Sha256Digest, Timestamp};
 use crate::store::{
-    AuditAction, AuditDetails, AuditDraft, AuditEntry, AuditResult, CaDrive, DriveComparison,
-    DriveHistory, DriveRole, DriveSet, ExportDrive, OperationId, OperationKind, OutputDir,
-    OutputPath, ParseError, RepairPlan, StoreError,
+    AuditEntry, CaDrive, DriveComparison, DriveHistory, DriveRole, DriveSet, ExportDrive,
+    OperationId, OperationKind, OutputDir, OutputPath, ParseError, RepairPlan, StoreError,
 };
 
 use super::recovery::RecoveryItem;
@@ -370,9 +369,15 @@ impl Ca {
                     drive: drive.label(),
                     entries: log.len(),
                 }),
-                Err(StoreError::Parse { source, .. }) => {
-                    let (entry, problem) = match source {
-                        ParseError::Audit { entry, problem } => (entry, problem.to_string()),
+                Err(error) => {
+                    // A missing or unreadable audit.log is reported for that drive (entry
+                    // 0: the file itself), never as a failure of the whole start check.
+                    let (entry, problem) = match error {
+                        StoreError::Parse {
+                            source: ParseError::Audit { entry, problem },
+                            ..
+                        } => (entry, problem.to_string()),
+                        StoreError::Parse { source, .. } => (0, source.to_string()),
                         other => (0, other.to_string()),
                     };
                     blockers.push(Blocker::AuditLogBroken {
@@ -386,7 +391,6 @@ impl Ca {
                         problem,
                     });
                 }
-                Err(error) => return Err(error.into()),
             }
         }
         let comparison = self.drives.compare()?;
@@ -539,55 +543,28 @@ impl Ca {
         let journal = self.drives.drives()[verified[0]]
             .operation_journal(operation)?
             .ok_or_else(|| OpsError::NotReady(format!("{operation} has no journal")))?;
-        let wanted: Vec<OutputPath> = outputs
+        let wanted: Vec<(OutputPath, String)> = outputs
             .iter()
             .map(|output| output.path.clone())
             .filter(|path| exported(journal.kind(), path))
+            .map(|path| {
+                let name = path.name().to_owned();
+                (path, name)
+            })
             .collect();
-        let mut done = Vec::new();
-        let mut missing = Vec::new();
-        for path in wanted {
-            let output = outputs
-                .iter()
-                .find(|o| o.path == path)
-                .ok_or_else(|| OpsError::Damaged(format!("{path} is not an output")))?;
-            match export.read_file(path.name(), crate::limits::MAX_OUTPUT_FILE_BYTES) {
-                Ok(existing) if crate::crypto::hash::sha256(&existing) == output.sha256 => {
-                    done.push(ExportedFile {
-                        name: path.name().to_owned(),
-                        path: export.path_of(path.name()),
-                        sha256: output.sha256,
-                    });
-                }
-                Ok(_) => {
-                    return Err(OpsError::Store(StoreError::AlreadyExists {
-                        path: export.path_of(path.name()),
-                    }));
-                }
-                Err(_) => missing.push((path.clone(), path.name().to_owned())),
-            }
-        }
-        for (name, sha256) in self.drives.export_outputs(operation, &export, &missing)? {
-            done.push(ExportedFile {
+        // The store keeps identical files already on the export drive (a retried
+        // export), never overwrites a different one, never exports the master's key, and
+        // appends the `export` audit entry (review finding 15).
+        Ok(self
+            .drives
+            .export_outputs(operation, &export, &wanted, time.get())?
+            .into_iter()
+            .map(|(name, sha256)| ExportedFile {
                 path: export.path_of(&name),
                 name,
                 sha256,
-            });
-        }
-        let mut draft =
-            AuditDraft::new(AuditAction::Export, journal.subject(), AuditResult::Success);
-        draft.details = Some(AuditDetails {
-            note: Some(format!(
-                "{operation}: {} written to the export drive",
-                done.iter()
-                    .map(|file| file.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            ..AuditDetails::default()
-        });
-        self.drives.append_audit(&[draft], time.get())?;
-        Ok(done)
+            })
+            .collect())
     }
 
     /// Export right after an operation completed; failures are reported, not raised.
@@ -619,7 +596,7 @@ impl Ca {
         self.drives
             .drives()
             .iter()
-            .map(|drive| (drive.label(), drive.identity().role))
+            .map(|drive| (drive.label(), drive.role()))
             .collect()
     }
 }

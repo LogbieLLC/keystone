@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use super::drive::{CaDrive, DriveSet, check_len, check_timestamp};
 use super::fsio::WriteMode;
-use super::ids::OperationId;
+use super::ids::{DriveId, OperationId};
 use super::journal::{AuditHead, OperationKind};
 use super::paths::AUDIT_LOG_FILE;
 use super::{ParseError, StoreError};
@@ -45,6 +45,9 @@ pub const GENESIS_PREV: Sha256Digest = Sha256Digest([0; 32]);
 
 /// Longest subject or note text accepted in an audit entry.
 pub const MAX_AUDIT_TEXT: usize = 4096;
+
+/// Most serials listed in one audit entry's details.
+pub const MAX_AUDIT_SERIALS: usize = 256;
 
 /// What was done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -138,6 +141,21 @@ pub struct AuditDetails {
     /// Clock correction (FR-17 AC3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_correction: Option<ClockCorrectionDetails>,
+    /// The action of the operation a `recovery_finish` entry finished (FR-14 AC1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_action: Option<AuditAction>,
+    /// Every serial the entry concerns when there is more than the entry's `serial`
+    /// (for example a revoked main intermediate and the sub-intermediates it cut off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serials: Option<Vec<Serial>>,
+    /// Replace a lost drive: the new drive that received a verified copy of the CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_added: Option<DriveId>,
+    /// Replace a lost drive: the backup drive that became the primary because the
+    /// primary was lost. From this entry on it is the primary (its `drive.json`, which is
+    /// never rewritten, still says backup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_promoted: Option<DriveId>,
     /// Free text (for example which drive was repaired from which).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -200,6 +218,13 @@ fn validate_details(details: &AuditDetails) -> Result<(), String> {
         .is_some_and(|n| n.len() > MAX_AUDIT_TEXT)
     {
         return Err("note is too long".to_string());
+    }
+    if details
+        .serials
+        .as_ref()
+        .is_some_and(|serials| serials.len() > MAX_AUDIT_SERIALS)
+    {
+        return Err("too many serials".to_string());
     }
     if let Some(correction) = &details.clock_correction {
         check_timestamp(correction.previous_newest, "previous_newest")
@@ -287,6 +312,12 @@ pub enum AuditProblem {
         /// The entry holding the link.
         next_entry: u64,
     },
+    /// This entry's link to the previous entry was changed: the previous entry still
+    /// verifies, and the next entry's link no longer matches this one.
+    #[error(
+        "its link to the previous entry was changed (the previous entry still verifies and the next entry no longer links to this one)"
+    )]
+    LinkChanged,
 }
 
 /// A parsed and verified audit log.
@@ -356,10 +387,21 @@ pub fn parse_audit_log(bytes: &[u8]) -> Result<AuditLog, ParseError> {
                 return Err(audit_err(number, AuditProblem::WrongGenesis));
             }
             Some(previous) if entry.prev != *previous => {
-                return Err(audit_err(
-                    number - 1,
-                    AuditProblem::HashMismatch { next_entry: number },
-                ));
+                // Entry n-1 verified against its own predecessor. If entry n+1 still
+                // links to entry n, entry n is unchanged and n-1 was edited; if it does
+                // not, entry n itself (its link) was edited (FR-14 AC3).
+                let next_links_here = rest[newline + 1..]
+                    .split(|b| *b == b'\n')
+                    .next()
+                    .and_then(|next| serde_json::from_slice::<AuditEntry>(next).ok())
+                    .map(|next| next.prev == sha256(line));
+                return Err(match next_links_here {
+                    Some(false) => audit_err(number, AuditProblem::LinkChanged),
+                    _ => audit_err(
+                        number - 1,
+                        AuditProblem::HashMismatch { next_entry: number },
+                    ),
+                });
             }
             _ => {}
         }
@@ -422,6 +464,20 @@ impl AuditLog {
             seq: self.entries.len() as u64,
             sha256: self.hashes.last().copied().unwrap_or(GENESIS_PREV),
         }
+    }
+
+    /// The newest entry that belongs to `operation` (its number and SHA-256): what an
+    /// operation's final journal entry records, so later entries that belong to no
+    /// operation never change it.
+    pub fn operation_head(&self, operation: OperationId) -> Option<AuditHead> {
+        let index = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.operation == Some(operation))?;
+        Some(AuditHead {
+            seq: self.entries[index].seq,
+            sha256: self.hashes[index],
+        })
     }
 
     /// True when this log's entries are the first entries of `other` (same entries and
@@ -501,6 +557,97 @@ impl CaDrive {
             path: self.keystone().child(AUDIT_LOG_FILE),
             source,
         })
+    }
+
+    /// Reads this drive's audit log without failing: a verified log, a missing file, or
+    /// bytes that do not verify (with the reason). Comparison and repair use it so one
+    /// drive's log never stops the whole drive set from being examined (review findings
+    /// 7 and 14).
+    pub(crate) fn read_audit_log(&self) -> LogRead {
+        match self
+            .keystone()
+            .read_if_exists(AUDIT_LOG_FILE, MAX_AUDIT_LOG_BYTES)
+        {
+            Ok(None) => LogRead::Missing,
+            Ok(Some(bytes)) => match parse_audit_log(&bytes) {
+                Ok(log) => LogRead::Valid(log),
+                Err(source) => LogRead::Unverified {
+                    problem: StoreError::Parse {
+                        path: self.keystone().child(AUDIT_LOG_FILE),
+                        source,
+                    }
+                    .to_string(),
+                    bytes,
+                },
+            },
+            Err(error) => LogRead::Unreadable(error.to_string()),
+        }
+    }
+}
+
+/// A drive's audit log read without failing ([`CaDrive::read_audit_log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LogRead {
+    /// The log verifies.
+    Valid(AuditLog),
+    /// There is no `audit.log` (on FAT drives a power cut during the atomic replace can
+    /// leave none).
+    Missing,
+    /// The bytes do not verify.
+    Unverified {
+        /// What is wrong, naming the first bad entry.
+        problem: String,
+        /// The bytes.
+        bytes: Vec<u8>,
+    },
+    /// The file cannot be read at all (not a regular file, too large, I/O error).
+    Unreadable(String),
+}
+
+impl LogRead {
+    /// The verified log, if it verifies.
+    pub(crate) fn valid(&self) -> Option<&AuditLog> {
+        match self {
+            LogRead::Valid(log) => Some(log),
+            _ => None,
+        }
+    }
+
+    /// The bytes on the drive (a missing file counts as empty).
+    pub(crate) fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            LogRead::Valid(log) => Some(log.as_bytes()),
+            LogRead::Missing => Some(&[]),
+            LogRead::Unverified { bytes, .. } => Some(bytes),
+            LogRead::Unreadable(_) => None,
+        }
+    }
+
+    /// For a missing or partly written log only: the complete entries it holds, when its
+    /// bytes are an exact byte prefix of `reference` (a verified log the other drives
+    /// agree on). Such a drive is behind and can be repaired from `reference`: an
+    /// interrupted write, not a changed history. Anything else is `None` (damage).
+    pub(crate) fn interrupted_prefix_of(&self, reference: &AuditLog) -> Option<AuditLog> {
+        let bytes = match self {
+            LogRead::Missing => &[][..],
+            LogRead::Unverified { bytes, .. } => bytes.as_slice(),
+            LogRead::Valid(_) | LogRead::Unreadable(_) => return None,
+        };
+        if !reference.as_bytes().starts_with(bytes) {
+            return None;
+        }
+        let complete = bytes.iter().filter(|b| **b == b'\n').count();
+        parse_audit_log(reference.prefix_bytes(complete)).ok()
+    }
+
+    /// One sentence for the operator when the log does not verify.
+    pub(crate) fn problem(&self) -> Option<String> {
+        match self {
+            LogRead::Valid(_) => None,
+            LogRead::Missing => Some(format!("{AUDIT_LOG_FILE} is missing")),
+            LogRead::Unverified { problem, .. } => Some(problem.clone()),
+            LogRead::Unreadable(reason) => Some(reason.clone()),
+        }
     }
 }
 

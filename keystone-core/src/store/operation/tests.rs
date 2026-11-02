@@ -140,6 +140,52 @@ fn fr16_cancel_before_a_persistent_change_keeps_the_serial_reserved() {
 }
 
 #[test]
+fn regression_cancel_on_a_resumed_operation_removes_every_staged_file() {
+    // Covers: FR-16 AC2, FR-22 AC7
+    // Regression (review finding 9): a resumed handle knows no staged outputs until
+    // staging is sealed, so cancel deleted nothing and the staged key stayed behind.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateMaster,
+            "CN=KEYSTONE TEST",
+            &[serial(1)],
+            ts(5),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.stage(key_path(1), encrypted_key_pem(serial(1)).as_bytes())
+        .expect("stage");
+    // A second file reached only the primary before an interruption.
+    crate::store::fault::fail_after(1);
+    assert!(
+        op.stage(
+            OutputPath::new(OutputDir::Certs, "partial.crt").expect("path"),
+            cert_pem(serial(1)).as_bytes(),
+        )
+        .is_err()
+    );
+    crate::store::fault::disarm();
+    drop(op);
+    let set = open_all(&drives);
+    let op = set.resume_operation(id).expect("resume");
+    assert!(op.outputs().is_empty(), "a resumed handle lists no outputs");
+    op.cancel(ts(6)).expect("cancel");
+    for root in drives.ca_drives() {
+        assert_eq!(journal_of(root, id).state(), OperationState::Cancelled);
+        let staging = root.join("keystone/staging").join(id.stem());
+        assert!(
+            !staging.exists(),
+            "{} still holds {:?}",
+            staging.display(),
+            all_files(&staging)
+        );
+    }
+    assert!(set.ensure_in_sync().is_ok());
+}
+
+#[test]
 fn fr16_no_cancel_after_a_signature() {
     // Covers: FR-16 AC1, FR-22 AC3
     let drives = TestDrives::new(2);
@@ -368,21 +414,93 @@ fn fr22_ac2_export_needs_the_completed_entry_and_verified_outputs_on_two_drives(
     let export = ExportDrive::open(healthy.export_drive()).expect("export");
     let files: Vec<(OutputPath, String)> = outputs
         .iter()
-        .filter(|o| o.path.dir() != OutputDir::Record)
+        .filter(|o| o.path.dir() == OutputDir::Certs)
         .map(|o| (o.path.clone(), o.path.name().to_string()))
         .collect();
-    let written = set.export_outputs(id, &export, &files).expect("export");
-    assert_eq!(written.len(), 2);
+    let written = set
+        .export_outputs(id, &export, &files, ts(11))
+        .expect("export");
+    assert_eq!(written.len(), 1);
+    let exported = healthy
+        .export_drive()
+        .join("keystone-export")
+        .join(files[0].1.clone());
+    assert!(exported.exists());
+    // A different file of the same name on the export drive is never overwritten.
+    fs::write(&exported, b"KEYSTONE TEST different").expect("write");
     assert!(
-        healthy
+        matches!(
+            set.export_outputs(id, &export, &files, ts(12)),
+            Err(StoreError::AlreadyExists { .. })
+        ),
+        "never overwritten"
+    );
+    assert_eq!(
+        fs::read(&exported).expect("read"),
+        b"KEYSTONE TEST different"
+    );
+}
+
+#[test]
+fn regression_export_never_includes_the_master_key_and_is_always_audited() {
+    // Covers: FR-09 AC1, FR-22 AC2, FR-14 AC1, SEC-04
+    // Regression (review finding 15): the store exported the master's encrypted key on
+    // request and wrote no audit entry for an export.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let id = issue_master(&set, 1, ts(10));
+    let export = ExportDrive::open(drives.export_drive()).expect("export");
+    let (outputs, _) = set.export_ready(id).expect("ready");
+    let key = outputs
+        .iter()
+        .find(|o| o.path.dir() == OutputDir::Keys)
+        .expect("master key output")
+        .path
+        .clone();
+    let error = set
+        .export_outputs(id, &export, &[(key.clone(), "master.key".into())], ts(11))
+        .expect_err("the master key is never exported");
+    assert!(error.to_string().contains("master"), "{error}");
+    assert!(
+        !drives
             .export_drive()
-            .join("keystone-export")
-            .join(files[0].1.clone())
+            .join("keystone-export/master.key")
             .exists()
     );
-    assert!(
-        set.export_outputs(id, &export, &files).is_err(),
-        "never overwritten"
+    let before = set.audit_log().expect("log").len();
+    let cert = outputs
+        .iter()
+        .find(|o| o.path.dir() == OutputDir::Certs)
+        .expect("certificate")
+        .path
+        .clone();
+    let files = [(cert, "master.crt".to_string())];
+    set.export_outputs(id, &export, &files, ts(12))
+        .expect("export");
+    // Retried with the same content: kept, not rewritten, and audited again.
+    set.export_outputs(id, &export, &files, ts(13))
+        .expect("retry");
+    let log = set.audit_log().expect("log");
+    let exports: Vec<_> = log.entries()[before..]
+        .iter()
+        .filter(|e| e.action == crate::store::AuditAction::Export)
+        .collect();
+    assert_eq!(exports.len(), 2, "{:?}", log.entries());
+    for entry in exports {
+        assert_eq!(entry.operation, None);
+        let note = entry
+            .details
+            .as_ref()
+            .and_then(|d| d.note.as_deref())
+            .expect("note");
+        assert!(
+            note.contains("master.crt") && note.contains(&id.to_string()),
+            "{note}"
+        );
+    }
+    assert_eq!(
+        set.compare().expect("compare"),
+        crate::store::DriveComparison::InSync
     );
 }
 
@@ -477,7 +595,12 @@ fn operation_steps_in_the_wrong_order_are_refused() {
     let export = ExportDrive::open(done.export_drive()).expect("export");
     let not_an_output = OutputPath::new(OutputDir::Crls, "none.crl").expect("path");
     assert!(matches!(
-        done_set.export_outputs(finished, &export, &[(not_an_output, "x.crl".to_string())]),
+        done_set.export_outputs(
+            finished,
+            &export,
+            &[(not_an_output, "x.crl".to_string())],
+            ts(2)
+        ),
         Err(StoreError::Unsafe(_))
     ));
 }

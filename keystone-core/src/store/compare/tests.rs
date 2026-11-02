@@ -284,6 +284,74 @@ fn damaged_outputs_block_signing() {
 }
 
 #[test]
+fn regression_begin_operation_refuses_whenever_compare_reports_damage() {
+    // Covers: SEC-22, FR-19 AC1, FR-22 AC2, FR-14 AC3
+    // Regression (review finding 4): with a certificate file deleted from the backup,
+    // compare() said Damaged but begin_operation still started a new operation.
+    let begin = |drives: &TestDrives| {
+        open_all(drives)
+            .begin_operation(
+                OperationKind::CreateSubIntermediate,
+                "CN=KEYSTONE TEST sub",
+                &[serial(3)],
+                ts(20),
+            )
+            .map(|op| op.id())
+    };
+    // A completed output missing on the backup.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    let op = issue_master(&set, 1, ts(10));
+    let output = set.drives()[1]
+        .operation_journal(op)
+        .expect("read")
+        .expect("journal")
+        .completed_outputs()
+        .expect("outputs")[0]
+        .clone();
+    let path = |drives: &TestDrives, drive: usize| {
+        drives
+            .ca_drive(drive)
+            .join("keystone")
+            .join(output.path.to_string())
+    };
+    fs::remove_file(path(&drives, 1)).expect("remove");
+    assert!(
+        !open_all(&drives)
+            .compare()
+            .expect("compare")
+            .signing_allowed()
+    );
+    let error = begin(&drives).expect_err("refused while damaged");
+    assert!(error.to_string().contains("missing"), "{error}");
+    // A changed output on the primary.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    issue_master(&set, 1, ts(10));
+    fs::write(path(&drives, 0), b"changed").expect("damage");
+    let error = begin(&drives).expect_err("refused while damaged");
+    assert!(error.to_string().contains("was changed"), "{error}");
+    // The same last audit entry changed on both drives: the logs agree and the chain
+    // still verifies, but the journal's recorded audit head no longer matches.
+    let drives = TestDrives::new(2);
+    let set = new_ca(&drives);
+    issue_master(&set, 1, ts(10));
+    for drive in 0..2 {
+        let log = drives.ca_drive(drive).join("keystone/audit.log");
+        let text = fs::read_to_string(&log).expect("read");
+        fs::write(&log, text.replace("Master", "Mister")).expect("write");
+    }
+    assert!(
+        !open_all(&drives)
+            .compare()
+            .expect("compare")
+            .signing_allowed()
+    );
+    let error = begin(&drives).expect_err("refused while damaged");
+    assert!(error.to_string().contains("audit entry 1"), "{error}");
+}
+
+#[test]
 fn fr12_ac3_a_behind_drive_holding_a_different_file_is_never_overwritten() {
     // Covers: FR-12 AC3, SEC-20
     let drives = behind_setup();
@@ -360,4 +428,337 @@ fn fr12_ac3_an_unfinished_operation_on_the_source_is_not_copied() {
         }
         other => panic!("expected a blocking problem, got {other:?}"),
     }
+}
+
+fn audit_only(action: AuditAction) -> AuditDraft {
+    AuditDraft::new(action, "", AuditResult::Success)
+}
+
+/// Repairs every behind drive (the plans shown by `compare`) and checks the result.
+fn repair_all_and_check(drives: &TestDrives, context: &str) {
+    let set = open_all(drives);
+    let shown = plans(set.compare().unwrap_or_else(|e| panic!("{context}: {e}")));
+    set.repair(&shown, ts(90))
+        .unwrap_or_else(|e| panic!("{context}: {e}"));
+    let set = open_all(drives);
+    assert_eq!(
+        set.compare().expect("compare"),
+        DriveComparison::InSync,
+        "{context}"
+    );
+    assert_finished_operations_are_whole(drives);
+}
+
+#[test]
+fn regression_an_audit_only_entry_while_an_operation_is_pending_keeps_drives_repairable() {
+    // Covers: FR-12 AC3, FR-22 AC4, FR-17 AC3, SEC-22
+    // Regression (review finding 6): a clock correction (or binary-hash record, drive
+    // repair, export) appended while an operation was pending made the completed entry
+    // record the log head instead of the operation's own last entry, and every behind
+    // drive became unrepairable ("operation 1 is not finished on primary").
+    let drives = TestDrives::new(3);
+    new_ca(&drives);
+    let pair = open_some(&drives, &[0, 1]);
+    let record = cert(serial(1), CaLevel::Master, serial(1));
+    let mut op = pair
+        .begin_operation(OperationKind::CreateMaster, "m", &[serial(1)], ts(5))
+        .expect("begin");
+    let id = op.id();
+    op.record_signed(
+        crate::store::journal::SignedObject::Certificate {
+            record: Box::new(record),
+            pem: crate::store::testutil::cert_pem(serial(1)),
+        },
+        ts(5),
+    )
+    .expect("signed");
+    op.stage(
+        crate::store::OutputPath::new(crate::store::OutputDir::Certs, "m.crt").expect("path"),
+        crate::store::testutil::cert_pem(serial(1)).as_bytes(),
+    )
+    .expect("stage");
+    op.seal_staging(ts(5)).expect("seal");
+    op.commit().expect("commit");
+    op.append_audit(&[audit_only(AuditAction::CreateMaster)], ts(5))
+        .expect("audit");
+    drop(op); // interrupted before its completed entry
+    for action in [
+        AuditAction::ClockCorrection,
+        AuditAction::BinaryHashRecorded,
+    ] {
+        let mut draft = audit_only(action);
+        if action == AuditAction::ClockCorrection {
+            draft.details = Some(AuditDetails {
+                clock_correction: Some(ClockCorrectionDetails {
+                    previous_newest: ts(5),
+                    confirmed: ts(6),
+                }),
+                ..AuditDetails::default()
+            });
+        }
+        open_some(&drives, &[0, 1])
+            .append_audit(&[draft], ts(6))
+            .expect("audit-only append while pending");
+    }
+    let pair = open_some(&drives, &[0, 1]);
+    pair.finish_operation(id, 0, ts(7)).expect("finish");
+    let journal = pair.drives()[0]
+        .operation_journal(id)
+        .expect("read")
+        .expect("journal");
+    assert_eq!(journal.state(), OperationState::Completed);
+    // The completed entry records the operation's own last entry (seq 1), not the head.
+    assert_eq!(journal.audit_head().expect("head").seq, 1);
+    // Drive 2 missed everything: it is behind and repairable.
+    repair_all_and_check(&drives, "audit-only entries after the operation's own");
+}
+
+#[test]
+fn regression_audit_only_entries_between_an_operations_entries_keep_drives_repairable() {
+    // Covers: FR-12 AC3, FR-22 AC4, FR-16 AC2
+    // An interrupted cancel wrote its audit entry; a clock correction followed while the
+    // operation was pending; then it was abandoned. Its own entries are not adjacent, and
+    // a drive that missed all of it must still be repairable.
+    let drives = TestDrives::new(3);
+    new_ca(&drives);
+    let pair = open_some(&drives, &[0, 1]);
+    let op = pair
+        .begin_operation(
+            OperationKind::Revoke,
+            "CN=KEYSTONE TEST",
+            &[serial(4)],
+            ts(5),
+        )
+        .expect("begin");
+    // cancel: audit primary, audit backup, cancelled primary -> stop before that.
+    fault::fail_after(2);
+    assert!(op.cancel(ts(6)).is_err());
+    fault::disarm();
+    open_some(&drives, &[0, 1])
+        .append_audit(&[audit_only(AuditAction::Export)], ts(7))
+        .expect("audit-only append while pending");
+    let pair = open_some(&drives, &[0, 1]);
+    pair.abandon_operation(OperationId(1), ts(8))
+        .expect("abandon");
+    let log = pair.audit_log().expect("log");
+    let own: Vec<u64> = log
+        .entries()
+        .iter()
+        .filter(|e| e.operation == Some(OperationId(1)))
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(own, vec![1, 3], "the operation's entries are not adjacent");
+    repair_all_and_check(&drives, "entries of no operation between its own");
+}
+
+/// A CA on `count` drives with two completed operations and an export entry.
+fn two_operations(count: usize) -> TestDrives {
+    let drives = TestDrives::new(count);
+    let set = new_ca(&drives);
+    issue_master(&set, 1, ts(10));
+    issue(
+        &set,
+        OperationKind::SetupYubikey,
+        cert(serial(2), CaLevel::MainIntermediate, serial(1)),
+        ts(20),
+    );
+    set.append_audit(&[audit_only(AuditAction::Export)], ts(21))
+        .expect("export entry");
+    drives
+}
+
+fn audit_log_path(drives: &TestDrives, drive: usize) -> std::path::PathBuf {
+    drives.ca_drive(drive).join("keystone/audit.log")
+}
+
+#[test]
+fn regression_a_malformed_journal_file_on_one_drive_is_reported_as_damage() {
+    // Covers: FR-19 AC1, FR-12 AC3, SEC-08
+    // Regression (review finding 7): one malformed journal file made compare() and
+    // recovery_report() fail for the whole drive set, so the start screen showed nothing.
+    let drives = two_operations(2);
+    fs::write(
+        drives
+            .ca_drive(1)
+            .join("keystone/journal/op-000001/009-junk.json"),
+        b"{}",
+    )
+    .expect("write");
+    let set = open_all(&drives);
+    match set.compare().expect("compare reports, never fails") {
+        DriveComparison::Damaged { problems } => {
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains(&set.drives()[1].label()) && p.contains("009-junk.json")),
+                "{problems:?}"
+            );
+        }
+        other => panic!("expected damage, got {other:?}"),
+    }
+    let report = set.recovery_report().expect("report, never fails");
+    assert!(report.pending.is_empty());
+    assert_eq!(report.unreadable.len(), 1, "{report:?}");
+    assert!(report.unreadable[0].contains("009-junk.json"));
+    assert!(!report.is_clean());
+    assert!(matches!(
+        set.begin_operation(OperationKind::Revoke, "x", &[], ts(30)),
+        Err(StoreError::Parse { .. })
+    ));
+}
+
+#[test]
+fn regression_a_pending_operation_with_an_unreadable_journal_drive_is_blocked_not_lost() {
+    // Covers: FR-22 AC4, FR-22 AC8, SEC-08
+    let drives = two_operations(2);
+    let set = open_all(&drives);
+    drop(
+        set.begin_operation(OperationKind::Revoke, "CN=KEYSTONE TEST", &[], ts(30))
+            .expect("begin"),
+    );
+    fs::write(
+        drives
+            .ca_drive(1)
+            .join("keystone/journal/op-000003/002-bad.json"),
+        b"not json",
+    )
+    .expect("write");
+    let set = open_all(&drives);
+    let report = set.recovery_report().expect("report");
+    assert_eq!(report.unreadable.len(), 1);
+    assert_eq!(report.pending.len(), 1, "seen on the readable drive");
+    let pending = &report.pending[0];
+    assert!(pending.actions.is_empty(), "{:?}", pending.actions);
+    assert!(
+        pending
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("cannot be read")),
+        "{pending:?}"
+    );
+    assert!(set.abandon_operation(OperationId(3), ts(31)).is_err());
+}
+
+#[test]
+fn regression_a_missing_audit_log_on_one_drive_is_repaired_from_the_others() {
+    // Covers: FR-12 AC3, FR-19 AC1, FR-14 AC3, SEC-11
+    // Regression (review findings 7 and 14): on FAT the rename that replaces audit.log is
+    // not crash-atomic, so a power cut can leave a drive without audit.log. compare()
+    // failed for the whole set; the drive is now behind and repaired from the others.
+    for (count, missing) in [(2, 1), (2, 0), (3, 2)] {
+        let drives = two_operations(count);
+        let expected = fs::read(audit_log_path(&drives, (missing + 1) % count)).expect("read");
+        fs::remove_file(audit_log_path(&drives, missing)).expect("remove");
+        let set = open_all(&drives);
+        let shown = plans(set.compare().expect("compare"));
+        assert_eq!(shown.len(), 1);
+        // Backups are ordered by their random drive ids: compare by mount point.
+        assert_eq!(
+            set.drives()[shown[0].target].root(),
+            drives.ca_drive(missing)
+        );
+        set.repair(&shown, ts(90)).expect("repair");
+        let set = open_all(&drives);
+        assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+        let repaired = fs::read(audit_log_path(&drives, missing)).expect("read");
+        assert!(
+            repaired.starts_with(&expected),
+            "{count} drives, drive {missing}"
+        );
+        assert_finished_operations_are_whole(&drives);
+    }
+}
+
+#[test]
+fn regression_a_partly_written_audit_log_is_repaired_and_a_changed_one_is_not() {
+    // Covers: FR-12 AC3, FR-14 AC3, SEC-09
+    let drives = two_operations(2);
+    let full = fs::read(audit_log_path(&drives, 1)).expect("read");
+    // Cut in the middle of the second entry: an exact byte prefix of the other drive's.
+    let second_line_end = full
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .nth(1)
+        .expect("two lines")
+        .0;
+    fs::write(audit_log_path(&drives, 1), &full[..second_line_end - 7]).expect("cut");
+    let set = open_all(&drives);
+    let shown = plans(set.compare().expect("compare"));
+    assert_eq!(set.drives()[shown[0].target].root(), drives.ca_drive(1));
+    set.repair(&shown, ts(90)).expect("repair");
+    assert_eq!(
+        open_all(&drives).compare().expect("compare"),
+        DriveComparison::InSync
+    );
+    // A cut copy whose bytes differ from the other drive's is damage, never repaired.
+    let drives = two_operations(2);
+    let mut changed = fs::read(audit_log_path(&drives, 1)).expect("read");
+    changed.truncate(second_line_end - 7);
+    let at = changed.len() - 3;
+    changed[at] ^= 0x01;
+    fs::write(audit_log_path(&drives, 1), &changed).expect("write");
+    assert!(matches!(
+        open_all(&drives).compare().expect("compare"),
+        DriveComparison::Damaged { .. }
+    ));
+    // A complete, valid but shorter log that the drive's own journals contradict stays
+    // damage (it cannot come from an interrupted write).
+    let drives = two_operations(2);
+    fs::write(audit_log_path(&drives, 1), b"").expect("empty");
+    assert!(matches!(
+        open_all(&drives).compare().expect("compare"),
+        DriveComparison::Damaged { .. }
+    ));
+}
+
+#[test]
+fn regression_a_missing_audit_log_during_an_operation_is_restored_by_recovery() {
+    // Covers: FR-22 AC4, FR-12 AC3, FR-14 AC1
+    // The realistic FAT case: the backup's audit.log vanished while the operation's audit
+    // entry was being written; the operation is pending.
+    let drives = two_operations(2);
+    let set = open_all(&drives);
+    let record = cert(serial(3), CaLevel::SubIntermediate, serial(2));
+    let mut op = set
+        .begin_operation(
+            OperationKind::CreateSubIntermediate,
+            "CN=KEYSTONE TEST sub",
+            &[serial(3)],
+            ts(30),
+        )
+        .expect("begin");
+    let id = op.id();
+    op.record_signed(
+        crate::store::journal::SignedObject::Certificate {
+            record: Box::new(record),
+            pem: crate::store::testutil::cert_pem(serial(3)),
+        },
+        ts(30),
+    )
+    .expect("signed");
+    op.stage(
+        crate::store::OutputPath::new(crate::store::OutputDir::Certs, "sub.crt").expect("path"),
+        crate::store::testutil::cert_pem(serial(3)).as_bytes(),
+    )
+    .expect("stage");
+    op.seal_staging(ts(30)).expect("seal");
+    op.commit().expect("commit");
+    op.append_audit(&[audit_only(AuditAction::CreateSubIntermediate)], ts(30))
+        .expect("audit");
+    drop(op);
+    fs::remove_file(audit_log_path(&drives, 1)).expect("lost by the power cut");
+    let set = open_all(&drives);
+    assert!(!set.compare().expect("compare").signing_allowed());
+    let report = set.recovery_report().expect("report");
+    let action = report.pending[0].actions.first().cloned();
+    let Some(crate::store::RecoveryAction::FinishFrom { drive_index, .. }) = action else {
+        panic!("expected finish, got {report:?}");
+    };
+    set.finish_operation(id, drive_index, ts(31))
+        .expect("finish restores the backup's log");
+    let set = open_all(&drives);
+    assert_eq!(set.compare().expect("compare"), DriveComparison::InSync);
+    assert!(set.recovery_report().expect("report").is_clean());
+    assert_finished_operations_are_whole(&drives);
 }

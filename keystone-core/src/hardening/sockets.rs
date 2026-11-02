@@ -1,11 +1,15 @@
-//! SEC-03: refuse to start with an inherited socket that is not AF_UNIX.
+//! SEC-03: refuse to start with an inherited socket that is not AF_UNIX, or with an
+//! inherited io_uring instance.
 //!
 //! A seccomp filter only stops *new* sockets. A process started by something else could
 //! inherit an open network socket. At startup Keystone lists its open file descriptors in
 //! `/proc/self/fd` (each socket reads as the link `socket:[<inode>]`) and looks the inodes
 //! up in `/proc/self/net/unix`, the kernel's table of AF_UNIX sockets. Any socket that is
-//! not in that table (AF_INET, AF_INET6, AF_PACKET, AF_NETLINK ...) stops the start. Only
-//! files are read; no socket API is used. The `/proc` root is a parameter so tests use a
+//! not in that table (AF_INET, AF_INET6, AF_PACKET, AF_NETLINK ...) stops the start. An
+//! inherited io_uring instance (the link `anon_inode:[io_uring]`) stops it too: with
+//! IORING_OP_SOCKET it can create an AF_INET socket without ever calling `socket()`, so
+//! the seccomp filter (which also blocks `io_uring_setup`, `io_uring_enter` and
+//! `io_uring_register`) is not the only guard. Only files are read; no socket API is used. The `/proc` root is a parameter so tests use a
 //! fake tree. Decision: an unreadable `/proc` also stops the start (fail closed).
 #![forbid(unsafe_code)]
 
@@ -47,6 +51,9 @@ pub fn parse_unix_table(text: &str) -> Result<BTreeSet<u64>, String> {
     Ok(inodes)
 }
 
+/// The link target of an io_uring instance in `/proc/<pid>/fd`.
+const IO_URING_LINK: &str = "anon_inode:[io_uring]";
+
 /// `socket:[123]` -> 123.
 fn socket_inode(target: &str) -> Option<u64> {
     target
@@ -56,10 +63,10 @@ fn socket_inode(target: &str) -> Option<u64> {
         .ok()
 }
 
-/// File descriptors of this process (under `proc_root`) that are sockets but not AF_UNIX.
-pub fn non_unix_sockets(proc_root: &Path) -> Result<Vec<u32>, HardeningError> {
+/// Every open file descriptor of this process (under `proc_root`) with its link target.
+fn descriptors(proc_root: &Path) -> Result<Vec<(u32, String)>, HardeningError> {
     let fd_dir = proc_root.join("self/fd");
-    let mut sockets = Vec::new();
+    let mut out = Vec::new();
     for entry in fs::read_dir(&fd_dir).map_err(|e| unreadable(&fd_dir, e))? {
         let entry = entry.map_err(|e| unreadable(&fd_dir, e))?;
         let Ok(fd) = entry.file_name().to_string_lossy().parse::<u32>() else {
@@ -69,10 +76,27 @@ pub fn non_unix_sockets(proc_root: &Path) -> Result<Vec<u32>, HardeningError> {
         let Ok(target) = fs::read_link(entry.path()) else {
             continue;
         };
-        if let Some(inode) = socket_inode(&target.to_string_lossy()) {
-            sockets.push((fd, inode));
-        }
+        out.push((fd, target.to_string_lossy().into_owned()));
     }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// File descriptors of this process (under `proc_root`) that are io_uring instances.
+pub fn io_uring_instances(proc_root: &Path) -> Result<Vec<u32>, HardeningError> {
+    Ok(descriptors(proc_root)?
+        .into_iter()
+        .filter(|(_, target)| target == IO_URING_LINK)
+        .map(|(fd, _)| fd)
+        .collect())
+}
+
+/// File descriptors of this process (under `proc_root`) that are sockets but not AF_UNIX.
+pub fn non_unix_sockets(proc_root: &Path) -> Result<Vec<u32>, HardeningError> {
+    let sockets: Vec<(u32, u64)> = descriptors(proc_root)?
+        .into_iter()
+        .filter_map(|(fd, target)| socket_inode(&target).map(|inode| (fd, inode)))
+        .collect();
     if sockets.is_empty() {
         return Ok(Vec::new());
     }
@@ -93,14 +117,18 @@ pub fn non_unix_sockets(proc_root: &Path) -> Result<Vec<u32>, HardeningError> {
     Ok(refused)
 }
 
-/// SEC-03: an error naming every inherited non-AF_UNIX socket, or `Ok`.
+/// SEC-03: an error naming every inherited non-AF_UNIX socket, or every inherited
+/// io_uring instance, or `Ok`.
 pub fn check_no_inherited_network_sockets(proc_root: &Path) -> Result<(), HardeningError> {
     let descriptors = non_unix_sockets(proc_root)?;
-    if descriptors.is_empty() {
-        Ok(())
-    } else {
-        Err(HardeningError::InheritedSocket { descriptors })
+    if !descriptors.is_empty() {
+        return Err(HardeningError::InheritedSocket { descriptors });
     }
+    let descriptors = io_uring_instances(proc_root)?;
+    if !descriptors.is_empty() {
+        return Err(HardeningError::InheritedIoUring { descriptors });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -164,6 +192,33 @@ mod tests {
     }
 
     #[test]
+    fn regression_an_inherited_io_uring_instance_is_refused() {
+        // Covers: SEC-03
+        // Regression (review finding 12): an inherited io_uring descriptor could create
+        // AF_INET sockets with IORING_OP_SOCKET without calling socket().
+        let proc_root = fake_proc(
+            &[
+                ("0", "/dev/null"),
+                ("3", "socket:[1001]"),
+                ("6", "anon_inode:[io_uring]"),
+                ("8", "anon_inode:[eventfd]"),
+                ("11", "anon_inode:[io_uring]"),
+            ],
+            Some(TABLE),
+        );
+        assert_eq!(
+            io_uring_instances(proc_root.path()).expect("read"),
+            vec![6, 11]
+        );
+        let error = check_no_inherited_network_sockets(proc_root.path()).expect_err("refused");
+        assert!(
+            matches!(error, HardeningError::InheritedIoUring { ref descriptors } if descriptors == &[6, 11]),
+            "{error}"
+        );
+        assert!(error.to_string().contains("io_uring"), "{error}");
+    }
+
+    #[test]
     fn sec03_unreadable_proc_fails_closed() {
         // Covers: SEC-03
         let missing_table = fake_proc(&[("3", "socket:[1001]")], None);
@@ -181,6 +236,7 @@ mod tests {
     fn real_proc_is_readable() {
         // The real tables parse (the result depends on how the tests were started).
         assert!(non_unix_sockets(Path::new(PROC_ROOT)).is_ok());
+        assert!(io_uring_instances(Path::new(PROC_ROOT)).is_ok());
         let table = fs::read_to_string("/proc/self/net/unix").expect("unix table");
         assert!(parse_unix_table(&table).is_ok());
     }
