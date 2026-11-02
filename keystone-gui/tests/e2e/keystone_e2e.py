@@ -54,11 +54,9 @@ def make_dirs(*names):
     return paths
 
 
-def prepare(scenario, primary, backup):
+def prepare(scenario, *drives):
     """Prepares a drive state with the e2e_prepare helper (store API only)."""
-    subprocess.run(
-        [os.environ["KEYSTONE_PREPARE"], scenario, primary, backup], check=True
-    )
+    subprocess.run([os.environ["KEYSTONE_PREPARE"], scenario, *drives], check=True)
 
 
 def drive_args(primary, backup, export):

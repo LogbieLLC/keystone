@@ -12,6 +12,9 @@
 //!                 breaks its hash chain (FR-14 AC3)
 //!   diverged      a CA whose backup drive's last audit entry was edited: both chains
 //!                 verify, but the histories differ (FR-12 AC3)
+//! cargo run -p keystone-gui --example e2e_prepare -- behind <primary> <backup> <second>
+//!   behind        a CA on three drives whose second backup missed one audit entry
+//!                 (FR-12 AC3)
 //! ```
 #![forbid(unsafe_code)]
 
@@ -124,17 +127,39 @@ fn edited_audit(primary: &Path, backup: &Path, edit: &str) -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
+/// A CA on three drives; one audit entry is written with only the primary and the
+/// first backup connected, so the second backup is behind (FR-12 AC3).
+fn behind(primary: &Path, backup: &Path, second: &Path) -> Result<(), String> {
+    DriveSet::create(primary, &[backup, second], ts(0)).map_err(|e| e.to_string())?;
+    let two = DriveSet::open(&[primary, backup]).map_err(|e| e.to_string())?;
+    two.append_audit(
+        &[AuditDraft::new(
+            AuditAction::Export,
+            "CN=KEYSTONE TEST missed",
+            AuditResult::Success,
+        )],
+        ts(30),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [scenario, primary, backup] = args.as_slice() else {
-        return ExitCode::from(2);
-    };
-    let (primary, backup) = (Path::new(primary), Path::new(backup));
-    let result = match scenario.as_str() {
-        "pending" => pending(primary, backup),
-        "broken-audit" => edited_audit(primary, backup, "first"),
-        "diverged" => edited_audit(primary, backup, "second"),
-        _ => Err(format!("unknown scenario {scenario}")),
+    let result = match args.as_slice() {
+        [scenario, primary, backup] => {
+            let (primary, backup) = (Path::new(primary), Path::new(backup));
+            match scenario.as_str() {
+                "pending" => pending(primary, backup),
+                "broken-audit" => edited_audit(primary, backup, "first"),
+                "diverged" => edited_audit(primary, backup, "second"),
+                _ => Err(format!("unknown scenario {scenario}")),
+            }
+        }
+        [scenario, primary, backup, second] if scenario == "behind" => {
+            behind(Path::new(primary), Path::new(backup), Path::new(second))
+        }
+        _ => return ExitCode::from(2),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
