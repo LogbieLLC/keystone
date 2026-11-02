@@ -1,0 +1,30 @@
+# Requirements that are not proven by a `Covers:` line in test code, each with the
+# reason (scripts/traceability.py, TESTING.md TEST-01, TEST-10).
+# Categories:
+#   blocked           - needs an outside dependency that does not exist yet; reported as
+#                       BLOCKED, never as passing (TEST-10). A full release is impossible
+#                       while anything is listed here (TEST-08).
+#   release-checklist - proven by the maintainer before every release (TEST-08).
+#   ci-job            - proven by a dedicated CI job rather than a unit/integration test.
+#   not-applicable    - the PRD itself says there is nothing to test.
+
+[blocked]
+"FR-09 AC3" = "Needs StarnetAuth encrypted-key import (POST /api/v1/pki/ca/import with an encrypted PKCS#8 key and passphrase, PRD OQ-1), not shipped yet. BLOCKED test: keystone-core/tests/interop/blocked.rs."
+"FR-13 AC5" = "Revocation is proven with local CRL files and `openssl verify -crl_check_all` in both scenarios (keystone-core/tests/interop/crl_cli.rs), but the AC requires CRLs downloaded from a StarnetAuth test instance (-crl_download); StarnetAuth CRL hosting (PRD OQ-2) has not shipped. BLOCKED test: keystone-core/tests/interop/blocked.rs."
+
+[release-checklist]
+"NFR-09" = "Hardware E2E suite on a real YubiKey 5 (firmware 5.7+) with operator touch, run by the maintainer before every release (TESTING.md TEST-08). Agents may not use a real YubiKey (SECP-02). The real PIV driver and its reviewed patch are not built yet."
+"NFR-10" = "Usability walkthrough of Flows A to E, passphrase confirmation and the recovery screen by the maintainer before every full release (TESTING.md TEST-08)."
+
+[ci-job]
+"FR-10 AC4" = "CI job `rfc5280-lint` runs pkilint on every certificate and CRL produced by the sample generator (scripts/lint-samples.sh)."
+"NFR-01" = "Every CI job runs in a clean ubuntu:26.04 container pinned by digest, using the distribution's GTK4, libadwaita and OpenSSL 3 packages."
+"NFR-06" = "CI job `traceability` (this script) fails when an acceptance criterion has no test and no documented reason."
+"NFR-07" = "CI job `coverage`: cargo llvm-cov --package keystone-core --fail-under-lines 90. Flow, boundary and failure-case E2E tests run in the `test` and `gui-e2e` jobs."
+"SEC-01" = "CI jobs `audit` (cargo audit), `deny` (cargo deny: advisories, licences, banned crates, sources) and `vet` (cargo vet); exact pins with Cargo.lock committed."
+"SEC-02" = "CI job `reproducible-build` builds the production binary twice in separate target directories and compares SHA-256. The independent second machine build is a release-checklist item (GOVERNANCE.md GOV-16)."
+"SEC-18" = "CI jobs `boundaries` (scripts/check-boundaries.sh: unsafe only in crypto/ffi.rs, every OpenSSL call in crypto/, #![forbid(unsafe_code)] elsewhere), `clippy` (-D warnings) and `codeql`; operator review of the crypto module before each release."
+
+[not-applicable]
+"NFR-02" = "Availability is not applicable: the tool only runs when the operator opens it (PRD NFR-02)."
+"NFR-05" = "English only; there is no localisation code to test (PRD NFR-05)."

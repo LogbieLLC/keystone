@@ -1,0 +1,98 @@
+# cargo-deny policy (PRD SEC-01, SEC-03; SECURITY.md SECP-03, SECP-07).
+# Changing this file is ask-first for agents (AGENTS.md, AGENT-02).
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+# Check every feature combination that can be built (production and simulator
+# are mutually exclusive at compile time, but both must pass the policy).
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# HR-1, SEC-03, SECP-07: no networking crates may enter the dependency graph.
+deny = [
+    { crate = "reqwest", reason = "HR-1: no networking code" },
+    { crate = "hyper", reason = "HR-1: no networking code" },
+    { crate = "hyper-util", reason = "HR-1: no networking code" },
+    { crate = "h2", reason = "HR-1: no networking code" },
+    { crate = "h3", reason = "HR-1: no networking code" },
+    { crate = "quinn", reason = "HR-1: no networking code" },
+    { crate = "ureq", reason = "HR-1: no networking code" },
+    { crate = "curl", reason = "HR-1: no networking code" },
+    { crate = "curl-sys", reason = "HR-1: no networking code" },
+    { crate = "isahc", reason = "HR-1: no networking code" },
+    { crate = "surf", reason = "HR-1: no networking code" },
+    { crate = "attohttpc", reason = "HR-1: no networking code" },
+    { crate = "socket2", reason = "HR-1: no networking code" },
+    { crate = "mio", reason = "HR-1: no networking code" },
+    { crate = "async-std", reason = "HR-1: no networking code" },
+    { crate = "smol", reason = "HR-1: no networking code" },
+    { crate = "async-net", reason = "HR-1: no networking code" },
+    { crate = "tungstenite", reason = "HR-1: no networking code" },
+    { crate = "tokio-tungstenite", reason = "HR-1: no networking code" },
+    { crate = "rustls", reason = "HR-1: no networking code" },
+    { crate = "native-tls", reason = "HR-1: no networking code" },
+    { crate = "tokio-native-tls", reason = "HR-1: no networking code" },
+    { crate = "trust-dns-resolver", reason = "HR-1: no networking code" },
+    { crate = "hickory-resolver", reason = "HR-1: no networking code" },
+    { crate = "hickory-proto", reason = "HR-1: no networking code" },
+    { crate = "pnet", reason = "HR-1: no networking code" },
+    { crate = "smoltcp", reason = "HR-1: no networking code" },
+    { crate = "libp2p", reason = "HR-1: no networking code" },
+    { crate = "tonic", reason = "HR-1: no networking code" },
+    { crate = "axum", reason = "HR-1: no networking code" },
+    { crate = "actix-web", reason = "HR-1: no networking code" },
+    { crate = "warp", reason = "HR-1: no networking code" },
+    { crate = "tiny_http", reason = "HR-1: no networking code" },
+    { crate = "zbus", reason = "HR-1: no network-capable IPC client beyond what GTK itself uses" },
+]
+
+# SEC-03: tokio's network features are banned; tokio is not used at all today.
+[[bans.features]]
+crate = "tokio"
+deny = ["net", "full"]
+
+# rustix: only the approved modules ("Keystone Dependencies.md"); `net` is banned.
+[[bans.features]]
+crate = "rustix"
+deny = ["net"]
+
+# openssl: link Ubuntu's OpenSSL 3; never bundle a private build.
+[[bans.features]]
+crate = "openssl"
+deny = ["vendored"]
+
+[[bans.features]]
+crate = "openssl-sys"
+deny = ["vendored"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
