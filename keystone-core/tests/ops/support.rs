@@ -500,3 +500,34 @@ pub fn verify_with_crls(
 ) -> Result<(), keystone_core::crypto::CryptoError> {
     verify_chain(leaf, untrusted, &[master], crls, &crl_check(at))
 }
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
+/// A copy of the CA on new temporary drives (same CA, same drive identities), so a test
+/// can interrupt the same operation many times from the same starting point.
+pub fn clone_ca(test: &TestCa) -> TestCa {
+    let drives = TestDrives::new(test.drives.ca_drives().len());
+    for (from, to) in test.drives.ca_drives().iter().zip(drives.ca_drives()) {
+        copy_tree(&from.join("keystone"), &to.join("keystone"));
+    }
+    let roots: Vec<&Path> = drives.ca_drives().iter().map(PathBuf::as_path).collect();
+    let ca = Ca::open(&roots).expect("open the copy");
+    TestCa {
+        drives,
+        ca,
+        master_words: test.master_words.clone(),
+        now: test.now,
+        master: test.master.clone(),
+    }
+}

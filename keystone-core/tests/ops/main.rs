@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![cfg(not(feature = "production"))]
 
+mod fault_injection;
 mod flow_a;
 mod flow_b;
 mod flow_c;

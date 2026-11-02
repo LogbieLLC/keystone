@@ -195,7 +195,9 @@ impl Ca {
         let mut items = Vec::new();
         for pending in report.pending {
             let column = match token.as_deref_mut() {
-                Some(token) => Some(self.token_column(token, &pending)?),
+                // A YubiKey that is absent or cannot be read gives no column; the
+                // recovery screen must still open (Flow E runs without the old one).
+                Some(token) => self.token_column(token, &pending).ok(),
                 None => None,
             };
             items.push(self.refine(pending, column)?);

@@ -23,6 +23,20 @@ fn injected(error: OpsError) {
     assert!(matches!(error, OpsError::InjectedFault(_)), "{error}");
 }
 
+#[test]
+fn regression_the_recovery_screen_opens_with_an_absent_yubikey() {
+    // Covers: FR-22 AC8, FR-15 AC1
+    // Regression: recovery_items failed with "no YubiKey found" when the connected
+    // YubiKey handle was removed, which blocked recovery during Flow E.
+    let (mut test, mut token, controller) = ca_with_main("R0", 70_000_000);
+    crash_flow_c(&mut test, &mut token, FaultPoint::BeforeSigning);
+    controller.remove();
+    let items = test.ca.recovery_items(Some(&mut token)).unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].yubikey.is_none());
+    assert_eq!(items[0].actions[0].action, RecoveryAction::Abandon);
+}
+
 /// Flow C stopped at `point`; returns the sub passphrase words.
 fn crash_flow_c(test: &mut TestCa, token: &mut SimulatedYubiKey, point: FaultPoint) -> String {
     let (plan, passphrase, words) = plan_flow_c(test, "R").unwrap();
