@@ -54,3 +54,33 @@ zlint's RFC 5280 rule set reports no findings on the resulting certificate.
   written.
 - Tests in `keystone-core/tests/interop/name_constraints.rs` prove the table above with
   both verifiers.
+
+## Known limitation: names the constraints do not cover (final security review, N3)
+
+RFC 5280 name constraints only limit the name forms they list. Keystone's sub-intermediate
+constrains DNS names, IP addresses, email addresses and URIs, which are the forms named in
+FR-21. Two other forms stay unconstrained:
+
+- **otherName**, for example a Microsoft UPN (`administrator@corp.example`) used for smart
+  card logon or PKINIT;
+- **directoryName**, that is, the leaf's subject DN.
+
+The final security review confirmed this. Under a constrained sub-intermediate, a leaf
+with a UPN SAN and a leaf with a different `dirName` SAN both verify with
+`openssl verify -x509_strict` and with Go.
+
+The profile is **not** changed, for these reasons:
+
+- A directoryName subtree also applies to every leaf's subject DN. Excluding all directory
+  names would therefore reject every leaf.
+- An otherName subtree is not handled the same way by all verifiers. Go may reject a
+  critical name-constraints extension containing forms it does not understand. This is
+  plausible but untested.
+
+**Consequence for relying parties:** a sub-intermediate's name constraints limit DNS, IP,
+email and URI names only. A relying party that authenticates certificates by UPN, by
+PKINIT or by subject DN must not rely on these constraints. Threat T-14's mitigation text
+should say "limited to the permitted DNS names and IP ranges; email and URI names are
+blocked; other name forms are not constrained".
+
+Any change to this (a new profile) needs a new ADR and maintainer approval (GOV-04).
