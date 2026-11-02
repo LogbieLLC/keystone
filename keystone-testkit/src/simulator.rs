@@ -42,6 +42,7 @@ use keystone_core::token::{
 use time::{Duration as TimeDuration, OffsetDateTime};
 use x509_cert::der::Encode;
 use x509_cert::der::asn1::Uint;
+use x509_cert::ext::Extension;
 
 use crate::keys;
 use crate::x509::{
@@ -263,6 +264,43 @@ pub fn test_attestation_trust() -> AttestationTrust {
     AttestationTrust::new(vec![attestation_root_der()], vec![]).expect("test trust")
 }
 
+/// The test attestation root as an issuer, so tests can build other certificates
+/// under it (for example a trusted intermediate that is not a device's F9).
+pub fn attestation_root_issuer() -> TestIssuer<'static> {
+    let root = attestation_root();
+    TestIssuer {
+        name_der: &root.name_der,
+        key: root.key,
+    }
+}
+
+/// Common Name of a simulated slot attestation certificate.
+pub const SLOT_ATTESTATION_CN: &str = "KEYSTONE TEST YubiKey PIV Attestation 9c";
+
+/// Yubico's extensions of a slot attestation certificate: firmware (3.3), device
+/// serial (3.7) and PIN and touch policy (3.8).
+pub fn slot_attestation_extensions(
+    firmware: FirmwareVersion,
+    serial: u32,
+    pin_policy: PinPolicy,
+    touch_policy: TouchPolicy,
+) -> Vec<Extension> {
+    let serial_value = Uint::new(&serial.to_be_bytes())
+        .and_then(|value| value.to_der())
+        .expect("serial extension");
+    vec![
+        raw_extension(
+            "1.3.6.1.4.1.41482.3.3",
+            vec![firmware.major, firmware.minor, firmware.patch],
+        ),
+        raw_extension("1.3.6.1.4.1.41482.3.7", serial_value),
+        raw_extension(
+            "1.3.6.1.4.1.41482.3.8",
+            vec![pin_policy.to_byte(), touch_policy.to_byte()],
+        ),
+    ]
+}
+
 fn secret(text: &str) -> SecretString {
     SecretString::from_str_copy(text).expect("locked memory")
 }
@@ -381,12 +419,9 @@ impl DeviceState {
         }
         let spki = slot.key.key().public_key_spki_der()?;
         let serial = self.attested_serial_override.unwrap_or(self.serial);
-        let serial_value = Uint::new(&serial.to_be_bytes())
-            .and_then(|value| value.to_der())
-            .expect("serial extension");
         let f9 = keystone_core::cert::parse_certificate_der(&self.f9_certificate).expect("F9");
         let certificate = build_test_certificate(&TestCertSpec {
-            subject_der: cn_name_der("KEYSTONE TEST YubiKey PIV Attestation 9c"),
+            subject_der: cn_name_der(SLOT_ATTESTATION_CN),
             subject_public_key_der: spki,
             issuer: Some(TestIssuer {
                 name_der: &f9.subject_der,
@@ -395,21 +430,12 @@ impl DeviceState {
             self_key: None,
             not_before: f9.not_before,
             not_after: f9.not_after,
-            extensions: vec![
-                raw_extension(
-                    "1.3.6.1.4.1.41482.3.3",
-                    vec![
-                        self.firmware.major,
-                        self.firmware.minor,
-                        self.firmware.patch,
-                    ],
-                ),
-                raw_extension("1.3.6.1.4.1.41482.3.7", serial_value),
-                raw_extension(
-                    "1.3.6.1.4.1.41482.3.8",
-                    vec![slot.pin_policy.to_byte(), slot.touch_policy.to_byte()],
-                ),
-            ],
+            extensions: slot_attestation_extensions(
+                self.firmware,
+                serial,
+                slot.pin_policy,
+                slot.touch_policy,
+            ),
         });
         Ok(SlotAttestation {
             slot_certificate_der: certificate,
