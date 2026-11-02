@@ -389,3 +389,78 @@ fn fr22_ac2_an_export_interrupted_after_completion_is_retried() {
         .unwrap();
     assert_eq!(files.len(), 3);
 }
+
+/// Takes, until nothing is pending, the first offered action that needs no YubiKey.
+fn recover_without_yubikey(test: &mut TestCa, context: &str) {
+    for _ in 0..3 {
+        let items = test.ca.recovery_items(None).unwrap();
+        let Some(item) = items.first() else { return };
+        assert!(item.actions.len() <= 2, "{context}: {item:?}");
+        let action = item
+            .actions
+            .iter()
+            .map(|choice| choice.action.clone())
+            .find(|action| {
+                !matches!(
+                    action,
+                    RecoveryAction::ResumeYubikeySetup { .. }
+                        | RecoveryAction::CompleteSetupWithExistingKey
+                )
+            })
+            .unwrap_or_else(|| panic!("{context}: only YubiKey actions: {item:?}"));
+        test.now += time::Duration::minutes(1);
+        let time = confirmed(&test.ca, test.now);
+        let master = test.master_entered();
+        test.ca
+            .run_recovery(
+                item.operation,
+                &action,
+                &RecoverySecrets {
+                    master_passphrase: Some(&master),
+                },
+                time,
+            )
+            .unwrap_or_else(|e| panic!("{context}: {e}"));
+    }
+}
+
+#[test]
+fn fr22_ac6_every_interrupted_state_has_an_action_that_needs_no_lost_yubikey() {
+    // Covers: FR-22 AC4, FR-22 AC6, FR-15 AC1, SEC-22
+    // Review finding 5 through the operations layer: Flows B and C are interrupted at
+    // every drive change, and recovery then runs with the YubiKey gone (lost). Every
+    // interrupted state must offer an action that needs no YubiKey, and taking it must
+    // leave a consistent CA with no lost record.
+    let base = new_ca("F8");
+    let mut with_main = clone_ca(&base);
+    let (mut main_token, _) = token(80_200_000);
+    run_flow_b(&mut with_main, &mut main_token, "F8", false).unwrap();
+    let flow_b: &Run = &|test, token| run_flow_b(test, token, "F8", false).map(|_| ());
+    let flow_c: &Run = &|test, token| run_flow_c(test, token, "F8", 5, false).map(|_| ());
+    for (label, start, run, fresh) in [
+        ("Flow B", &base, flow_b, true),
+        ("Flow C", &with_main, flow_c, false),
+    ] {
+        let token_for = |n: u32| -> SimulatedYubiKey {
+            if fresh {
+                token(80_210_000 + n).0
+            } else {
+                main_token.reopen()
+            }
+        };
+        let mut probe = clone_ca(start);
+        let mut probe_token = token_for(0);
+        testing::drive_change_count();
+        run(&mut probe, &mut probe_token).expect("clean run");
+        let total = testing::drive_change_count();
+        for crash_at in 0..total {
+            let mut test = clone_ca(start);
+            let mut token = token_for(crash_at + 1);
+            testing::crash_on_drive_change(crash_at);
+            run(&mut test, &mut token).expect_err("the crash stops the operation");
+            test.reopen();
+            recover_without_yubikey(&mut test, &format!("{label} change {crash_at}"));
+            assert_no_lost_record(&test.ca);
+        }
+    }
+}

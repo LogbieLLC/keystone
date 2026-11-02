@@ -18,6 +18,12 @@
 //!   while the setup's YubiKey (by serial; any YubiKey when no step was journaled yet) is
 //!   connected, only the resume is offered; when it is absent, "Abandon" is offered as
 //!   well, for a YubiKey that is lost or will be replaced. Never more than two actions.
+//! - YubiKey setup whose main intermediate the master already signed but whose first CRL
+//!   the YubiKey never signed (review finding 5): resuming needs that YubiKey. While it
+//!   is absent, [`RecoveryAction::FinishWithoutYubikey`] is offered as well: the signed
+//!   certificate is recorded (FR-22 AC3) and the operation finished without that CRL;
+//!   the main intermediate is then revoked with Replace lost YubiKey (Flow E). So every
+//!   interrupted state has an action that needs no lost YubiKey.
 #![forbid(unsafe_code)]
 
 use crate::cert::{SoftwareSigner, parse_certificate_pem};
@@ -33,9 +39,14 @@ use crate::store::{
 };
 use crate::token::{CredentialStatus, DeviceInfo, SIGNING_SLOT, TokenSigner};
 
-use super::pipeline::{OpContext, assemble_and_finish, record_crl, run, signed_crl, staged_key};
-use super::state::key_path;
+use super::pipeline::{
+    Assembly, OpContext, assemble_and_finish, finish, record_crl, run, signed_crl, staged_key,
+};
+use super::state::{certificate_path, key_path};
 use super::{Ca, NoProgress, OpsError};
+use crate::store::{
+    AuditAction, AuditDetails, AuditDraft, AuditResult, RecordChange, RecordUpdate,
+};
 
 /// A safe recovery action (FR-22 AC4, AC5, AC7).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +74,12 @@ pub enum RecoveryAction {
     /// The YubiKey holds a key without a certificate: verify its attestation and have
     /// the master sign it ([`Ca::resume_yubikey_setup`], FR-22 AC5).
     CompleteSetupWithExistingKey,
+    /// YubiKey setup whose main intermediate the master already signed, but whose first
+    /// CRL the (now absent) YubiKey never signed: record the certificate (FR-22 AC3) and
+    /// finish without that CRL, for a YubiKey that is lost. Offered only while the
+    /// setup's YubiKey is not connected; the main intermediate must then be revoked with
+    /// Replace lost YubiKey (Flow E). Nothing is signed (review finding 5).
+    FinishWithoutYubikey,
 }
 
 /// One action with its sentence (FR-22 AC8).
@@ -143,6 +160,9 @@ fn describe(action: &RecoveryAction, operation: OperationId) -> String {
         ),
         RecoveryAction::CompleteSetupWithExistingKey => format!(
             "Verify the attestation of the key already in the YubiKey, have the master sign it and finish {operation}; the key is not replaced and nothing is wiped."
+        ),
+        RecoveryAction::FinishWithoutYubikey => format!(
+            "Record the main intermediate the master already signed and finish {operation} without its first CRL, for when this YubiKey is lost; then revoke it with Replace lost YubiKey, and nothing is signed, deleted or overwritten."
         ),
     }
 }
@@ -331,6 +351,22 @@ impl Ca {
                 }
             }
         }
+        // Review finding 5: the master signed the main intermediate but the YubiKey never
+        // signed its first CRL; resuming needs that YubiKey. While it is absent (lost),
+        // the certificate can still be recorded and the operation finished.
+        if pending.kind == OperationKind::SetupYubikey
+            && !setup_yubikey_present
+            && every_journal_readable
+            && consistent
+            && !sealed
+            && what.certificate.is_some()
+            && !what.crl
+            && actions
+                .iter()
+                .any(|c| matches!(c.action, RecoveryAction::ResumeYubikeySetup { .. }))
+        {
+            actions.push(choice(RecoveryAction::FinishWithoutYubikey, operation));
+        }
         if actions.is_empty()
             && every_journal_readable
             && consistent
@@ -427,6 +463,7 @@ impl Ca {
             RecoveryAction::RebuildFromJournal { .. } => {
                 self.rebuild(operation, item.kind, secrets, time)
             }
+            RecoveryAction::FinishWithoutYubikey => self.finish_without_yubikey(operation, time),
             RecoveryAction::ResumeYubikeySetup { .. }
             | RecoveryAction::CompleteSetupWithExistingKey => Err(OpsError::NotReady(
                 "connect the YubiKey and continue the setup with resume_yubikey_setup".into(),
@@ -452,6 +489,68 @@ impl Ca {
                 },
             ]));
         }
+        Ok(())
+    }
+
+    /// [`RecoveryAction::FinishWithoutYubikey`]: stages the journaled main-intermediate
+    /// certificate and its record entry, and writes a `recovery_finish` audit entry;
+    /// nothing is signed.
+    fn finish_without_yubikey(
+        &self,
+        operation: OperationId,
+        time: ConfirmedTime,
+    ) -> Result<(), OpsError> {
+        self.ready_for_recovery(operation, OperationKind::SetupYubikey, time)?;
+        self.drive_set().sync_operation_journal(operation)?;
+        let journal = self.drive_set().drives()[0]
+            .operation_journal(operation)?
+            .ok_or_else(|| OpsError::Damaged(format!("{operation} has no journal")))?;
+        let (record, pem) = journal
+            .signed()
+            .find_map(|object| match object {
+                SignedObject::Certificate { record, pem } => {
+                    Some(((**record).clone(), pem.clone()))
+                }
+                SignedObject::Crl(_) => None,
+            })
+            .ok_or_else(|| OpsError::NotReady(format!("{operation} signed no certificate")))?;
+        let update = RecordUpdate::new(
+            operation,
+            vec![RecordChange::Issued {
+                certificate: Box::new(record.clone()),
+            }],
+        );
+        let mut draft = AuditDraft::new(
+            AuditAction::RecoveryFinish,
+            record.subject.display(),
+            AuditResult::Success,
+        );
+        draft.serial = Some(record.serial);
+        draft.fingerprint = Some(record.fingerprint);
+        draft.details = Some(AuditDetails {
+            original_action: Some(AuditAction::SetupYubikey),
+            issuer_serial: Some(record.issuer_serial),
+            note: Some(
+                "finished without the main intermediate's first CRL because its YubiKey is lost or will be replaced; revoke it with Replace lost YubiKey (FR-15)"
+                    .to_owned(),
+            ),
+            ..AuditDetails::default()
+        });
+        let assembly = Assembly {
+            files: vec![
+                (certificate_path(&record), pem.into_bytes()),
+                (update.output_path(), update.to_bytes()),
+            ],
+            audit: vec![draft],
+        };
+        let handle = self.drive_set().resume_operation(operation)?;
+        let progress = NoProgress;
+        let cancel = CancelFlag::new();
+        let mut ctx = OpContext::new(time, &progress, &cancel);
+        ctx.persistent = true;
+        run(handle, &mut ctx, |handle, ctx| {
+            finish(handle, ctx, &assembly)
+        })?;
         Ok(())
     }
 

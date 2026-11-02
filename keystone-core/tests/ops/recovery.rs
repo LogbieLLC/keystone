@@ -664,6 +664,119 @@ fn fr22_ac5_a_key_that_fails_attestation_is_never_completed_but_its_setup_can_be
 }
 
 #[test]
+fn regression_a_signed_main_intermediate_whose_yubikey_is_lost_is_recorded_then_replaced() {
+    // Covers: FR-22 AC3, FR-22 AC4, FR-15 AC1, FR-22 AC8
+    // Review finding 5: the master signed the main intermediate, then the YubiKey was
+    // lost before it signed its first CRL. Resuming needs that YubiKey, so the CA was
+    // blocked for ever. With the YubiKey absent the certificate is now recorded and the
+    // operation finished without that CRL; Flow E then revokes it.
+    let mut test = new_ca("R14");
+    let (mut lost, _) = token(70_000_901);
+    testing::arm_fault(FaultPoint::AfterSignedRecorded);
+    injected(run_flow_b(&mut test, &mut lost, "R14", false).unwrap_err());
+    test.reopen();
+    // With the YubiKey connected only the resume is offered.
+    let present = test.ca.recovery_items(Some(&mut lost)).unwrap();
+    assert_eq!(present[0].actions.len(), 1, "{:?}", present[0].actions);
+    let items = test.ca.recovery_items(None).unwrap();
+    let actions: Vec<_> = items[0].actions.iter().map(|c| c.action.clone()).collect();
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            RecoveryAction::ResumeYubikeySetup { .. },
+            RecoveryAction::FinishWithoutYubikey
+        ]
+    ));
+    let sentence = &items[0].actions[1].description;
+    assert!(sentence.contains("Replace lost YubiKey"), "{sentence}");
+    let serial = items[0].planned_serials[0];
+    let time = test.tick();
+    test.ca
+        .run_recovery(
+            items[0].operation,
+            &RecoveryAction::FinishWithoutYubikey,
+            &RecoverySecrets::default(),
+            time,
+        )
+        .unwrap();
+    assert_no_lost_record(&test.ca);
+    let state = test.ca.state().unwrap();
+    assert_eq!(state.active_main(test.now).unwrap().serial(), serial);
+    assert!(state.current_crl(serial).is_none());
+    // Flow E revokes it with the master; a new YubiKey is then set up.
+    let time = test.tick();
+    let master = test.master_entered();
+    test.ca
+        .plan_replace_yubikey(RevocationReason::KeyCompromise, time)
+        .unwrap()
+        .execute(
+            &test.ca,
+            IssuerUnlock::Master(&master),
+            None,
+            &NoProgress,
+            &CancelFlag::new(),
+        )
+        .unwrap();
+    let (mut replacement, _) = crate::support::token(70_000_902);
+    run_flow_b(&mut test, &mut replacement, "R14", false).expect("Flow B on a new YubiKey");
+    let state = test.ca.state().unwrap();
+    assert!(matches!(
+        state.record().get(serial).unwrap().status,
+        CertStatus::Revoked { .. }
+    ));
+    assert_ne!(state.active_main(test.now).unwrap().serial(), serial);
+    assert_no_lost_record(&test.ca);
+}
+
+#[test]
+fn fr14_ac1_an_operation_finished_through_recovery_has_a_complete_audit_entry() {
+    // Covers: FR-14 AC1, FR-21 AC6, FR-22 AC4
+    // Review test gap: FR-14 AC1 for operations finished through recovery, both by
+    // finishing from a drive and by rebuilding from the journal.
+    use keystone_core::store::{AuditAction, AuditResult};
+    for (point, expected) in [
+        (FaultPoint::AfterStaged, AuditAction::RecoveryFinish),
+        (
+            FaultPoint::AfterSignedRecorded,
+            AuditAction::CreateSubIntermediate,
+        ),
+    ] {
+        let (mut test, mut token, _) = ca_with_main("R15", 70_001_001);
+        crash_flow_c(&mut test, &mut token, point);
+        let operation = test.ca.recovery_items(None).unwrap()[0].operation;
+        recover_all(&mut test, None, "R15");
+        assert_no_lost_record(&test.ca);
+        let state = test.ca.state().unwrap();
+        let sub = &state.sub_intermediates()[0];
+        let log = test.ca.drive_set().audit_log().unwrap();
+        let entry = log
+            .entries()
+            .iter()
+            .rev()
+            .find(|e| e.operation == Some(operation))
+            .expect("an audit entry for the operation");
+        assert_eq!(entry.action, expected, "{point:?}");
+        assert!(entry.time.get() <= test.now, "{point:?}");
+        assert_eq!(entry.subject, sub.record.subject.display(), "{point:?}");
+        assert_eq!(entry.serial, Some(sub.serial()), "{point:?}");
+        assert_eq!(entry.fingerprint, Some(sub.record.fingerprint), "{point:?}");
+        assert_eq!(entry.result, AuditResult::Success, "{point:?}");
+        let details = entry.details.as_ref().expect("details");
+        assert_eq!(
+            details.permitted_dns.as_deref(),
+            Some(&["starnet".to_string()][..]),
+            "{point:?}"
+        );
+        if expected == AuditAction::RecoveryFinish {
+            assert_eq!(
+                details.original_action,
+                Some(AuditAction::CreateSubIntermediate)
+            );
+        }
+    }
+}
+
+#[test]
 fn boundary_the_yubikey_removed_right_after_on_device_key_generation() {
     // Covers: FR-22 AC5, FR-22 AC7, FR-22 AC6
     let mut test = new_ca("R9");
